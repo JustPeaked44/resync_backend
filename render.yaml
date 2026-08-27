@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: resync-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    # Note: Render web services have a hard 100-second connection timeout.
+    # Given the Gemini sequential execution budget (even with threshold lowered to 70.0),
+    # there is a risk of timeouts for complex AI operations. 
+    # This constraint should be handled at the application layer (e.g., polling, webhooks) if necessary.
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: GEMINI_API_KEY
+        sync: false
