@@ -174,7 +174,7 @@ def compute_ai_text_indicator(
 
     if embedder is not None and len(sents) >= MIN_SENTENCES_FOR_SIGNAL:
         try:
-            sent_vecs = np.array(embedder.encode(sents, convert_to_numpy=True))
+            sent_vecs = np.array(embedder.encode(sents, convert_to_numpy=True, batch_size=8))
             norms = np.linalg.norm(sent_vecs, axis=1, keepdims=True)
             norms[norms == 0] = 1e-9
             unit = sent_vecs / norms

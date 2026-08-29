@@ -19,6 +19,12 @@ from dotenv import load_dotenv
 # override=True ensures .env values WIN over Windows system env vars.
 load_dotenv(override=True)
 
+# Cap torch's intra-op thread pool before any model is imported below —
+# Render free tier gives 0.1 CPU, but torch defaults to os.cpu_count() of
+# the host machine (8-16), causing thread contention under concurrent scans.
+import torch
+torch.set_num_threads(1)
+
 from services.ingestion import DocumentIngestionService
 from services.parser import ManuscriptParserService
 from services.embedding import embedding_service
@@ -66,6 +72,13 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {"status": "Resync FastAPI Server is Live!"}
+
+# ponytail: single-slot global lock — one scan at a time on 0.1 CPU / 512MB.
+# Raise to 2+ only on a Standard (2GB) instance. Held across the whole
+# pipeline (not just the CPU-bound steps) so it also serializes the Gemini
+# calls in reasoning.py, keeping two concurrent scans from doubling the
+# request rate against the shared 15 RPM free-tier quota.
+SCAN_SLOT = asyncio.Semaphore(1)
 
 
 # ---------------------------------------------------------------------------
@@ -883,30 +896,37 @@ async def _run_scan_job(
     update, an exception would be swallowed by the background-task runner
     and leave the job pinned at 'processing' forever, with the client
     polling indefinitely.
+
+    Waits its turn on SCAN_SLOT if another scan is already running — the
+    client already polls GET /api/scans/{id}, so a longer wait here just
+    surfaces as 'processing' for a bit longer, which is the correct UX for
+    a background job (unlike the sync endpoint, this has no proxy timeout
+    to race against).
     """
-    try:
-        result = await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
-        db_client = DatabasePersistenceService.get_client()
-        await asyncio.to_thread(
-            lambda: db_client.table("analysis_run").update({
-                "status": "completed",
-                "result_json": result.model_dump(mode="json"),
-            }).eq("analysis_run_id", analysis_run_id).execute()
-        )
-        logger.info("Async scan job completed: %s", analysis_run_id)
-    except Exception as exc:
-        logger.exception("Async scan job failed: %s", analysis_run_id)
+    async with SCAN_SLOT:
         try:
+            result = await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
             db_client = DatabasePersistenceService.get_client()
             await asyncio.to_thread(
                 lambda: db_client.table("analysis_run").update({
-                    "status": "failed",
-                    "error_message": str(exc)[:1000],
+                    "status": "completed",
+                    "result_json": result.model_dump(mode="json"),
                 }).eq("analysis_run_id", analysis_run_id).execute()
             )
-        except Exception:
-            logger.exception("Could not mark scan job %s as failed", analysis_run_id)
-        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
+            logger.info("Async scan job completed: %s", analysis_run_id)
+        except Exception as exc:
+            logger.exception("Async scan job failed: %s", analysis_run_id)
+            try:
+                db_client = DatabasePersistenceService.get_client()
+                await asyncio.to_thread(
+                    lambda: db_client.table("analysis_run").update({
+                        "status": "failed",
+                        "error_message": str(exc)[:1000],
+                    }).eq("analysis_run_id", analysis_run_id).execute()
+                )
+            except Exception:
+                logger.exception("Could not mark scan job %s as failed", analysis_run_id)
+            await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
 
 
 @app.post(
@@ -927,14 +947,30 @@ async def run_scan(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> ScanResponse:
     """Synchronous scan — provisions the run row, debits a credit, then
-    awaits the full pipeline. Refunds the credit if the pipeline throws."""
+    awaits the full pipeline. Refunds the credit if the pipeline throws.
+
+    Only one scan runs at a time (see SCAN_SLOT). Rather than blocking here
+    and risking Render's 100s proxy timeout while merely queued, this fails
+    fast with 503 so the Android client gets an honest "busy, retry" instead
+    of a silent timeout."""
     _assert_owner(authenticated_user_id, req.user_id)
     analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
+    try:
+        await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
+    except asyncio.TimeoutError:
+        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Another scan is currently in progress. Please retry shortly.",
+            headers={"Retry-After": "60"},
+        )
     try:
         return await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
     except Exception:
         await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
         raise
+    finally:
+        SCAN_SLOT.release()
 
 
 @app.post(

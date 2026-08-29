@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 graphify-out/
 *.egg-info/
+.claude/worktrees/

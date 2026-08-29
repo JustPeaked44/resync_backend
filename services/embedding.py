@@ -22,7 +22,7 @@ class EmbeddingService:
         if cls._instance is None:
             cls._instance = super(EmbeddingService, cls).__new__(cls)
             # Singleton model initialization: loads once at app startup
-            cls._model = SentenceTransformer("all-mpnet-base-v2")
+            cls._model = SentenceTransformer("all-MiniLM-L6-v2")
         return cls._instance
 
     def _is_empty_section(self, text: str) -> bool:
@@ -34,8 +34,8 @@ class EmbeddingService:
 
     def _chunk_and_embed(self, text: str) -> Optional[List[float]]:
         """
-        Token limit safety: MPNet context window is 384 tokens (~300 words).
-        If section text exceeds 300 words, split into paragraphs/sentences,
+        Token limit safety: MiniLM-L6 context window is 256 tokens (~200 words).
+        If section text exceeds 200 words, split into paragraphs/sentences,
         encode each chunk, and mean-pool the embeddings.
         Returns None if the section is empty (no meaningful content).
         """
@@ -45,8 +45,8 @@ class EmbeddingService:
             return None
 
         words = cleaned_text.split()
-        if len(words) <= 300:
-            embedding = self._model.encode(cleaned_text, convert_to_numpy=True)
+        if len(words) <= 200:
+            embedding = self._model.encode(cleaned_text, convert_to_numpy=True, batch_size=8)
             return embedding.tolist()
 
         # Split text by double newlines for chunks of ~200-250 words
@@ -64,14 +64,14 @@ class EmbeddingService:
         if not chunks:
             chunks = [cleaned_text[:1000]]
 
-        chunk_embeddings = self._model.encode(chunks, convert_to_numpy=True)
-        # Mean pooling across chunks to get 768-D section vector
+        chunk_embeddings = self._model.encode(chunks, convert_to_numpy=True, batch_size=8)
+        # Mean pooling across chunks to get 384-D section vector
         section_vector = np.mean(chunk_embeddings, axis=0)
         return section_vector.tolist()
 
     def embed_sections(self, sections: Dict[str, str]) -> Dict[str, Optional[List[float]]]:
         """
-        Encodes a dict of section names to text into 768-D vector embeddings.
+        Encodes a dict of section names to text into 384-D vector embeddings.
         Empty sections map to None instead of a zero vector.
         """
         embeddings = {}

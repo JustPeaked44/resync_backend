@@ -3,10 +3,8 @@ services:
     name: resync-backend
     env: docker
     dockerfilePath: ./Dockerfile
-    # Note: Render web services have a hard 100-second connection timeout.
-    # Given the Gemini sequential execution budget (even with threshold lowered to 70.0),
-    # there is a risk of timeouts for complex AI operations. 
-    # This constraint should be handled at the application layer (e.g., polling, webhooks) if necessary.
+    # Render's 100s proxy timeout is handled at the application layer:
+    # POST /api/scans/start + GET /api/scans/{id} polling (see main.py).
     envVars:
       - key: PORT
         value: "8000"
