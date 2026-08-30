@@ -10,3 +10,8 @@ services:
         value: "8000"
       - key: GEMINI_API_KEY
         sync: false
+      # ponytail: capstone-testing kill switch -- credit_wallet/credit_ledger
+      # lack service_role GRANTs (migrations/004_credits.sql never added them).
+      # Flip to "true" (or remove) once the Supabase GRANTs are applied.
+      - key: CREDITS_ENABLED
+        value: "false"
