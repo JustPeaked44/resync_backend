@@ -18,7 +18,7 @@ output text by any third party without the issuing model's own detection
 service. Formal academic writing already exhibits many of the same
 surface features this indicator looks for (frequent transition words,
 domain-jargon repetition, uniform APA-style sentence structure), so a
-well-written human capstone chapter can legitimately score 40-60 here.
+well-written human academic manuscript can legitimately score 40-60 here.
 This must never be used to block a submission or as a standalone
 plagiarism/academic-integrity charge -- advisory only, excluded from the
 manuscript score, always shown with DISCLAIMER attached.
@@ -41,7 +41,7 @@ DISCLAIMER = (
     "at the token-sampling level and are not recoverable from output text by any third "
     "party without the issuing model's own detection service. Formal academic prose "
     "already exhibits many of these same surface features, so well-written human "
-    "capstone chapters can score in the 40-60 range; this indicator must never be used "
+    "academic manuscripts can score in the 40-60 range; this indicator must never be used "
     "to block a submission or as a plagiarism/integrity charge on its own."
 )
 
