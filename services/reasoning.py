@@ -83,6 +83,33 @@ TRUNCATION_NOTICE = (
     "\n\n(Note: this excerpt was truncated for length; base your analysis only on what is shown.)"
 )
 
+# ---------------------------------------------------------------------------
+# Hard-floor prompt for critically low-scoring pairs (< 65). Unlike the
+# standard SYSTEM_PROMPT which allows the model to dismiss a low score as a
+# false positive, this prompt FORCES a finding -- because a score this low
+# inherently represents a structural gap worth surfacing.
+# ---------------------------------------------------------------------------
+HARD_FLOOR_PROMPT = (
+    "You are an expert academic research reviewer and capstone advisor. "
+    "You are reviewing two sections from an IT/CS undergraduate capstone manuscript. "
+    "The deterministic embedding-similarity model scored this pair VERY LOW "
+    "({score}/100), which is well below the acceptable threshold.\n\n"
+    "A score this low means these two sections are structurally disconnected. "
+    "Your task is to identify SPECIFICALLY what is missing or misaligned between them. "
+    "Do NOT dismiss this as acceptable. A material structural gap EXISTS — your job is "
+    "to explain it clearly and helpfully.\n\n"
+    "Provide a strict 3-part Explainable AI (XAI) breakdown:\n"
+    "1. WHAT: Identify the specific structural gap, missing linkage, or content disconnect "
+    "between these two sections. Reference actual content from the excerpts.\n"
+    "2. WHY: Explain why this disconnect weakens the manuscript's validity or structural integrity.\n"
+    "3. FIX: Give a concise, actionable recommendation referencing the specific content that "
+    "needs to be added, revised, or connected.\n\n"
+    "Be direct, constructive, and specific to the actual content shown. "
+    "For evidence_a, copy a sentence VERBATIM from Section A's excerpt that relates to the gap. "
+    "For evidence_b, copy a sentence VERBATIM from Section B's excerpt. "
+    "If no excerpt sentence genuinely supports the finding, leave that evidence field empty."
+)
+
 
 def _xai_schema(include_objectives: bool) -> Dict[str, Any]:
     """Builds the Gemini structured-output schema per call. objectives_unaddressed
@@ -117,6 +144,42 @@ def _xai_schema(include_objectives: bool) -> Dict[str, Any]:
         },
     }
     required = ["finding_status", "what", "why", "fix", "evidence_a", "evidence_b"]
+    if include_objectives:
+        properties["objectives_unaddressed"] = {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "description": "Objective sentences from Section A that are not addressed in Section B",
+        }
+        required.append("objectives_unaddressed")
+    return {"type": "OBJECT", "properties": properties, "required": required}
+
+
+def _forced_finding_schema(include_objectives: bool) -> Dict[str, Any]:
+    """Schema for hard-floor pairs (score < 65). No finding_status field --
+    Gemini MUST produce a what/why/fix finding, no escape hatch."""
+    properties = {
+        "what": {
+            "type": "STRING",
+            "description": "Specific structural gap or content disconnect between the two sections, referencing actual content",
+        },
+        "why": {
+            "type": "STRING",
+            "description": "Why this disconnect weakens the manuscript's validity or structural integrity",
+        },
+        "fix": {
+            "type": "STRING",
+            "description": "Actionable recommendation referencing specific content that needs to be added, revised, or connected",
+        },
+        "evidence_a": {
+            "type": "STRING",
+            "description": "A sentence copied verbatim from Section A's excerpt that relates to the gap, or empty",
+        },
+        "evidence_b": {
+            "type": "STRING",
+            "description": "A sentence copied verbatim from Section B's excerpt that relates to the gap, or empty",
+        },
+    }
+    required = ["what", "why", "fix", "evidence_a", "evidence_b"]
     if include_objectives:
         properties["objectives_unaddressed"] = {
             "type": "ARRAY",
@@ -266,14 +329,35 @@ class ReasoningService:
         rest of the scan.
         """
         include_objectives = role_a == "objectives"
-        prompt = self._build_prompt(role_a, text_a, role_b, text_b, score)
+        is_hard_floor = score < 65.0
+
+        if is_hard_floor:
+            # Hard-floor path: use the forced prompt that doesn't allow
+            # no_material_issue, and the schema without finding_status.
+            excerpt_a = self._truncate_text(text_a)
+            excerpt_b = self._truncate_text(text_b)
+            prompt = (
+                f"{HARD_FLOOR_PROMPT.format(score=score)}\n\n"
+                f"Section A ({role_a}):\n{excerpt_a}"
+                f"{TRUNCATION_NOTICE if excerpt_a.endswith('[truncated]') else ''}\n\n"
+                f"Section B ({role_b}):\n{excerpt_b}"
+                f"{TRUNCATION_NOTICE if excerpt_b.endswith('[truncated]') else ''}\n\n"
+            )
+            if role_a == "objectives":
+                prompt += OBJECTIVES_INSTRUCTION + "\n\n"
+            prompt += "Identify the structural gap and output the structured response."
+            schema = _forced_finding_schema(include_objectives)
+        else:
+            # Standard path: allows Gemini to dismiss false positives
+            prompt = self._build_prompt(role_a, text_a, role_b, text_b, score)
+            schema = _xai_schema(include_objectives)
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.2,
                 "responseMimeType": "application/json",
-                "responseSchema": _xai_schema(include_objectives),
+                "responseSchema": schema,
             },
         }
 
@@ -285,30 +369,8 @@ class ReasoningService:
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(raw_text)
 
-            if parsed.get("finding_status") == "no_material_issue":
-                # Hard floor: if the score is critically low (< 65) we surface
-                # a structural gap regardless of the model's dismissal.
-                # A score this low means the two sections share almost no
-                # conceptual vocabulary -- that IS an inconsistency worth flagging,
-                # even if the model couldn't pinpoint a specific contradiction from
-                # the text excerpts it received.
-                if score < 65.0:
-                    return InconsistencyOutput(
-                        section_a=role_a,
-                        section_b=role_b,
-                        coherence_score=score,
-                        explanation_what=f"The '{role_a}' and '{role_b}' sections show very low conceptual alignment (score: {score}/100).",
-                        explanation_why=(
-                            parsed.get("why", "")
-                            or f"A coherence score of {score}/100 indicates these two sections share minimal conceptual overlap. "
-                               f"This suggests the {role_b} may not adequately reflect or build upon the {role_a}."
-                        ),
-                        suggested_fix=f"Review the '{role_b}' section to ensure it directly addresses or builds upon the content in '{role_a}'.",
-                        evidence_a="",
-                        evidence_b="",
-                        evidence_verified=False,
-                        objectives_unaddressed=[],
-                    ), None
+            # Standard path: model can dismiss
+            if not is_hard_floor and parsed.get("finding_status") == "no_material_issue":
                 return None, {
                     "role_a": role_a,
                     "role_b": role_b,
