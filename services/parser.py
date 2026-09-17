@@ -2,13 +2,9 @@ import re
 import spacy
 from typing import Dict, List, Any, Optional
 
-# Load spaCy English NLP model
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    import spacy.cli
-    spacy.cli.download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+# Load spaCy English NLP model (lightweight sentencizer only)
+nlp = spacy.blank("en")
+nlp.add_pipe("sentencizer")
 
 # Default Capstone TOC Template
 DEFAULT_TOC_TEMPLATE = [

@@ -64,6 +64,12 @@ class EmbeddingService:
         if not chunks:
             chunks = [cleaned_text[:1000]]
 
+        MAX_CHUNKS = 80
+        if len(chunks) > MAX_CHUNKS:
+            import logging
+            logging.getLogger("resync.embedding").info(f"Subsampling {len(chunks)} chunks down to {MAX_CHUNKS} for embedding.")
+            chunks = chunks[:40] + chunks[-40:]
+
         chunk_embeddings = self._model.encode(chunks, convert_to_numpy=True, batch_size=8)
         # Mean pooling across chunks to get 384-D section vector
         section_vector = np.mean(chunk_embeddings, axis=0)

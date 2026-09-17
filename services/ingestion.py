@@ -1,5 +1,6 @@
 import logging
 import re
+import io
 import httpx
 from fastapi import HTTPException, status
 
@@ -75,7 +76,7 @@ class DocumentIngestionService:
                 
                 # Clean non-text noise
                 cleaned_text = cls.strip_document_noise(raw_text)
-                return cleaned_text
+                return cls.enforce_size_limits(cleaned_text)
 
             except HTTPException:
                 # Explicitly re-raise 400, 403, and 404 status codes
@@ -89,6 +90,53 @@ class DocumentIngestionService:
                     detail=f"Network error while fetching the Google Doc ({type(exc).__name__})."
                 )
 
+    @classmethod
+    async def extract_plaintext_from_upload(cls, file_bytes: bytes, filename: str) -> str:
+        """
+        Extracts plaintext from an uploaded .pdf or .docx file.
+        """
+        filename_lower = filename.lower()
+        
+        try:
+            if filename_lower.endswith(".docx"):
+                import docx
+                doc = docx.Document(io.BytesIO(file_bytes))
+                raw_text = "\n".join([p.text for p in doc.paragraphs])
+            elif filename_lower.endswith(".pdf"):
+                import pypdf
+                pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                pages_text = []
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        pages_text.append(text)
+                raw_text = "\n".join(pages_text)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Unsupported file format. Please upload a .pdf or .docx file."
+                )
+                
+            if not raw_text.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="The uploaded document appears to be empty or contains no extractable text."
+                )
+                
+            # Clean non-text noise
+            cleaned_text = cls.strip_document_noise(raw_text)
+            return cls.enforce_size_limits(cleaned_text)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logging.getLogger("resync.ingestion").error(
+                "Error extracting text from uploaded file %s: %s", filename, exc
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unable to extract text from the uploaded file. It may be corrupted or encrypted. ({type(exc).__name__})"
+            )
+
     @staticmethod
     def strip_document_noise(text: str) -> str:
         """
@@ -99,3 +147,19 @@ class DocumentIngestionService:
         text = re.sub(r"\r\n", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+        
+    @classmethod
+    def enforce_size_limits(cls, text: str) -> str:
+        """Enforces limits on document size to prevent out-of-memory errors on small instances."""
+        char_count = len(text)
+        
+        if char_count > 200_000:
+            logging.getLogger("resync.ingestion").warning(f"Large document ingested: {char_count} characters.")
+            
+        if char_count > 500_000:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Document is too large to process ({char_count:,} characters). Max limit is 500,000 characters."
+            )
+            
+        return text

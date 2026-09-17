@@ -58,6 +58,20 @@ _TRANSITION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Abbreviations that confuse the sentencizer (it treats every "." as a
+# sentence boundary). We mask them with a placeholder before parsing,
+# then restore afterwards. Using a rare Unicode character (§) as the
+# stand-in so it won't appear naturally in manuscript text.
+_ABBREV_PLACEHOLDER = "§"
+_ACADEMIC_ABBREVS = re.compile(
+    r'\b('
+    r'et\s+al|e\.g|i\.e|cf|viz|vs|Fig|Figs|fig|Tab|Sec|sec|'
+    r'Dr|Mr|Mrs|Ms|Prof|Rev|Sr|Jr|No|Vol|pp|approx|dept|est|'
+    r'govt|incl|intl|max|min|misc|orig|dept|Corp|Ltd|U\.S|U\.K'
+    r')\.',
+    re.IGNORECASE,
+)
+
 # Reasoned, deliberately wide reference bands -- NOT fit to a labeled
 # human-vs-AI corpus (none exists for this domain). Recalibrate once
 # enough real scanned manuscripts with an honest self-reported ground
@@ -153,8 +167,18 @@ def compute_ai_text_indicator(
     if not text:
         return AITextIndicatorResult(score=None, feature_breakdown={})
 
-    doc = nlp(text)
-    sents = [s.text.strip() for s in doc.sents if s.text.strip()]
+    # Hard cap at 40,000 chars to avoid memory exhaustion on large sections
+    if len(text) > 40_000:
+        import logging
+        logging.getLogger("resync.ai_text").warning(f"Section truncated from {len(text)} to 40,000 chars for AI text analysis")
+        text = text[:40_000]
+
+    # Mask academic abbreviations so the sentencizer doesn't split on their
+    # trailing periods (e.g. "et al." → "et al§", "Fig. 3" → "Fig§ 3").
+    masked_text = _ACADEMIC_ABBREVS.sub(lambda m: m.group(0)[:-1] + _ABBREV_PLACEHOLDER, text)
+    doc = nlp(masked_text)
+    # Restore placeholder → "." in each sentence for accurate word stats
+    sents = [s.text.strip().replace(_ABBREV_PLACEHOLDER, ".") for s in doc.sents if s.text.strip()]
     if len(sents) < MIN_SENTENCES_FOR_SIGNAL:
         return AITextIndicatorResult(score=None, feature_breakdown={})
 

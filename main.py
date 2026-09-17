@@ -708,6 +708,9 @@ async def _execute_scan_pipeline(
     references_section_present: bool = bool(references_text.strip())
     intext_citation_count = len(extract_intext_citations(raw_text))
 
+    # Free the full manuscript string from memory early
+    del raw_text
+
     # ------------------------------------------------------------------
     # Step 5b – Citation Integrity
     # ------------------------------------------------------------------
