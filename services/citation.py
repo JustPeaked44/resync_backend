@@ -193,27 +193,39 @@ def _is_safe_public_host(host: str) -> bool:
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
     """Returns a real HTTP status code, or a synthetic negative code for a
     network-level failure (so classify_http_status can still bucket it)."""
-    try:
-        host = httpx.URL(url).host
-        if not host or not await asyncio.to_thread(_is_safe_public_host, host):
-            return -4
-    except Exception:
-        return -4
-    try:
-        resp = await client.head(url, headers=BROWSER_HEADERS, timeout=10.0, follow_redirects=True)
-        if resp.status_code in (405, 501) or resp.status_code >= 500:
-            resp = await client.get(url, headers=BROWSER_HEADERS, timeout=12.0, follow_redirects=True)
-        return resp.status_code
-    except httpx.TimeoutException:
+    current_url = url
+    max_redirects = 5
+    for _ in range(max_redirects):
         try:
-            resp = await client.get(url, headers=BROWSER_HEADERS, timeout=15.0, follow_redirects=True)
-            return resp.status_code
+            host = httpx.URL(current_url).host
+            if not host or not await asyncio.to_thread(_is_safe_public_host, host):
+                return -4
         except Exception:
-            return -1
-    except httpx.ConnectError:
-        return -2
-    except Exception:
-        return -3
+            return -4
+
+        try:
+            resp = await client.head(current_url, headers=BROWSER_HEADERS, timeout=10.0, follow_redirects=False)
+            if resp.status_code in (405, 501) or resp.status_code >= 500:
+                resp = await client.get(current_url, headers=BROWSER_HEADERS, timeout=12.0, follow_redirects=False)
+        except httpx.TimeoutException:
+            try:
+                resp = await client.get(current_url, headers=BROWSER_HEADERS, timeout=15.0, follow_redirects=False)
+            except Exception:
+                return -1
+        except httpx.ConnectError:
+            return -2
+        except Exception:
+            return -3
+
+        if resp.is_redirect:
+            location = resp.headers.get("Location")
+            if not location:
+                return resp.status_code
+            current_url = str(resp.url.join(location))
+        else:
+            return resp.status_code
+
+    return -4
 
 
 def _classify_http_status(code: int) -> CitationStatus:
