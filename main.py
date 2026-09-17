@@ -64,6 +64,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://nmqc58bh-5173.asse.devtunnels.ms",
+        "https://resync-web-m.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
