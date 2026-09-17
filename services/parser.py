@@ -219,9 +219,17 @@ class ManuscriptParserService:
 
 
         # 2. Iterate line-by-line and match headings
+        toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
         for line in lines:
+            # Skip TOC-style "Heading . . . . 14" lines
+            if toc_line_re.search(line):
+                continue
             matched_header = cls._match_header(line, template_toc)
             if matched_header:
+                # If the section accumulated very little content so far it was
+                # probably a TOC occurrence — reset and start fresh from here.
+                if len("\n".join(parsed_sections_lines[matched_header]).strip()) < 150:
+                    parsed_sections_lines[matched_header] = []
                 current_section = matched_header
             elif line.strip().lower() in ["appendices", "appendix", "curriculum vitae"]:
                 current_section = None
@@ -305,10 +313,21 @@ class ManuscriptParserService:
         detected_roles_in_order: List[str] = []
         current_role: Optional[str] = None
 
+        # Regex to detect TOC-style "heading . . . . . . 12" lines
+        toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
+
         # 1. Walk lines, classifying each as a heading (role-mapped) or body text
         for line in lines:
+            # Skip TOC-style lines (e.g. "Methodology ...... 14" or "Results   12")
+            if toc_line_re.search(line):
+                continue
             role = cls._detect_heading_role(line, prefix_re)
             if role:
+                # If we already have this role and its content so far is very
+                # short (< 150 chars), it was likely a TOC entry — discard it
+                # and restart accumulation from this real heading occurrence.
+                if role in sections_lines and len("\n".join(sections_lines[role]).strip()) < 150:
+                    sections_lines[role] = []
                 current_role = role
                 if role not in sections_lines:
                     sections_lines[role] = []
