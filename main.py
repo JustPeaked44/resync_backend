@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, UploadFile, File, Form
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header
 import asyncio
 from services.deterministic import DeterministicAuditService, deterministic_service
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,7 +64,6 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://nmqc58bh-5173.asse.devtunnels.ms",
-        "https://resync-web-m.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -267,14 +266,6 @@ async def test_reasoning(
 # ---------------------------------------------------------------------------
 # Master Production Scan Endpoint
 # ---------------------------------------------------------------------------
-
-class NotificationResponse(BaseModel):
-    id: str
-    notification_type: str
-    notification_payload: dict
-    notification_isread: bool
-    created_at: str
-    analysis_run_id: Optional[str] = None
 
 class ScanRequest(BaseModel):
     """Request body for the master production scan pipeline."""
@@ -919,7 +910,7 @@ async def _run_scan_job(
             db_client = DatabasePersistenceService.get_client()
             await asyncio.to_thread(
                 lambda: db_client.table("analysis_run").update({
-                    "analysis_run_status": "completed",
+                    "status": "completed",
                     "result_json": result.model_dump(mode="json"),
                 }).eq("analysis_run_id", analysis_run_id).execute()
             )
@@ -930,7 +921,7 @@ async def _run_scan_job(
                 db_client = DatabasePersistenceService.get_client()
                 await asyncio.to_thread(
                     lambda: db_client.table("analysis_run").update({
-                        "analysis_run_status": "failed",
+                        "status": "failed",
                         "error_message": str(exc)[:1000],
                     }).eq("analysis_run_id", analysis_run_id).execute()
                 )
@@ -1039,7 +1030,7 @@ async def get_scan_status(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table("analysis_run")
-                .select("analysis_run_id, user_id, analysis_run_status, error_message, result_json")
+                .select("analysis_run_id, user_id, status, error_message, result_json")
                 .eq("analysis_run_id", analysis_run_id)
                 .execute()
         )
@@ -1065,7 +1056,7 @@ async def get_scan_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan {analysis_run_id} not found."
         )
-    job_status = row.get("analysis_run_status") or "processing"
+    job_status = row.get("status") or "processing"
 
     if job_status == "failed":
         return ScanStatusResponse(
@@ -1334,104 +1325,3 @@ async def get_credit_history(
             for e in entries
         ],
     )
-
-
-# ---------------------------------------------------------------------------
-# Notification Endpoints
-# ---------------------------------------------------------------------------
-@app.get(
-    "/api/notifications",
-    response_model=List[NotificationResponse],
-    summary="Fetch user notifications"
-)
-async def get_notifications(
-    limit: int = 50,
-    authenticated_user_id: str = Depends(get_authenticated_user_id)
-):
-    db = DatabasePersistenceService.get_client()
-    res = db.table("notification") \
-        .select("*") \
-        .eq("user_id", authenticated_user_id) \
-        .order("created_at", desc=True) \
-        .limit(limit) \
-        .execute()
-    
-    notifications = []
-    for row in res.data or []:
-        try:
-            payload = json.loads(row.get("notification_payload", "{}")) if isinstance(row.get("notification_payload"), str) else row.get("notification_payload", {})
-        except:
-            payload = {}
-        notifications.append({
-            "id": str(row["id"]),
-            "notification_type": row.get("notification_type", ""),
-            "notification_payload": payload,
-            "notification_isread": row.get("notification_isread", False),
-            "created_at": row.get("created_at", ""),
-            "analysis_run_id": str(row["analysis_run_id"]) if row.get("analysis_run_id") else None
-        })
-    return notifications
-
-@app.patch(
-    "/api/notifications/{notification_id}/read",
-    summary="Mark a notification as read"
-)
-async def mark_notification_read(
-    notification_id: str,
-    authenticated_user_id: str = Depends(get_authenticated_user_id)
-):
-    db = DatabasePersistenceService.get_client()
-    
-    # Verify ownership
-    check = db.table("notification").select("user_id").eq("id", notification_id).execute()
-    if not check.data or str(check.data[0]["user_id"]) != authenticated_user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this notification.")
-        
-    res = db.table("notification").update({"notification_isread": True}).eq("id", notification_id).execute()
-    return {"status": "success"}
-
-@app.post(
-    "/api/scans/upload",
-    summary="Upload a file and start async scan",
-    response_model=dict
-)
-async def upload_scan(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    user_id: str = Form(...),
-    manuscript_title: Optional[str] = Form(None),
-    authenticated_user_id: str = Depends(get_authenticated_user_id)
-):
-    _assert_owner(authenticated_user_id, user_id)
-    await _check_scan_rate_limit(user_id)
-
-    db_client = DatabasePersistenceService.get_client()
-
-    file_bytes = await file.read()
-    filename = file.filename or "uploaded_document.pdf"
-    
-    # Pre-flight text extraction
-    text = await DocumentIngestionService.extract_plaintext_from_upload(file_bytes, filename)
-    doc_url = f"uploaded://{filename}"
-    
-    # Reuse ScanRequest structure for the provision call
-    req = ScanRequest(
-        user_id=user_id,
-        manuscript_title=manuscript_title or filename,
-        doc_url=doc_url,
-        style_reference_url=None
-    )
-
-    manuscript_id, analysis_run_id, _ = await _provision_analysis_run(req)
-
-    background_tasks.add_task(
-        _run_scan_job,
-        analysis_run_id=analysis_run_id,
-        user_id=user_id,
-        manuscript_id=manuscript_id,
-        doc_url=doc_url,
-        style_reference_url=None,
-        pre_extracted_text=text
-    )
-
-    return {"status": "processing", "analysis_run_id": analysis_run_id}
