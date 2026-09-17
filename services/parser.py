@@ -204,6 +204,7 @@ class ManuscriptParserService:
                 "section_roles": section_roles,
                 "auto_detected": True,
                 "detection_confidence": detection["confidence"],
+                "research_type": detection.get("research_type", "unknown"),
             }
 
         # Fallback to default TOC template if list is empty or invalid
@@ -253,6 +254,7 @@ class ManuscriptParserService:
             "section_roles": section_roles,  # heading → standardized role
             "auto_detected": False,
             "detection_confidence": 1.0,
+            "research_type": "unknown",
         }
 
     @classmethod
@@ -351,10 +353,28 @@ class ManuscriptParserService:
 
         confidence = max(0.0, min(1.0, confidence))
 
+        # Quali/Quanti heuristic detection
+        quanti_keywords = {"survey", "respondents", "n =", "p <", "statistical", "questionnaire", "likert"}
+        quali_keywords = {"thematic analysis", "interview", "coding", "purposive", "narrative", "phenomenology"}
+        
+        text_lower = text.lower()
+        quanti_score = sum(1 for kw in quanti_keywords if kw in text_lower)
+        quali_score = sum(1 for kw in quali_keywords if kw in text_lower)
+        
+        if quanti_score > 0 and quali_score > 0:
+            research_type = "mixed" if abs(quanti_score - quali_score) <= 1 else ("quantitative" if quanti_score > quali_score else "qualitative")
+        elif quanti_score > 0:
+            research_type = "quantitative"
+        elif quali_score > 0:
+            research_type = "qualitative"
+        else:
+            research_type = "unknown"
+
         return {
             "sections": sections,
             "confidence": confidence,
             "detected_headings": detected_headings,
+            "research_type": research_type,
         }
 
     @classmethod

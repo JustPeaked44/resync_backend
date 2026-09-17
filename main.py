@@ -349,6 +349,7 @@ class ScoreBreakdown(BaseModel):
     structural_detail: Dict[str, Any] = {}
     coherence_detail: Dict[str, Any] = {}
     citation_detail: Dict[str, Any] = {}
+    research_type: Optional[str] = None
 
 
 class AITextIndicatorReport(BaseModel):
@@ -731,6 +732,7 @@ async def _execute_scan_pipeline(
     # coherence_detail dict here rather than in scoring.py -- it already
     # rides whole into both persistence and the API response.
     score_breakdown_dict: Dict[str, Any] = functional_metric.to_dict()
+    score_breakdown_dict["research_type"] = parse_result.get("research_type", "unknown")
     score_breakdown_dict.setdefault("coherence_detail", {})
     score_breakdown_dict["coherence_detail"]["dismissed_pairs"] = dismissed_pairs
     score_breakdown_dict["coherence_detail"]["verifications"] = [
