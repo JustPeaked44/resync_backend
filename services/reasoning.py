@@ -286,6 +286,29 @@ class ReasoningService:
             parsed = json.loads(raw_text)
 
             if parsed.get("finding_status") == "no_material_issue":
+                # Hard floor: if the score is critically low (< 65) we surface
+                # a structural gap regardless of the model's dismissal.
+                # A score this low means the two sections share almost no
+                # conceptual vocabulary -- that IS an inconsistency worth flagging,
+                # even if the model couldn't pinpoint a specific contradiction from
+                # the text excerpts it received.
+                if score < 65.0:
+                    return InconsistencyOutput(
+                        section_a=role_a,
+                        section_b=role_b,
+                        coherence_score=score,
+                        explanation_what=f"The '{role_a}' and '{role_b}' sections show very low conceptual alignment (score: {score}/100).",
+                        explanation_why=(
+                            parsed.get("why", "")
+                            or f"A coherence score of {score}/100 indicates these two sections share minimal conceptual overlap. "
+                               f"This suggests the {role_b} may not adequately reflect or build upon the {role_a}."
+                        ),
+                        suggested_fix=f"Review the '{role_b}' section to ensure it directly addresses or builds upon the content in '{role_a}'.",
+                        evidence_a="",
+                        evidence_b="",
+                        evidence_verified=False,
+                        objectives_unaddressed=[],
+                    ), None
                 return None, {
                     "role_a": role_a,
                     "role_b": role_b,
