@@ -83,13 +83,7 @@ class DatabasePersistenceService:
             "analysis_run_status": "completed", # Bug 6: Valid enum is 'completed'
             "analysis_run_coherence_score": int(coherence_score),
             "analysis_run_completed_at": now_iso,
-            # Denormalized copies consumed directly by the web app's history
-            # query (App.tsx) via the Supabase client — see migration 002.
-            "overall_coherence_score": float(coherence_score),
-            "status": "completed",
         }
-        if doc_url is not None:
-            analysis_run_update["doc_url"] = doc_url
         if sections_analyzed is not None:
             analysis_run_update["sections_analyzed"] = sections_analyzed
         if missing_sections is not None:
@@ -178,16 +172,7 @@ class DatabasePersistenceService:
                         or data.get("section_b")
                         or ""
                     ),
-                    # Denormalized copies consumed directly by the web app's
-                    # history query (App.tsx) via the Supabase client — see
-                    # migration 002.
-                    "section_a": data.get("section_a") or data.get("primary_section_name") or "General",
-                    "section_b": data.get("section_b") or data.get("conflicting_section_name") or "",
                     "coherence_score": data.get("coherence_score"),
-                    "explanation_what": data.get("explanation_what") or data.get("inconsistency_explanation_what") or "",
-                    "explanation_why": data.get("explanation_why") or data.get("inconsistency_explanation_why") or "",
-                    "suggested_fix": data.get("suggested_fix") or data.get("inconsistency_suggested_fix") or "",
-                    "severity": str(data.get("severity") or data.get("inconsistency_severity") or "Medium").capitalize(),
                     # Previously computed by the XAI and returned to the
                     # client, then silently dropped here -- reload from
                     # history lost the evidence quotes and unaddressed
