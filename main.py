@@ -154,7 +154,8 @@ async def _check_scan_rate_limit(user_id: str) -> None:
 # real Gemini quota for free. Fine for local dev; set ENABLE_TEST_ENDPOINTS=
 # false in production to 404 them.
 # ---------------------------------------------------------------------------
-ENABLE_TEST_ENDPOINTS = os.getenv("ENABLE_TEST_ENDPOINTS", "true").strip().lower() not in ("false", "0", "no")
+# Security: Default to false (Secure by Default) to prevent unauthenticated API consumption
+ENABLE_TEST_ENDPOINTS = os.getenv("ENABLE_TEST_ENDPOINTS", "false").strip().lower() in ("true", "1", "yes")
 
 
 def _require_test_endpoints_enabled() -> None:
@@ -926,7 +927,8 @@ async def _run_scan_job(
                 await asyncio.to_thread(
                     lambda: db_client.table("analysis_run").update({
                         "status": "failed",
-                        "error_message": str(exc)[:1000],
+                        # Security: Prevent leaking sensitive stack traces or internal details
+                        "error_message": "An internal error occurred during the scan.",
                     }).eq("analysis_run_id", analysis_run_id).execute()
                 )
             except Exception:
