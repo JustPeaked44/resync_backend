@@ -101,7 +101,24 @@ class DocumentIngestionService:
             if filename_lower.endswith(".docx"):
                 import docx
                 doc = docx.Document(io.BytesIO(file_bytes))
-                raw_text = "\n".join([p.text for p in doc.paragraphs])
+                lines = []
+                for p in doc.paragraphs:
+                    text = p.text.strip()
+                    if text:
+                        lines.append(text)
+                # Also extract text from tables if any
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if row_cells:
+                            # Avoid duplicate cells from merged rows/cols
+                            unique_cells = []
+                            for c in row_cells:
+                                if not unique_cells or c != unique_cells[-1]:
+                                    unique_cells.append(c)
+                            if unique_cells:
+                                lines.append(" | ".join(unique_cells))
+                raw_text = "\n".join(lines)
             elif filename_lower.endswith(".pdf"):
                 import pypdf
                 pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
@@ -114,7 +131,7 @@ class DocumentIngestionService:
             else:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Unsupported file format. Please upload a .pdf or .docx file."
+                    detail="Unsupported file format. Please upload a .docx or .pdf file."
                 )
                 
             if not raw_text.strip():
@@ -134,7 +151,7 @@ class DocumentIngestionService:
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Unable to extract text from the uploaded file. It may be corrupted or encrypted. ({type(exc).__name__})"
+                detail=f"Unable to extract text from the uploaded file ({filename}). It may be corrupted or encrypted. ({type(exc).__name__})"
             )
 
     @staticmethod

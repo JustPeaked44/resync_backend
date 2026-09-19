@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
 import asyncio
 from services.deterministic import DeterministicAuditService, deterministic_service
 from fastapi.middleware.cors import CORSMiddleware
@@ -174,6 +174,19 @@ async def test_ingestion(doc_url: str = Query(..., description="Public Google Do
         "text_preview": extracted_text[:500] + "..."
     }
 
+@app.post("/api/test-upload-ingestion")
+async def test_upload_ingestion(file: UploadFile = File(..., description="Manuscript file (.docx or .pdf)")):
+    """Endpoint to test .docx / .pdf file text extraction."""
+    _require_test_endpoints_enabled()
+    file_bytes = await file.read()
+    extracted_text = await DocumentIngestionService.extract_plaintext_from_upload(file_bytes, file.filename or "uploaded.docx")
+    return {
+        "status": "success",
+        "filename": file.filename,
+        "character_count": len(extracted_text),
+        "text_preview": extracted_text[:500] + "..."
+    }
+
 @app.post("/api/test-parser")
 async def test_parser(
     doc_url: str = Query(..., description="Public Google Docs Link"),
@@ -284,7 +297,18 @@ class ScanRequest(BaseModel):
         default=None,
         description="Used to create a new manuscript row when manuscript_id is omitted.",
     )
-    doc_url: str = Field(..., description="Public Google Docs share URL")
+    doc_url: Optional[str] = Field(
+        default=None,
+        description="Public Google Docs share URL or document source identifier."
+    )
+    file_content_base64: Optional[str] = Field(
+        default=None,
+        description="Optional base64-encoded .docx or .pdf file payload for JSON scan submissions."
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        description="Optional document filename (e.g. 'Thesis.docx')."
+    )
     template_toc: Optional[List[str]] = Field(
         default=None,
         description="Optional ordered list of mandatory section headers for the Department TOC template."
@@ -400,9 +424,9 @@ class IssueFeedbackResponse(BaseModel):
 # + /api/scans/{id}, used by the web app to avoid proxy request timeouts).
 # ---------------------------------------------------------------------------
 
-async def _resolve_manuscript_id(db_client: Any, req: ScanRequest) -> str:
+async def _resolve_manuscript_id(db_client: Any, req: ScanRequest, default_source_name: Optional[str] = None) -> str:
     """Returns req.manuscript_id if given (validated to exist), otherwise
-    creates a new manuscript row from manuscript_title + doc_url.
+    creates a new manuscript row from manuscript_title + doc_url / filename.
 
     Scan-and-go means every submission is its own manuscript: reusing one
     hardcoded manuscript_id across every user (the previous frontend
@@ -422,20 +446,21 @@ async def _resolve_manuscript_id(db_client: Any, req: ScanRequest) -> str:
         return req.manuscript_id
 
     new_manuscript_id = str(uuid.uuid4())
-    title = (req.manuscript_title or req.doc_url or "Untitled Manuscript")[:250]
+    source_name = req.doc_url or req.filename or default_source_name or "Uploaded Document"
+    title = (req.manuscript_title or req.filename or req.doc_url or default_source_name or "Untitled Manuscript")[:250]
     await asyncio.to_thread(
         lambda: db_client.table("manuscript").insert({
             "manuscript_id": new_manuscript_id,
             "user_id": req.user_id,
             "manuscript_title": title,
-            "manuscript_source_url": req.doc_url,
+            "manuscript_source_url": source_name,
         }).execute()
     )
     logger.info("Created manuscript row %s for user %s", new_manuscript_id, req.user_id)
     return new_manuscript_id
 
 
-async def _provision_analysis_run(req: ScanRequest) -> tuple[str, str, int]:
+async def _provision_analysis_run(req: ScanRequest, default_source_name: Optional[str] = None) -> tuple[str, str, int]:
     """
     Validates the user, resolves/creates the manuscript, inserts the
     `analysis_run` row in 'processing' state, and debits one scan credit.
@@ -466,10 +491,11 @@ async def _provision_analysis_run(req: ScanRequest) -> tuple[str, str, int]:
                 detail=f"User with ID {req.user_id} not found."
             )
 
-        manuscript_id = await _resolve_manuscript_id(db_client, req)
+        manuscript_id = await _resolve_manuscript_id(db_client, req, default_source_name=default_source_name)
 
         # Bug 4: analysis_run_template_toc is a text column, stringify the list
         toc_str = json.dumps(req.template_toc) if req.template_toc else None
+        source_identifier = req.doc_url or req.filename or default_source_name or "uploaded_file.docx"
 
         # Bug 1: Add user_id to the insert payload
         await asyncio.to_thread(
@@ -484,7 +510,7 @@ async def _provision_analysis_run(req: ScanRequest) -> tuple[str, str, int]:
                 # this rather than the enum column, because the enum has no
                 # 'failed' member (see migration 003).
                 "status": "processing",
-                "doc_url": req.doc_url,
+                "doc_url": source_identifier,
             }).execute()
         )
         logger.info(f"Provisioned analysis_run row: {analysis_run_id}")
@@ -519,6 +545,8 @@ async def _execute_scan_pipeline(
     analysis_run_id: str,
     manuscript_id: str,
     credits_remaining: Optional[int] = None,
+    file_bytes: Optional[bytes] = None,
+    filename: Optional[str] = None,
 ) -> ScanResponse:
     """
     Runs the full RESYNC analysis pipeline against an already-provisioned
@@ -526,7 +554,7 @@ async def _execute_scan_pipeline(
 
     Pipeline sequence
     -----------------
-    1. Ingestion    – fetch plaintext from Google Docs
+    1. Ingestion    – fetch plaintext from uploaded file, base64 payload, or Google Docs
     2. Parser       – segment text into sections using the Department TOC template
     3. Embedding    – compute pairwise cosine-similarity coherence scores
     3b. Structural  – score completeness against the required/optional roles
@@ -545,7 +573,28 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Step 1 – Ingestion
     # ------------------------------------------------------------------
-    raw_text: str = await DocumentIngestionService.fetch_plaintext_from_gdoc(req.doc_url)
+    source_identifier = req.doc_url or req.filename or filename or "Uploaded Manuscript"
+    if file_bytes:
+        fname = filename or req.filename or req.doc_url or "document.docx"
+        raw_text: str = await DocumentIngestionService.extract_plaintext_from_upload(file_bytes, fname)
+    elif req.file_content_base64:
+        import base64
+        try:
+            decoded_bytes = base64.b64decode(req.file_content_base64)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid base64 encoding in file_content_base64."
+            )
+        fname = req.filename or req.doc_url or "document.docx"
+        raw_text = await DocumentIngestionService.extract_plaintext_from_upload(decoded_bytes, fname)
+    elif req.doc_url and ("docs.google.com" in req.doc_url or req.doc_url.startswith("http")):
+        raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(req.doc_url)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid manuscript provided. Please provide a public Google Docs link or upload a .docx/.pdf file."
+        )
 
     # ------------------------------------------------------------------
     # Step 2 – Parser
@@ -782,7 +831,7 @@ async def _execute_scan_pipeline(
             "section_scores": ai_text_result.section_scores,
             "flagged_sections": ai_text_result.flagged_sections,
         },
-        doc_url=req.doc_url,
+        doc_url=source_identifier,
         sections_analyzed=list(parsed_sections.keys()),
         missing_sections=missing_sections,
         has_all_required_sections=has_all_required_sections,
@@ -795,9 +844,9 @@ async def _execute_scan_pipeline(
     # Step 7 – Notification (non-blocking background task)
     # ------------------------------------------------------------------
     # Derive a human-readable manuscript title for the push message.
-    # We use the Google Doc URL as a fallback since the title is not in
-    # the request model; the notification service only needs a string.
-    manuscript_title: str = req.doc_url
+    # We use the source identifier as a fallback since the title may not be
+    # in the request model; the notification service only needs a string.
+    manuscript_title: str = req.manuscript_title or source_identifier
     try:
         ms_row = (
             db_client
@@ -810,7 +859,7 @@ async def _execute_scan_pipeline(
         if ms_row and ms_row.data and ms_row.data.get("manuscript_title"):
             manuscript_title = ms_row.data["manuscript_title"]
     except Exception:
-        pass  # silently fall back to URL — non-critical
+        pass  # silently fall back to URL/filename — non-critical
 
     notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
         user_id=req.user_id,
@@ -827,7 +876,7 @@ async def _execute_scan_pipeline(
         analysis_run_id=analysis_run_id,
         user_id=req.user_id,
         manuscript_id=manuscript_id,
-        doc_url=req.doc_url,
+        doc_url=source_identifier,
         overall_coherence_score=functional_metric.overall_score,
         sections_analyzed=list(parsed_sections.keys()),
         missing_sections=missing_sections,
@@ -887,7 +936,12 @@ class ScanStatusResponse(BaseModel):
 
 
 async def _run_scan_job(
-    req: ScanRequest, analysis_run_id: str, manuscript_id: str, credits_remaining: int
+    req: ScanRequest,
+    analysis_run_id: str,
+    manuscript_id: str,
+    credits_remaining: int,
+    file_bytes: Optional[bytes] = None,
+    filename: Optional[str] = None,
 ) -> None:
     """
     Background wrapper around the scan pipeline for the async job endpoint.
@@ -910,7 +964,14 @@ async def _run_scan_job(
     """
     async with SCAN_SLOT:
         try:
-            result = await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
+            result = await _execute_scan_pipeline(
+                req,
+                analysis_run_id,
+                manuscript_id,
+                credits_remaining,
+                file_bytes=file_bytes,
+                filename=filename,
+            )
             db_client = DatabasePersistenceService.get_client()
             await asyncio.to_thread(
                 lambda: db_client.table("analysis_run").update({
@@ -1010,6 +1071,163 @@ async def start_scan(
     background_tasks.add_task(_run_scan_job, req, analysis_run_id, manuscript_id, credits_remaining)
     logger.info("Accepted async scan job: %s", analysis_run_id)
     return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
+
+
+@app.post(
+    "/api/scans/upload",
+    response_model=ScanJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start Scan from Uploaded File (asynchronous)",
+    description=(
+        "Upload a .docx or .pdf file directly (max 25MB). Validates the file, "
+        "provisions the analysis_run row, and processes the scan in the background. "
+        "Poll GET /api/scans/{analysis_run_id} for progress and final results."
+    ),
+    tags=["Scans"]
+)
+async def upload_and_start_scan(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Manuscript document (.docx or .pdf)"),
+    user_id: str = Form(..., description="Supabase auth user UUID"),
+    manuscript_id: Optional[str] = Form(None, description="Optional existing manuscript UUID"),
+    manuscript_title: Optional[str] = Form(None, description="Optional manuscript title"),
+    template_toc: Optional[str] = Form(None, description="Optional JSON array string of Department TOC headers"),
+    style_reference_url: Optional[str] = Form(None, description="Optional style reference URL"),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+) -> ScanJobResponse:
+    """
+    Accepts an uploaded Word (.docx) or PDF manuscript and starts an asynchronous scan job.
+    """
+    _assert_owner(authenticated_user_id, user_id)
+
+    # 25 MB max file size
+    MAX_FILE_SIZE = 25 * 1024 * 1024
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File exceeds maximum allowed size of 25 MB."
+        )
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file is empty."
+        )
+
+    parsed_toc: Optional[List[str]] = None
+    if template_toc:
+        try:
+            parsed_toc = json.loads(template_toc)
+            if not isinstance(parsed_toc, list):
+                parsed_toc = None
+        except Exception:
+            pass
+
+    req = ScanRequest(
+        user_id=user_id,
+        manuscript_id=manuscript_id,
+        manuscript_title=manuscript_title or file.filename or "Uploaded Manuscript",
+        doc_url=file.filename or "uploaded_file.docx",
+        filename=file.filename,
+        template_toc=parsed_toc,
+        style_reference_url=style_reference_url,
+    )
+
+    analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
+        req, default_source_name=file.filename
+    )
+    background_tasks.add_task(
+        _run_scan_job,
+        req,
+        analysis_run_id,
+        resolved_manuscript_id,
+        credits_remaining,
+        file_bytes=file_bytes,
+        filename=file.filename,
+    )
+    logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
+    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
+
+
+@app.post(
+    "/api/scans/upload/run",
+    response_model=ScanResponse,
+    summary="Run Scan from Uploaded File (synchronous)",
+    description="Synchronously runs scan pipeline on an uploaded .docx or .pdf file.",
+    tags=["Scans"]
+)
+async def upload_and_run_scan(
+    file: UploadFile = File(..., description="Manuscript document (.docx or .pdf)"),
+    user_id: str = Form(..., description="Supabase auth user UUID"),
+    manuscript_id: Optional[str] = Form(None, description="Optional existing manuscript UUID"),
+    manuscript_title: Optional[str] = Form(None, description="Optional manuscript title"),
+    template_toc: Optional[str] = Form(None, description="Optional JSON array string of Department TOC headers"),
+    style_reference_url: Optional[str] = Form(None, description="Optional style reference URL"),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+) -> ScanResponse:
+    """
+    Synchronously runs the analysis pipeline on an uploaded .docx or .pdf file.
+    """
+    _assert_owner(authenticated_user_id, user_id)
+
+    MAX_FILE_SIZE = 25 * 1024 * 1024
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File exceeds maximum allowed size of 25 MB."
+        )
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The uploaded file is empty."
+        )
+
+    parsed_toc: Optional[List[str]] = None
+    if template_toc:
+        try:
+            parsed_toc = json.loads(template_toc)
+            if not isinstance(parsed_toc, list):
+                parsed_toc = None
+        except Exception:
+            pass
+
+    req = ScanRequest(
+        user_id=user_id,
+        manuscript_id=manuscript_id,
+        manuscript_title=manuscript_title or file.filename or "Uploaded Manuscript",
+        doc_url=file.filename or "uploaded_file.docx",
+        filename=file.filename,
+        template_toc=parsed_toc,
+        style_reference_url=style_reference_url,
+    )
+
+    analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
+        req, default_source_name=file.filename
+    )
+    try:
+        await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
+    except asyncio.TimeoutError:
+        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Another scan is currently in progress. Please retry shortly.",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        return await _execute_scan_pipeline(
+            req,
+            analysis_run_id,
+            resolved_manuscript_id,
+            credits_remaining,
+            file_bytes=file_bytes,
+            filename=file.filename,
+        )
+    except Exception:
+        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
+        raise
+    finally:
+        SCAN_SLOT.release()
 
 
 @app.get(
