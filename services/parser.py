@@ -204,6 +204,7 @@ class ManuscriptParserService:
                 "section_roles": section_roles,
                 "auto_detected": True,
                 "detection_confidence": detection["confidence"],
+                "research_type": detection.get("research_type", "unknown"),
             }
 
         # Fallback to default TOC template if list is empty or invalid
@@ -218,9 +219,17 @@ class ManuscriptParserService:
 
 
         # 2. Iterate line-by-line and match headings
+        toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
         for line in lines:
+            # Skip TOC-style "Heading . . . . 14" lines
+            if toc_line_re.search(line):
+                continue
             matched_header = cls._match_header(line, template_toc)
             if matched_header:
+                # If the section accumulated very little content so far it was
+                # probably a TOC occurrence — reset and start fresh from here.
+                if len("\n".join(parsed_sections_lines[matched_header]).strip()) < 150:
+                    parsed_sections_lines[matched_header] = []
                 current_section = matched_header
             elif line.strip().lower() in ["appendices", "appendix", "curriculum vitae"]:
                 current_section = None
@@ -253,6 +262,7 @@ class ManuscriptParserService:
             "section_roles": section_roles,  # heading → standardized role
             "auto_detected": False,
             "detection_confidence": 1.0,
+            "research_type": "unknown",
         }
 
     @classmethod
@@ -303,10 +313,21 @@ class ManuscriptParserService:
         detected_roles_in_order: List[str] = []
         current_role: Optional[str] = None
 
+        # Regex to detect TOC-style "heading . . . . . . 12" lines
+        toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
+
         # 1. Walk lines, classifying each as a heading (role-mapped) or body text
         for line in lines:
+            # Skip TOC-style lines (e.g. "Methodology ...... 14" or "Results   12")
+            if toc_line_re.search(line):
+                continue
             role = cls._detect_heading_role(line, prefix_re)
             if role:
+                # If we already have this role and its content so far is very
+                # short (< 150 chars), it was likely a TOC entry — discard it
+                # and restart accumulation from this real heading occurrence.
+                if role in sections_lines and len("\n".join(sections_lines[role]).strip()) < 150:
+                    sections_lines[role] = []
                 current_role = role
                 if role not in sections_lines:
                     sections_lines[role] = []
@@ -351,10 +372,28 @@ class ManuscriptParserService:
 
         confidence = max(0.0, min(1.0, confidence))
 
+        # Quali/Quanti heuristic detection
+        quanti_keywords = {"survey", "respondents", "n =", "p <", "statistical", "questionnaire", "likert"}
+        quali_keywords = {"thematic analysis", "interview", "coding", "purposive", "narrative", "phenomenology"}
+        
+        text_lower = text.lower()
+        quanti_score = sum(1 for kw in quanti_keywords if kw in text_lower)
+        quali_score = sum(1 for kw in quali_keywords if kw in text_lower)
+        
+        if quanti_score > 0 and quali_score > 0:
+            research_type = "mixed" if abs(quanti_score - quali_score) <= 1 else ("quantitative" if quanti_score > quali_score else "qualitative")
+        elif quanti_score > 0:
+            research_type = "quantitative"
+        elif quali_score > 0:
+            research_type = "qualitative"
+        else:
+            research_type = "unknown"
+
         return {
             "sections": sections,
             "confidence": confidence,
             "detected_headings": detected_headings,
+            "research_type": research_type,
         }
 
     @classmethod
