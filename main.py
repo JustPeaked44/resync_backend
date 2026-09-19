@@ -412,12 +412,19 @@ async def _resolve_manuscript_id(db_client: Any, req: ScanRequest) -> str:
     """
     if req.manuscript_id:
         ms_resp = await asyncio.to_thread(
-            lambda: db_client.table("manuscript").select("manuscript_id").eq("manuscript_id", req.manuscript_id).execute()
+            lambda: db_client.table("manuscript").select("manuscript_id, user_id").eq("manuscript_id", req.manuscript_id).execute()
         )
         if not ms_resp.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Manuscript with ID {req.manuscript_id} not found."
+            )
+        # Security: Prevent IDOR. Make sure the manuscript belongs to the user initiating the scan.
+        # This is critical because the backend uses the service role key which bypasses RLS.
+        if ms_resp.data[0].get("user_id") != req.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to access this manuscript."
             )
         return req.manuscript_id
 

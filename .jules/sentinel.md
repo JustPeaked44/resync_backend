@@ -1,0 +1,4 @@
+## 2024-05-15 - [IDOR in Manuscript Access]
+**Vulnerability:** The API endpoint for manuscript processing allowed any authenticated user to pass any `manuscript_id` and have it processed on their behalf because the database access was done with a Supabase Service Role key (bypassing RLS) without checking if the manuscript actually belonged to the user making the request.
+**Learning:** When using elevated privileges like the Supabase Service Role key, database Row Level Security (RLS) is completely bypassed. Application-level authorization checks are absolutely necessary to ensure that the user owns the resource they are trying to access or manipulate.
+**Prevention:** Always verify ownership (`user_id`) against the authenticated user when fetching resources from the database using a service role key.
