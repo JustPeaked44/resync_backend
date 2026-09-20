@@ -172,10 +172,7 @@ def _is_safe_public_host(host: str) -> bool:
     """SSRF guard: reference links come from user-submitted manuscript text,
     so before fetching one, reject any hostname that resolves to a private,
     loopback, link-local, or otherwise non-public address (e.g. cloud
-    metadata endpoints or internal services). Only the initial URL is
-    checked -- a redirect to an internal address is a known residual gap,
-    acceptable here since httpx's automatic redirect handling doesn't
-    expose a per-hop hook without materially more code."""
+    metadata endpoints or internal services)."""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
@@ -190,15 +187,15 @@ def _is_safe_public_host(host: str) -> bool:
     return True
 
 
+async def _verify_request_host(request: httpx.Request):
+    host = request.url.host
+    if not host or not await asyncio.to_thread(_is_safe_public_host, host):
+        raise httpx.ConnectError(f"SSRF blocked: {host} resolves to a non-public IP.", request=request)
+
+
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
     """Returns a real HTTP status code, or a synthetic negative code for a
     network-level failure (so classify_http_status can still bucket it)."""
-    try:
-        host = httpx.URL(url).host
-        if not host or not await asyncio.to_thread(_is_safe_public_host, host):
-            return -4
-    except Exception:
-        return -4
     try:
         resp = await client.head(url, headers=BROWSER_HEADERS, timeout=10.0, follow_redirects=True)
         if resp.status_code in (405, 501) or resp.status_code >= 500:
@@ -343,7 +340,7 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, event_hooks={'request': [_verify_request_host]}) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:

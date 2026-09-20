@@ -1,0 +1,4 @@
+## 2026-09-20 - [SSRF via HTTP Redirect]
+**Vulnerability:** A known SSRF gap existed in `services/citation.py` where only the initial URL's host was verified as safe. If that URL redirected to an internal/private address (like 127.0.0.1 or AWS metadata services), the `httpx` client would automatically follow the redirect, bypassing the SSRF check.
+**Learning:** Checking only the initial host before making a request is insufficient when HTTP clients automatically follow redirects. Attackers can use external URLs that redirect to internal resources to bypass these checks.
+**Prevention:** Instead of a one-time check before the request, use the `event_hooks={'request': [...]}` feature in `httpx.AsyncClient` to intercept and validate the host of *every* outgoing request, including those triggered by redirects.
