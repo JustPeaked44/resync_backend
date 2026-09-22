@@ -190,6 +190,17 @@ def _is_safe_public_host(host: str) -> bool:
     return True
 
 
+async def _block_internal_redirects(response: httpx.Response):
+    """Event hook to block redirects to internal IP addresses (SSRF protection)."""
+    if response.is_redirect:
+        location = response.headers.get("location")
+        if location:
+            url = response.url.join(location)
+            host = url.host
+            if host and not _is_safe_public_host(host):
+                raise httpx.ConnectError(f"Blocked redirect to internal host {host}", request=response.request)
+
+
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
     """Returns a real HTTP status code, or a synthetic negative code for a
     network-level failure (so classify_http_status can still bucket it)."""
@@ -343,7 +354,10 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            event_hooks={"response": [_block_internal_redirects]}
+        ) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
