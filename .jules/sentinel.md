@@ -1,0 +1,4 @@
+## 2024-05-24 - [CRITICAL] Prevent SSRF Vulnerability via HTTP Redirects
+**Vulnerability:** The `_check_http_reachability` and `_verify_entry_link` functions used `httpx.AsyncClient` with `follow_redirects=True`. While the initial host was validated against internal/private IP blocks, the client could be redirected to an internal endpoint (e.g. cloud metadata servers or loopback) by an attacker-controlled external server, bypassing the SSRF protection entirely.
+**Learning:** Checking the initial URL is insufficient for SSRF protection when the HTTP client is configured to follow redirects automatically.
+**Prevention:** Add an `event_hooks` callback to the `httpx.AsyncClient` configuration that triggers on the `response` event. In the hook, check `response.is_redirect`, resolve the `location` header, and validate the new host before allowing the redirect to proceed.
