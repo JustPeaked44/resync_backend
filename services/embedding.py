@@ -22,7 +22,7 @@ class EmbeddingService:
         if cls._instance is None:
             cls._instance = super(EmbeddingService, cls).__new__(cls)
             # Singleton model initialization: loads once at app startup
-            cls._model = SentenceTransformer("all-MiniLM-L6-v2")
+            cls._model = SentenceTransformer("./models/minilm-dost-v4")
         return cls._instance
 
     def _is_empty_section(self, text: str) -> bool:

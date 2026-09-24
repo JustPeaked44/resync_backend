@@ -12,9 +12,8 @@ ENV OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     HF_HOME=/app/.cache/huggingface
 
-# Pre-bake models into the image so cold starts don't re-download ~430MB
-# onto Render free tier's ephemeral disk after each 15-min spin-down.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+# Copy local fine-tuned model directly into the image
+COPY models/minilm-dost-v4 /app/models/minilm-dost-v4
 
 # Copy application code
 COPY . .
