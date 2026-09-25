@@ -343,7 +343,16 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async def _ssrf_guard_hook(request: httpx.Request) -> None:
+            # Re-check the host on every redirect to prevent SSRF via redirect.
+            host = request.url.host
+            if not host or not await asyncio.to_thread(_is_safe_public_host, host):
+                raise httpx.ConnectError(f"Blocked request to internal host: {host}", request=request)
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            event_hooks={"request": [_ssrf_guard_hook]}
+        ) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
