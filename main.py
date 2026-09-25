@@ -1304,6 +1304,126 @@ async def get_scan_status(
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id)
 
 
+import httpx
+import re
+
+# In-process cache for manuscript previews: { scan_id: { "text": "...", "expires_at": float } }
+# TTL is 10 minutes. Max keys = 100 to prevent OOM.
+_manuscript_cache = {}
+
+@app.get(
+    "/api/scans/{scan_id}/manuscript",
+    response_model=None,
+    summary="Fetch Manuscript Preview",
+    tags=["Scans"]
+)
+async def get_manuscript_preview(
+    scan_id: str,
+    nocache: bool = False,
+    authenticated_user_id: str = Depends(get_authenticated_user_id)
+) -> dict:
+    """Fetches the full manuscript text from Google Docs for the result preview pane."""
+    db_client = DatabasePersistenceService.get_client()
+    
+    try:
+        run_resp = await asyncio.to_thread(
+            lambda: db_client
+                .table("analysis_run")
+                .select("user_id, result_json")
+                .eq("analysis_run_id", scan_id)
+                .execute()
+        )
+    except Exception as exc:
+        logger.error("Failed to read scan %s for manuscript preview: %s", scan_id, exc)
+        return {"available": False, "reason": "unreachable"}
+
+    if not run_resp.data:
+        return {"available": False, "reason": "unreachable"}
+        
+    row = run_resp.data[0]
+    
+    if row.get("user_id") != authenticated_user_id:
+        return {"available": False, "reason": "unreachable"}
+        
+    result_json = row.get("result_json") or {}
+    doc_url = result_json.get("doc_url")
+    
+    if not doc_url or "docs.google.com" not in doc_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Document URL is not a supported Google Docs link."
+        )
+        
+    now = time.time()
+    if not nocache and scan_id in _manuscript_cache:
+        cached = _manuscript_cache[scan_id]
+        if now < cached["expires_at"]:
+            return {
+                "available": True,
+                "text": cached["text"],
+                "fetched_at": datetime.fromtimestamp(cached["fetched_at"], tz=timezone.utc).isoformat()
+            }
+        else:
+            del _manuscript_cache[scan_id]
+            
+    match = re.search(r"/document/d/([a-zA-Z0-9-_]+)", doc_url)
+    if not match:
+        raise HTTPException(
+            status_code=400,
+            detail="Document URL is not a supported Google Docs link."
+        )
+    doc_id = match.group(1)
+    export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+    
+    _BROWSER_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+            headers={"User-Agent": _BROWSER_UA}
+        ) as client:
+            resp = await client.get(export_url)
+
+            if resp.status_code in (401, 403):
+                return {"available": False, "reason": "private"}
+            if resp.status_code == 404:
+                return {"available": False, "reason": "unreachable"}
+            resp.raise_for_status()
+
+            raw_text = resp.text
+
+            # Google returns an HTML login-redirect page instead of 403
+            # when the doc is private. Catch it here.
+            if "<html" in raw_text[:500].lower():
+                return {"available": False, "reason": "private"}
+
+    except Exception as exc:
+        logger.warning("Failed to fetch manuscript %s from Google Docs: %s", doc_id, exc)
+        return {"available": False, "reason": "unreachable"}
+        
+    processed_text = DocumentIngestionService.strip_document_noise(raw_text)
+    
+    if len(_manuscript_cache) >= 100:
+        oldest_key = min(_manuscript_cache.keys(), key=lambda k: _manuscript_cache[k]["expires_at"])
+        del _manuscript_cache[oldest_key]
+        
+    _manuscript_cache[scan_id] = {
+        "text": processed_text,
+        "expires_at": now + 600,
+        "fetched_at": now
+    }
+    
+    return {
+        "available": True,
+        "text": processed_text,
+        "fetched_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Issue Feedback Endpoint
 # ---------------------------------------------------------------------------
