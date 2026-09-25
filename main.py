@@ -741,6 +741,47 @@ async def _execute_scan_pipeline(
         })
 
     # ------------------------------------------------------------------
+    # Step 4c – Missing Required Sections → Issue entries
+    # structural_result is assigned at Step 3b (line 624), well before
+    # this point. Surface each structurally-absent required section as
+    # an explicit issue so it appears in the Issues tab.
+    # ------------------------------------------------------------------
+    _MISSING_SECTION_GUIDANCE: Dict[str, str] = {
+        "abstract":     "a concise summary of the study, methods, results, and conclusions.",
+        "introduction": "background context, research gap, and motivation for the study.",
+        "objectives":   "the specific aims or research questions being investigated.",
+        "methodology":  "the research design, participants, instruments, and procedures.",
+        "results":      "the findings presented clearly with supporting data.",
+        "discussion":   "interpretation of results in relation to prior literature.",
+        "conclusion":   "a synthesis of findings, limitations, and future directions.",
+        "references":   "all cited sources formatted consistently (e.g. APA 7th ed.).",
+    }
+    for missing_role in structural_result.missing_required:
+        inconsistencies_data.append({
+            "inconsistency_id": str(uuid.uuid4()),
+            "section_a": missing_role,
+            "section_b": "",
+            "coherence_score": None,
+            "explanation_what": (
+                f"Required section '{missing_role}' is missing from the manuscript."
+            ),
+            "explanation_why": (
+                f"A complete research manuscript requires a '{missing_role}' section. "
+                "Its absence weakens the structural integrity of the work and may lower "
+                "the evaluation score."
+            ),
+            "suggested_fix": (
+                f"Add a '{missing_role}' section covering "
+                + _MISSING_SECTION_GUIDANCE.get(missing_role, "its expected scholarly content.")
+            ),
+            "evidence_a": "",
+            "evidence_b": "",
+            "evidence_verified": True,
+            "objectives_unaddressed": [],
+            "finding_status": "material_issue",
+        })
+
+    # ------------------------------------------------------------------
     # Step 5 – Citation Audit
     # ------------------------------------------------------------------
     # No 20,000-char slice here anymore — that cap silently truncated a

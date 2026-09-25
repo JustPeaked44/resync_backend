@@ -68,6 +68,18 @@ def compute_structural_completeness(
             if 0 < word_count < STRUCTURAL_MIN_WORDS:
                 stubs.append(heading)
 
+    # Roles present in parsed_sections (by their canonical role, not heading)
+    covered_roles = {
+        section_roles.get(h, h.lower()) for h in parsed_sections
+    }
+    # Required roles the parser found no heading for at all — the existing
+    # loop never sees these, so they were silently excluded from both
+    # weighted_total and missing_req, making the denominator equal the
+    # numerator and the raw score artificially 100%.
+    for role in REQUIRED_ROLES - covered_roles:
+        weighted_total += REQUIRED_WEIGHT
+        missing_req.append(role)
+
     raw_score = 100.0 * (weighted_present / weighted_total) if weighted_total else 0.0
     # Dampens auto-detect false confidence: a low-confidence auto-detection
     # shouldn't be allowed to claim full structural credit.
@@ -402,9 +414,7 @@ def _band_for(score: float) -> str:
         return "Strong"
     if score >= 70:
         return "Solid"
-    if score >= 55:
-        return "Needs Revision"
-    return "Major Revision"
+    return "Needs Revision"
 
 
 def _lever_reason(key: str, structural: StructuralScoreResult,
