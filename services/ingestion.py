@@ -2,7 +2,31 @@ import logging
 import re
 import io
 import httpx
+import socket
+import ipaddress
+import asyncio
 from fastapi import HTTPException, status
+
+def _is_safe_public_host(host: str) -> bool:
+    """SSRF guard to prevent fetching from internal or private IPs via redirects."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+async def _ssrf_request_hook(request: httpx.Request):
+    host = request.url.host
+    if host and not await asyncio.to_thread(_is_safe_public_host, host):
+        raise httpx.ConnectError(f"Blocked non-public host: {host}", request=request)
+
 
 class DocumentIngestionService:
     """
@@ -40,7 +64,8 @@ class DocumentIngestionService:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=60.0,
-            headers=headers
+            headers=headers,
+            event_hooks={'request': [_ssrf_request_hook]}
         ) as client:
             try:
                 response = await client.get(export_url)
