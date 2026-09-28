@@ -1,0 +1,4 @@
+## 2026-09-28 - SSRF via httpx redirects
+**Vulnerability:** Found a Server-Side Request Forgery (SSRF) vulnerability in `services/citation.py` where `httpx.AsyncClient` was configured with `follow_redirects=True` but the SSRF validation `_is_safe_public_host` was only applied to the initial URL. A malicious redirect could route the request to internal infrastructure (e.g., cloud metadata servers at 169.254.169.254).
+**Learning:** `httpx` does not expose a per-hop hook natively out of the box that pauses redirect chains automatically for host checking without additional configuration.
+**Prevention:** To prevent SSRF vulnerabilities when using `httpx` with `follow_redirects=True`, apply `event_hooks={'request': [hook_function]}` to validate the host before every request, including redirects.
