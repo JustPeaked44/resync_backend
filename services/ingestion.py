@@ -3,6 +3,7 @@ import re
 import io
 import httpx
 from fastapi import HTTPException, status
+from services.http_utils import ssrf_hook
 
 class DocumentIngestionService:
     """
@@ -40,7 +41,8 @@ class DocumentIngestionService:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=60.0,
-            headers=headers
+            headers=headers,
+            event_hooks={"request": [ssrf_hook]}
         ) as client:
             try:
                 response = await client.get(export_url)

@@ -19,6 +19,7 @@ from services.reference_parser import (
     fuzzy_title_match,
     surname_key_variants,
 )
+from services.http_utils import is_safe_public_host, ssrf_hook
 
 logger = logging.getLogger(__name__)
 
@@ -168,34 +169,12 @@ async def _resolve_doi_metadata(doi: str, client: httpx.AsyncClient) -> Optional
         return None
 
 
-def _is_safe_public_host(host: str) -> bool:
-    """SSRF guard: reference links come from user-submitted manuscript text,
-    so before fetching one, reject any hostname that resolves to a private,
-    loopback, link-local, or otherwise non-public address (e.g. cloud
-    metadata endpoints or internal services). Only the initial URL is
-    checked -- a redirect to an internal address is a known residual gap,
-    acceptable here since httpx's automatic redirect handling doesn't
-    expose a per-hop hook without materially more code."""
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return False
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            return False
-    return True
-
-
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
     """Returns a real HTTP status code, or a synthetic negative code for a
     network-level failure (so classify_http_status can still bucket it)."""
     try:
         host = httpx.URL(url).host
-        if not host or not await asyncio.to_thread(_is_safe_public_host, host):
+        if not host or not await asyncio.to_thread(is_safe_public_host, host):
             return -4
     except Exception:
         return -4
@@ -343,7 +322,7 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, event_hooks={"request": [ssrf_hook]}) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
