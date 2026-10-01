@@ -172,10 +172,7 @@ def _is_safe_public_host(host: str) -> bool:
     """SSRF guard: reference links come from user-submitted manuscript text,
     so before fetching one, reject any hostname that resolves to a private,
     loopback, link-local, or otherwise non-public address (e.g. cloud
-    metadata endpoints or internal services). Only the initial URL is
-    checked -- a redirect to an internal address is a known residual gap,
-    acceptable here since httpx's automatic redirect handling doesn't
-    expose a per-hop hook without materially more code."""
+    metadata endpoints or internal services)."""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
@@ -188,6 +185,20 @@ def _is_safe_public_host(host: str) -> bool:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
+
+
+async def _block_ssrf_redirect(request: httpx.Request):
+    host = request.url.host
+    if not host:
+        raise httpx.ConnectError("Blocked SSRF attempt: No host provided", request=request)
+
+    # We use a synchronous wrapper here because event hooks in httpx for async clients
+    # are run in an async context, but `_is_safe_public_host` is synchronous.
+    # To avoid blocking the event loop entirely on DNS, we use asyncio.to_thread
+    # However, since this is called in event hook, we can just await it.
+    is_safe = await asyncio.to_thread(_is_safe_public_host, host)
+    if not is_safe:
+        raise httpx.ConnectError(f"Blocked SSRF attempt to {host}", request=request)
 
 
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
@@ -343,7 +354,7 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, event_hooks={'request': [_block_ssrf_redirect]}) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
