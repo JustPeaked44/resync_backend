@@ -864,7 +864,7 @@ async def _execute_scan_pipeline(
         manuscript_id=manuscript_id,
         analysis_run_id=analysis_run_id,
         coherence_score=int(functional_metric.overall_score),
-        inconsistencies=inconsistency_outputs,   # accepts Pydantic models or dicts
+        inconsistencies=inconsistencies_data,   # accepts Pydantic models or dicts
         recommendations=recommendations,
         citations=citations,
         crossmatch_issues=citation_crossmatch,
