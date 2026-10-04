@@ -1,0 +1,4 @@
+## 2023-10-27 - SSRF Vulnerability via HTTP Redirects
+**Vulnerability:** A Server-Side Request Forgery (SSRF) vulnerability existed where `httpx` would follow HTTP redirects to non-public (internal/private) IP addresses, bypassing the initial URL validation.
+**Learning:** `httpx`'s `follow_redirects=True` automatically resolves and follows redirects, ignoring any custom checks performed on the initial URL before the request was made. A redirect could therefore target an internal service.
+**Prevention:** When using `httpx` with `follow_redirects=True`, apply an asynchronous request event hook (`event_hooks={'request': [hook_function]}`) to the `AsyncClient` to validate the host before *every* request, including all redirects. Use `httpx.ConnectError` and pass `request=request` when raising the error in the hook.
