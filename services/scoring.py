@@ -368,10 +368,12 @@ def compute_citation_integrity(
 # 4. Composite score, band, "biggest lever"
 # ---------------------------------------------------------------------------
 
+# Overall score excludes Citation Integrity as of 2026-10-06. Citation Integrity
+# remains computed and displayed as a separate dimension.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "structural": 0.25,
-    "coherence": 0.50,
-    "citation": 0.25,
+    "structural": 0.40,
+    "coherence": 0.60,
+    "citation": 0.0,
 }
 
 _LEVER_LABELS = {
