@@ -1,0 +1,4 @@
+## 2023-10-24 - [SSRF in HTTPX Redirects]
+**Vulnerability:** A Server-Side Request Forgery (SSRF) vulnerability existed where an initial URL validation step correctly filtered out internal IPs, but the `httpx.AsyncClient` subsequently followed redirects automatically (`follow_redirects=True`). A malicious server could redirect the client to an internal IP (e.g., `169.254.169.254` or `127.0.0.1`), bypassing the initial host check.
+**Learning:** `httpx` does not validate intermediate hosts when following redirects by default. The initial check is insufficient if redirects are enabled.
+**Prevention:** Always use the `event_hooks={'request': [hook_function]}` feature in `httpx` to validate the host before *every* request, including all intermediate redirects. The hook function can be async if using `httpx.AsyncClient`, and it should raise an appropriate exception (like `httpx.ConnectError` with `request=request`) if the host is disallowed.
