@@ -5,3 +5,6 @@ __pycache__/
 graphify-out/
 *.egg-info/
 .claude/worktrees/
+.pytest_cache/
+dist/
+build/
