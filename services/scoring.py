@@ -116,6 +116,17 @@ ROLE_PAIR_WEIGHTS: List[Tuple[str, str, float]] = [
     ("discussion", "conclusion", 0.06),
 ]
 
+# Explicit mapping documenting the academic pairing rationale for each scored role pair.
+ROLE_PAIR_RATIONALE: Dict[Tuple[str, str], str] = {
+    ("objectives", "methodology"): "Objectives <-> Research Design / Methods (Checks methodological alignment)",
+    ("methodology", "results"): "Methods <-> Results / Findings (Verifies data matches planned procedures)",
+    ("results", "discussion"): "Results <-> Discussion / Interpretation (Ensures claims are grounded in findings)",
+    ("objectives", "conclusion"): "Objectives <-> Conclusions (Confirms all research questions are resolved)",
+    ("introduction", "objectives"): "Introduction / Background <-> Problem Statement / Objectives (Validates research gap)",
+    ("abstract", "__document__"): "Abstract <-> Full Manuscript Synthesis (Verifies executive summary coverage)",
+    ("discussion", "conclusion"): "Discussion <-> Conclusions / Recommendations (Guards logical progression)",
+}
+
 # Calibration anchors replacing the old linear ((sim + 1) / 2) * 100 map.
 # all-mpnet-base-v2 cosine similarity is anisotropic: two *unrelated*
 # formal academic paragraphs still land around 0.20-0.35 cosine purely

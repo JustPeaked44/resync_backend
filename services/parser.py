@@ -64,6 +64,7 @@ ROLE_MAPPING: dict = {
     # introduction
     "introduction":                      "introduction",
     "background":                        "introduction",
+    "background of the study":           "introduction",
     "rationale":                         "introduction",
     "rationale of the study":            "introduction",
 
@@ -127,6 +128,14 @@ ROLE_MAPPING: dict = {
     "future work":                       "future_work",
     "future research":                   "future_work",
     "recommendations for future":        "future_work",
+
+    # literature
+    "review of related literature":      "literature",
+    "review of related literature & studies": "literature",
+    "related literature":                "literature",
+    "related studies":                   "literature",
+    "review of literature":              "literature",
+    "literature review":                 "literature",
 }
 
 class ManuscriptParserService:
