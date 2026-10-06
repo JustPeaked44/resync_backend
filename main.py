@@ -787,9 +787,17 @@ async def _execute_scan_pipeline(
     # No 20,000-char slice here anymore — that cap silently truncated a
     # real 150-reference APA list mid-entry. CitationAuditService applies
     # its own much larger DoS-guard cap (150,000 chars) internally.
-    references_text: str = (
-        parsed_sections.get("References") or parsed_sections.get("references") or ""
-    )
+    references_text: str = ""
+    for heading, text in parsed_sections.items():
+        role = section_roles.get(heading, heading.strip().lower())
+        if role == "references":
+            references_text = text
+            break
+    if not references_text:
+        for heading, text in parsed_sections.items():
+            if heading.strip().lower() == "references":
+                references_text = text
+                break
     citation_audit_result: Dict[str, Any] = await CitationAuditService.audit_citations(
         references_text, body_text=raw_text
     )
