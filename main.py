@@ -606,8 +606,6 @@ async def _execute_scan_pipeline(
         ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
     )
     parsed_sections: Dict[str, str] = parse_result["parsed_sections"]
-    missing_sections: List[str] = parse_result["missing_sections"]
-    has_all_required_sections: bool = parse_result["has_all_required_sections"]
 
     # ------------------------------------------------------------------
     # Step 3 – Embedding / Coherence
@@ -625,6 +623,8 @@ async def _execute_scan_pipeline(
         parsed_sections, section_roles,
         detection_confidence=parse_result.get("detection_confidence", 1.0),
     )
+    missing_sections: List[str] = structural_result.missing_required
+    has_all_required_sections: bool = len(structural_result.missing_required) == 0
 
     # ------------------------------------------------------------------
     # Step 3c – Cross-Chapter Coherence (role-aware weighted pair matrix,
