@@ -52,35 +52,41 @@ def compute_structural_completeness(
     missing_opt: List[str] = []
     stubs: List[str] = []
 
+    # Aggregate word counts per canonical role to deduplicate multiple headings
+    role_word_counts: Dict[str, int] = {}
     for heading, text in parsed_sections.items():
         role = section_roles.get(heading, heading.lower())
+        role_word_counts[role] = max(role_word_counts.get(role, 0), len((text or "").split()))
+
+    for role, word_count in role_word_counts.items():
         is_required = role in REQUIRED_ROLES
         weight = REQUIRED_WEIGHT if is_required else OPTIONAL_WEIGHT
         weighted_total += weight
 
-        word_count = len((text or "").split())
-        is_present = word_count >= STRUCTURAL_MIN_WORDS
-        if is_present:
+        if word_count >= STRUCTURAL_MIN_WORDS:
             weighted_present += weight
-            (present_req if is_required else present_opt).append(heading)
+            (present_req if is_required else present_opt).append(role)
         else:
-            (missing_req if is_required else missing_opt).append(heading)
+            (missing_req if is_required else missing_opt).append(role)
             if 0 < word_count < STRUCTURAL_MIN_WORDS:
-                stubs.append(heading)
+                stubs.append(role)
 
-    # Roles present in parsed_sections (by their canonical role, not heading)
-    covered_roles = {
-        section_roles.get(h, h.lower()) for h in parsed_sections
-    }
-    # Required roles the parser found no heading for at all — the existing
-    # loop never sees these, so they were silently excluded from both
-    # weighted_total and missing_req, making the denominator equal the
-    # numerator and the raw score artificially 100%.
-    for role in REQUIRED_ROLES - covered_roles:
+    # Required roles missing from parsed_sections entirely
+    for role in sorted(REQUIRED_ROLES - set(role_word_counts.keys())):
         weighted_total += REQUIRED_WEIGHT
         missing_req.append(role)
 
     raw_score = 100.0 * (weighted_present / weighted_total) if weighted_total else 0.0
+
+    # Cap structural score when required sections are missing
+    missing_count = len(missing_req)
+    if missing_count >= 5:
+        raw_score = min(raw_score, 30.0)
+    elif missing_count >= 4:
+        raw_score = min(raw_score, 40.0)
+    elif missing_count >= 3:
+        raw_score = min(raw_score, 50.0)
+
     # Dampens auto-detect false confidence: a low-confidence auto-detection
     # shouldn't be allowed to claim full structural credit.
     score = raw_score * (0.7 + 0.3 * max(0.0, min(1.0, detection_confidence)))
