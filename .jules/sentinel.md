@@ -1,0 +1,4 @@
+## 2024-10-07 - [SSRF in HTTPx Redirects]
+**Vulnerability:** The application was vulnerable to SSRF through HTTPx redirects in the citation verification process. The original code explicitly mentioned that it only checked the initial URL because it was believed `httpx`'s automatic redirect handling doesn't expose a per-hop hook.
+**Learning:** `httpx` does support an event hook `event_hooks={'request': [hook_function]}` that executes before every request, including redirects. The hook function must validate the host and raise an exception like `httpx.ConnectError` if the host is internal.
+**Prevention:** To prevent SSRF vulnerabilities when using `httpx` with `follow_redirects=True`, apply `event_hooks={'request': [hook_function]}` to validate the host before every request, including redirects. Remember to pass `request=request` when raising `httpx.ConnectError`.
