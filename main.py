@@ -1583,6 +1583,8 @@ class CreditBalanceResponse(BaseModel):
 
 class CheckoutRequest(BaseModel):
     credit_amount: int = Field(..., gt=0, le=100, description="Number of credits to purchase")
+    # Frontend may pass a discounted per-credit rate (e.g. bulk packages). Default 25.0 PHP.
+    unit_price: float = Field(default=25.0, gt=0, le=500.0)
 
 
 class CheckoutResponse(BaseModel):
@@ -1650,7 +1652,9 @@ async def create_credit_checkout(
 ) -> CheckoutResponse:
     _assert_owner(authenticated_user_id, x_user_id)
     try:
-        result = await credits_service.create_checkout(x_user_id, body.credit_amount)
+        result = await credits_service.create_checkout(
+            x_user_id, body.credit_amount, unit_price=body.unit_price
+        )
         return CheckoutResponse(**result)
     except Exception as exc:
         logger.error("Failed to create checkout for user %s: %s", x_user_id, exc)
