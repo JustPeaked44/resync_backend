@@ -3,6 +3,8 @@ import json
 import time
 import uuid
 import logging
+import re
+from html import unescape
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -10,7 +12,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Bod
 import asyncio
 from services.deterministic import DeterministicAuditService, deterministic_service
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from dotenv import load_dotenv
 
 # Load .env FIRST — must happen before service imports
@@ -360,6 +362,10 @@ class CitationReport(BaseModel):
     citation_crossref_title: Optional[str] = None
     citation_title_match_score: Optional[float] = None
     citation_is_cited_in_text: Optional[bool] = None
+
+    @field_serializer("citation_authors_parsed", "citation_crossref_title")
+    def serialize_metadata(self, value: Optional[str]) -> Optional[str]:
+        return unescape(re.sub(r"<[^>]*>", "", value)) if value is not None else None
 
 
 class ScoreBreakdown(BaseModel):
