@@ -454,7 +454,7 @@ async def _resolve_manuscript_id(db_client: Any, req: ScanRequest, default_sourc
 
     new_manuscript_id = str(uuid.uuid4())
     source_name = req.doc_url or req.filename or default_source_name or "Uploaded Document"
-    title = (req.manuscript_title or req.filename or req.doc_url or default_source_name or "Untitled Manuscript")[:250]
+    title = req.manuscript_title or req.filename or req.doc_url or default_source_name or "Untitled Manuscript"
     await asyncio.to_thread(
         lambda: db_client.table("manuscript").insert({
             "manuscript_id": new_manuscript_id,
