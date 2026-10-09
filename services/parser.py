@@ -89,6 +89,7 @@ ROLE_MAPPING: dict = {
     "study design":                      "methodology",
     "approach":                          "methodology",
     "software engineering methodology":  "methodology",
+    "research methodology":              "methodology",
 
     # results
     "result":                            "results",
@@ -123,6 +124,7 @@ ROLE_MAPPING: dict = {
     "limitations":                       "limitations",
     "scope and limitation":              "limitations",
     "scope and limitation of the study": "limitations",
+    "scope and limitations of the study": "limitations",
 
     # future_work
     "future work":                       "future_work",
@@ -156,7 +158,9 @@ class ManuscriptParserService:
         If `template_toc` is provided (and contains real content after
         filtering placeholder junk), sections are parsed against that
         template and keyed by the original template heading strings — this
-        is the existing TOC-driven path. If `template_toc` is None (omitted
+        is the existing TOC-driven path. Recognized academic headings absent
+        from the template are retained under their manuscript heading names.
+        If `template_toc` is None (omitted
         entirely by the caller), "scan and go" auto-detection is used
         instead (see auto_detect_sections()): sections are detected
         heuristically from the document itself and keyed by canonical role.
@@ -233,15 +237,16 @@ class ManuscriptParserService:
             # Skip TOC-style "Heading . . . . 14" lines
             if toc_line_re.search(line):
                 continue
+            if line.lower() in ["appendices", "appendix", "curriculum vitae"]:
+                break
             matched_header = cls._match_header(line, template_toc)
             if matched_header:
+                parsed_sections_lines.setdefault(matched_header, [])
                 # If the section accumulated very little content so far it was
                 # probably a TOC occurrence — reset and start fresh from here.
                 if len("\n".join(parsed_sections_lines[matched_header]).strip()) < 150:
                     parsed_sections_lines[matched_header] = []
                 current_section = matched_header
-            elif line.strip().lower() in ["appendices", "appendix", "curriculum vitae"]:
-                current_section = None
             else:
                 if current_section and current_section in parsed_sections_lines:
                     parsed_sections_lines[current_section].append(line)
@@ -267,7 +272,7 @@ class ManuscriptParserService:
             "parsed_sections": parsed_sections,
             "missing_sections": missing_sections,
             "has_all_required_sections": len(missing_sections) == 0,
-            "total_sections_count": len(template_toc),
+            "total_sections_count": len(parsed_sections),
             "section_roles": section_roles,  # heading → standardized role
             "auto_detected": False,
             "detection_confidence": 1.0,
@@ -542,7 +547,17 @@ class ManuscriptParserService:
         
         for header in template_toc:
             clean_header = header.strip().lower()
-            # Exact match or prefix match
-            if clean_line == clean_header or clean_line.startswith(clean_header):
+            # Allow heading decorations, not prose such as "References the user".
+            suffix = clean_line[len(clean_header):].strip()
+            if clean_line == clean_header or (
+                clean_line.startswith(clean_header)
+                and (suffix == "s" or suffix.startswith(("(", "/", "cont'd", "cont’d", "summary")))
+            ):
                 return header
+        # Keep known academic headings under their own names when a template
+        # uses different wording; do not relabel them as unrelated template topics.
+        if clean_line in ROLE_MAPPING and (
+            len(clean_line.split()) > 1 or clean_line in ROLE_MAPPING.values()
+        ):
+            return line.strip()
         return None
