@@ -248,7 +248,7 @@ def compute_cross_chapter_coherence(
         if va is None or vb is None:
             pair_scores.append({
                 "role_a": role_a, "role_b": role_b, "weight": weight,
-                "included": False, "reason": "role missing or empty",
+                "included": False, "score": None, "reason": "role missing or empty",
             })
             continue
 
@@ -257,7 +257,7 @@ def compute_cross_chapter_coherence(
         if norm_a == 0 or norm_b == 0:
             pair_scores.append({
                 "role_a": role_a, "role_b": role_b, "weight": weight,
-                "included": False, "reason": "role missing or empty",
+                "included": False, "score": None, "reason": "role missing or empty",
             })
             continue
 
