@@ -1,0 +1,5 @@
+## 2026-10-09 - Fix SSRF via httpx redirects
+
+**Vulnerability:** A Server-Side Request Forgery (SSRF) vulnerability existed where the system correctly verified the initial URL host but blindly followed HTTP redirects to any internal or private IP address since `httpx.AsyncClient` was initialized with `follow_redirects=True` without a redirect hook.
+**Learning:** `httpx` handles redirects automatically before returning control to the caller. Checking the initial host is insufficient; every hop in the redirect chain must be verified. The correct way to intercept and validate redirects in `httpx` is using event hooks (`event_hooks={'request': [hook_function]}`).
+**Prevention:** Whenever using `httpx` with `follow_redirects=True` for fetching user-provided URLs, always apply an event hook that verifies the host for every request in the chain. Furthermore, ensure async wrappers (e.g. `asyncio.to_thread`) are used for synchronous networking calls (e.g. `socket.getaddrinfo`) within those async hooks.
