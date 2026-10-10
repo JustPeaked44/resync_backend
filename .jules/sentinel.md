@@ -1,0 +1,4 @@
+## 2025-02-14 - Fixed SSRF Vulnerability in httpx Client
+**Vulnerability:** Server-Side Request Forgery (SSRF) allowed access to internal networks via HTTP redirects. The application checked the initial host but failed to validate hosts during subsequent redirects, as `httpx` automatically handled them with `follow_redirects=True`.
+**Learning:** Initial validation before executing a request is insufficient when the client is configured to follow redirects automatically, as malicious redirects can bypass the initial check and target internal resources.
+**Prevention:** Use HTTPX `event_hooks={'request': [hook_function]}` to consistently validate the host on every request, including all intermediate redirects. Ensure the hook safely wraps blocking operations (like DNS resolution) in `asyncio.to_thread`.
