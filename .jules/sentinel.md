@@ -1,0 +1,4 @@
+## 2024-05-24 - Fix SSRF Vulnerability in Google Docs Import
+**Vulnerability:** In `services/ingestion.py`, an SSRF vulnerability exists when fetching plaintext from a user-provided Google Docs URL. The user-provided link is used to fetch a document from `https://docs.google.com/document/d/{doc_id}/export?format=txt` with `follow_redirects=True`, but there is no protection against redirects to internal network addresses. This allows an attacker to exploit the HTTP client to access internal services.
+**Learning:** The URL extracted from user input was used in an `httpx` request with `follow_redirects=True` without an event hook to validate the destination host after each redirect.
+**Prevention:** Always validate the host against a whitelist or use an event hook to ensure that the request (including redirects) only accesses public IP addresses, similar to how it was addressed in other parts of the codebase.
