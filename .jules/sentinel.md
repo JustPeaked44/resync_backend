@@ -1,0 +1,4 @@
+## 2024-10-14 - SSRF via unvalidated HTTPx Redirects
+**Vulnerability:** Server-Side Request Forgery (SSRF) could be triggered in `httpx` because `follow_redirects=True` automatically followed redirects to arbitrary IP addresses (including internal ones), bypassing initial host validation checks in functions like `_check_http_reachability` and when fetching documents.
+**Learning:** Checking the initial hostname is insufficient when using an HTTP client configured to follow redirects automatically. Redirects can resolve to loopback, link-local, or private IP addresses, exposing internal network infrastructure.
+**Prevention:** Always validate the host on every request (including redirects). When using `httpx`, this can be safely accomplished by using `event_hooks={"request": [_verify_request_host]}` to run a host validation function right before each request is issued over the network.
