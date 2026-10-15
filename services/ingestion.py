@@ -3,6 +3,7 @@ import re
 import io
 import httpx
 from fastapi import HTTPException, status
+from services.security import _verify_request_host
 
 class DocumentIngestionService:
     """
@@ -40,7 +41,8 @@ class DocumentIngestionService:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=60.0,
-            headers=headers
+            headers=headers,
+            event_hooks={'request': [_verify_request_host]}
         ) as client:
             try:
                 response = await client.get(export_url)
