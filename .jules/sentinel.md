@@ -1,0 +1,4 @@
+## 2024-10-15 - Prevent SSRF with HTTPX Follow Redirects
+**Vulnerability:** Server-Side Request Forgery (SSRF) bypass due to `follow_redirects=True` on `httpx.AsyncClient` where initial validation of the host is skipped on subsequent redirects.
+**Learning:** Checking the host domain initially is insufficient if redirects are allowed, as a safe public URL can redirect to an internal IP (like AWS metadata IP `169.254.169.254` or internal services).
+**Prevention:** Use `httpx` `event_hooks={'request': [hook_fn]}` to intercept and validate the host *before every single request*, including any requests triggered by redirects. Ensure async environments wrap synchronous socket functions properly (e.g., `asyncio.to_thread`).
