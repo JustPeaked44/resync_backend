@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 import httpx
 
+from services.security import _is_safe_public_host, _verify_request_host
 from services.reference_parser import (
     ParsedReferenceEntry,
     build_parsed_entries,
@@ -168,26 +169,6 @@ async def _resolve_doi_metadata(doi: str, client: httpx.AsyncClient) -> Optional
         return None
 
 
-def _is_safe_public_host(host: str) -> bool:
-    """SSRF guard: reference links come from user-submitted manuscript text,
-    so before fetching one, reject any hostname that resolves to a private,
-    loopback, link-local, or otherwise non-public address (e.g. cloud
-    metadata endpoints or internal services). Only the initial URL is
-    checked -- a redirect to an internal address is a known residual gap,
-    acceptable here since httpx's automatic redirect handling doesn't
-    expose a per-hop hook without materially more code."""
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return False
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            return False
-    return True
 
 
 async def _check_http_reachability(url: str, client: httpx.AsyncClient) -> int:
@@ -343,7 +324,10 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            event_hooks={"request": [_verify_request_host]}
+        ) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
