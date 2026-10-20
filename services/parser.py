@@ -237,8 +237,9 @@ class ManuscriptParserService:
             # Skip TOC-style "Heading . . . . 14" lines
             if toc_line_re.search(line):
                 continue
-            if line.lower() in ["appendices", "appendix", "curriculum vitae"]:
-                break
+            if line.strip().lower() in ["appendices", "appendix", "curriculum vitae"]:
+                current_section = None
+                continue
             matched_header = cls._match_header(line, template_toc)
             if matched_header:
                 parsed_sections_lines.setdefault(matched_header, [])
