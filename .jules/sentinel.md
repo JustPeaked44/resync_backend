@@ -1,0 +1,4 @@
+## 2024-10-21 - SSRF Vulnerability in httpx Client with follow_redirects=True
+**Vulnerability:** The codebase relies on `httpx.AsyncClient` with `follow_redirects=True` in several places (`services/citation.py`, `services/ingestion.py`), but the existing SSRF guard `_is_safe_public_host` is only applied to the initial URL. Redirects are automatically followed without verification, allowing an attacker to bypass the initial check and redirect to an internal or private endpoint.
+**Learning:** `httpx`'s automatic redirect handling doesn't expose a per-hop hook easily, requiring the use of event hooks (`event_hooks={'request': [...]}`) to validate the host before every request, including redirects.
+**Prevention:** Apply an event hook to all `httpx.AsyncClient` instances that follow redirects, particularly when fetching user-controlled URLs. Centralize the SSRF security functions in `services/security.py`.
