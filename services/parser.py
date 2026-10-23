@@ -163,7 +163,8 @@ class ManuscriptParserService:
         If `template_toc` is None (omitted
         entirely by the caller), "scan and go" auto-detection is used
         instead (see auto_detect_sections()): sections are detected
-        heuristically from the document itself and keyed by canonical role.
+        heuristically from the document itself and keyed by source-ordered
+        occurrence names; `section_roles` maps those names to canonical roles.
 
         Detects missing mandatory sections based on the template
         (TOC-driven path) or against a minimal required role set
@@ -178,7 +179,8 @@ class ManuscriptParserService:
         Returns:
             Dict with keys: "parsed_sections", "missing_sections",
             "has_all_required_sections", "total_sections_count",
-            "section_roles", "auto_detected", "detection_confidence".
+            "section_roles", "auto_detected", "detection_confidence",
+            "section_order".
         """
         # Remember whether the caller omitted the TOC entirely, before the
         # junk-filtering step below reassigns template_toc. Only a genuine
@@ -198,15 +200,21 @@ class ManuscriptParserService:
             # --- "Scan and go" auto-detection path (no template supplied) ---
             detection = cls.auto_detect_sections(text)
             parsed_sections = detection["sections"]
-            # Roles are already normalized keys, so section_roles is a
-            # self-mapping — keeps parsed_sections/section_roles key-consistent
-            # for downstream consumers (embedding/coherence/deterministic checks).
-            section_roles: Dict[str, str] = {role: role for role in parsed_sections}
+            # Keep each detected occurrence in source order. Downstream scoring
+            # still groups these keys through section_roles when it needs roles.
+            section_roles: Dict[str, str] = detection.get(
+                "section_roles",
+                {role: role for role in parsed_sections},
+            )
 
             required_roles = {"introduction", "methodology", "results", "discussion"}
+            role_lengths: Dict[str, int] = {}
+            for heading, content in parsed_sections.items():
+                role = section_roles.get(heading, heading)
+                role_lengths[role] = role_lengths.get(role, 0) + len(content)
             missing_sections = [
                 role for role in required_roles
-                if role not in parsed_sections or len(parsed_sections[role]) < 20
+                if role_lengths.get(role, 0) < 20
             ]
 
             return {
@@ -218,6 +226,7 @@ class ManuscriptParserService:
                 "auto_detected": True,
                 "detection_confidence": detection["confidence"],
                 "research_type": detection.get("research_type", "unknown"),
+                "section_order": detection.get("section_order", list(parsed_sections)),
             }
 
         # Fallback to default TOC template if list is empty or invalid
@@ -229,6 +238,7 @@ class ManuscriptParserService:
 
         parsed_sections_lines: Dict[str, List[str]] = {section: [] for section in template_toc}
         current_section = template_toc[0]  # Dynamically set initial section
+        matched_section_keys: List[str] = []
 
 
         # 2. Iterate line-by-line and match headings
@@ -242,12 +252,22 @@ class ManuscriptParserService:
                 continue
             matched_header = cls._match_header(line, template_toc)
             if matched_header:
-                parsed_sections_lines.setdefault(matched_header, [])
+                section_key = matched_header
+                if section_key in parsed_sections_lines:
+                    existing_content = "\n".join(parsed_sections_lines[section_key]).strip()
+                    if len(existing_content) >= 150:
+                        occurrence = 2
+                        while f"{matched_header} ({occurrence})" in parsed_sections_lines:
+                            occurrence += 1
+                        section_key = f"{matched_header} ({occurrence})"
+                parsed_sections_lines.setdefault(section_key, [])
                 # If the section accumulated very little content so far it was
                 # probably a TOC occurrence — reset and start fresh from here.
-                if len("\n".join(parsed_sections_lines[matched_header]).strip()) < 150:
-                    parsed_sections_lines[matched_header] = []
-                current_section = matched_header
+                if len("\n".join(parsed_sections_lines[section_key]).strip()) < 150:
+                    parsed_sections_lines[section_key] = []
+                current_section = section_key
+                if section_key not in matched_section_keys:
+                    matched_section_keys.append(section_key)
             else:
                 if current_section and current_section in parsed_sections_lines:
                     parsed_sections_lines[current_section].append(line)
@@ -255,7 +275,13 @@ class ManuscriptParserService:
         # 3. Join with newlines (a space-joined blob collapses a multi-entry
         # References list into one line, which downstream reference
         # segmentation can't split) and clean up leading/trailing whitespace
-        parsed_sections = {k: "\n".join(v).strip() for k, v in parsed_sections_lines.items()}
+        ordered_keys = matched_section_keys + [
+            section for section in parsed_sections_lines if section not in matched_section_keys
+        ]
+        parsed_sections = {
+            key: "\n".join(parsed_sections_lines[key]).strip()
+            for key in ordered_keys
+        }
 
         # 4. Identify missing mandatory sections (< 20 characters)
         missing_sections = [
@@ -278,6 +304,7 @@ class ManuscriptParserService:
             "auto_detected": False,
             "detection_confidence": 1.0,
             "research_type": "unknown",
+            "section_order": list(parsed_sections),
         }
 
     @classmethod
@@ -304,12 +331,15 @@ class ManuscriptParserService:
 
         Returns:
             Dict with keys:
-                "sections": Dict[str, str] mapping role -> accumulated body
-                    text for that role.
+                "sections": Dict[str, str] mapping each detected section
+                    occurrence to its body text, in source order. Repeated
+                    canonical roles receive a numbered suffix.
                 "confidence": float in [0.0, 1.0] estimating how reliable
                     the auto-detection is for this document.
                 "detected_headings": List[str] of the raw heading lines
                     found, in document order.
+                "section_roles": Dict[str, str] mapping occurrence names to
+                    canonical roles.
         """
         core_roles = ("introduction", "methodology", "results", "discussion")
         extra_roles = ("abstract", "objectives", "conclusion", "references")
@@ -324,9 +354,11 @@ class ManuscriptParserService:
         lines = [line.strip() for line in text.split("\n") if line.strip()]
 
         sections_lines: Dict[str, List[str]] = {}
+        role_keys: Dict[str, List[str]] = {}
+        section_roles: Dict[str, str] = {}
         detected_headings: List[str] = []
         detected_roles_in_order: List[str] = []
-        current_role: Optional[str] = None
+        current_section_key: Optional[str] = None
 
         # Regex to detect TOC-style "heading . . . . . . 12" lines
         toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
@@ -341,15 +373,22 @@ class ManuscriptParserService:
                 # If we already have this role and its content so far is very
                 # short (< 150 chars), it was likely a TOC entry — discard it
                 # and restart accumulation from this real heading occurrence.
-                if role in sections_lines and len("\n".join(sections_lines[role]).strip()) < 150:
-                    sections_lines[role] = []
-                current_role = role
-                if role not in sections_lines:
-                    sections_lines[role] = []
+                previous_keys = role_keys.get(role, [])
+                previous_key = previous_keys[-1] if previous_keys else None
+                if previous_key and len("\n".join(sections_lines[previous_key]).strip()) < 150:
+                    section_key = previous_key
+                    sections_lines[section_key] = []
+                else:
+                    occurrence = len(previous_keys) + 1
+                    section_key = role if occurrence == 1 else f"{role} ({occurrence})"
+                    role_keys.setdefault(role, []).append(section_key)
+                    sections_lines[section_key] = []
+                section_roles[section_key] = role
+                current_section_key = section_key
                 detected_headings.append(line)
                 detected_roles_in_order.append(role)
-            elif current_role is not None:
-                sections_lines[current_role].append(line)
+            elif current_section_key is not None:
+                sections_lines[current_section_key].append(line)
 
         # 2. Join with newlines (see parse_manuscript_sections for why: a
         # space-joined blob collapses a multi-entry References list into
@@ -409,6 +448,8 @@ class ManuscriptParserService:
             "confidence": confidence,
             "detected_headings": detected_headings,
             "research_type": research_type,
+            "section_roles": section_roles,
+            "section_order": list(sections),
         }
 
     @classmethod

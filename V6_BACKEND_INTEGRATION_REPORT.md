@@ -448,3 +448,82 @@ Confirmed:
 Best-evidenced hypothesis for the owner's reported attempt, not a confirmed fact: the attempt did not reach the current local process/database target that was inspected—most plausibly the pre-v6 stale listener or a different Supabase project/URL was used. The owner’s SQL Editor project and the original attempt’s request log or analysis-run ID were not available, so this workspace cannot prove which of those two external-routing possibilities occurred. The local current-code path and the `.env` target are ruled out as causes of failure by the successful reproduction above.
 
 No backend fix was made because the reproduction did not fail. The current-code server is left running on port 8000.
+
+## Google Docs Manuscript Ordering Diagnostic
+
+Run date: 2026-10-23 (Asia/Manila).
+
+### What the backend actually does
+
+The Google Docs path does not use the Google Docs API and does not scrape the rendered editor page. `DocumentIngestionService.extract_google_doc_id()` extracts the `/document/d/{id}` segment at `services/ingestion.py:14-23`, then `fetch_plaintext_from_gdoc()` performs an `httpx` request to:
+
+```text
+https://docs.google.com/document/d/{id}/export?format=txt
+```
+
+That URL is constructed at `services/ingestion.py:31-32` and fetched at `services/ingestion.py:39-46`. The production scan calls that service at `main.py:603-617`, then passes the returned plaintext to `ManuscriptParserService.parse_manuscript_sections()`.
+
+The preview route is a second, duplicated plaintext-export fetch: it builds the same `format=txt` URL at `main.py:1473`, fetches it at `main.py:1481-1494`, and returns `strip_document_noise()` output at `main.py:1505-1519`. That route does not call the parser. Its cleaner normalizes line endings/blank lines and removes figure/table/chart caption lines; it does not sort the remaining lines.
+
+No concrete Google Docs URL exists in this repository, and no owner-provided public/authenticated document was available for a real network reproduction. The reproduction below therefore uses a local plaintext fixture matching the exact `format=txt` payload shape requested by the code. It confirms backend parser ordering loss without making a claim about Google’s handling of tables, columns, headers/footers, or other visual-only layout constructs that are not represented in this export.
+
+### Confirmed root cause
+
+Before this fix, the auto-detection loop in the current `services/parser.py:353-392` area stored content under `sections_lines[role]` (the pre-fix file used that role key directly). A later heading that mapped to an already-seen canonical role, such as `Background` mapping to `introduction`, was appended to the first role bucket. The output dictionary consequently exposed one `introduction` entry before `methodology`, even when the later introduction-role content appeared after methodology in the source.
+
+The template path had a separate ordering defect: `parsed_sections_lines` is initialized from `template_toc` at `services/parser.py:238`, and the pre-fix comprehension (originally `services/parser.py:258`) emitted that template order rather than source encounter order. The `canonical_order` list is now at `services/parser.py:343-347` and is used only for the confidence penalty at `services/parser.py:409-418`; it is not an output sort.
+
+### Fix
+
+- Repeated auto-detected roles now receive deterministic occurrence keys such as `introduction` and `introduction (2)` at `services/parser.py:373-383`, preserving each content block and its source insertion order.
+- The template path records encountered section keys and emits present sections in encounter order, then appends template sections that were absent (`services/parser.py:239-286`).
+- `section_roles` maps each occurrence key back to its canonical role. The production response now uses the parser’s explicit `section_order` at `main.py:620`, `main.py:934`, and `main.py:980`.
+- Scoring remains role-based by design: `services/scoring.py:204-229` still concatenates repeated occurrence keys under the canonical role, in source order, for reasoning/coherence. This preserves the existing scoring contract while keeping the returned/analyzed section sequence faithful to the source. Repeated role occurrences are therefore separate in ordered output but intentionally grouped for role-level scoring.
+
+### Reproduction and captured output
+
+Fixture: `tests/fixtures/google_docs_plaintext_ordering_export.txt`. The source heading sequence is `Introduction -> Methodology -> Background -> Results`, where `Background` maps to the same role as `Introduction`.
+
+Running the pre-fix `HEAD` parser against that fixture produced:
+
+```text
+FORMAT=txt_SIMULATION=local_plaintext_export
+SOURCE_HEADINGS= ['Introduction', 'Methodology', 'Background', 'Results']
+PARSED_KEYS= ['introduction', 'methodology', 'results']
+INTRODUCTION_BODY_MARKERS= ['INTRODUCTION_FIRST', 'INTRODUCTION_SECOND']
+METHODOLOGY_BODY_MARKERS= ['METHODOLOGY_BODY']
+RESULTS_BODY_MARKERS= ['RESULTS_BODY']
+```
+
+After the fix, the same fixture and parsing path produced:
+
+```text
+FORMAT=txt_SIMULATION=local_plaintext_export
+SOURCE_HEADINGS= ['Introduction', 'Methodology', 'Background', 'Results']
+PARSED_KEYS= ['introduction', 'methodology', 'introduction (2)', 'results']
+SECTION_ORDER= ['introduction', 'methodology', 'introduction (2)', 'results']
+INTRODUCTION_BODY_MARKERS= ['INTRODUCTION_FIRST']
+METHODOLOGY_BODY_MARKERS= ['METHODOLOGY_BODY']
+INTRODUCTION (2)_BODY_MARKERS= ['INTRODUCTION_SECOND']
+RESULTS_BODY_MARKERS= ['RESULTS_BODY']
+ROLE_GROUPED_INTRO_MARKERS= ['INTRODUCTION_FIRST', 'INTRODUCTION_SECOND']
+```
+
+The template-order reproduction also passed after the fix:
+
+```text
+SOURCE_HEADINGS= Results -> Introduction -> Methodology
+TEMPLATE_ORDER= Introduction -> Methodology -> Results -> Discussion
+PARSED_KEYS= ['Results', 'Introduction', 'Methodology', 'Discussion']
+SECTION_ORDER= ['Results', 'Introduction', 'Methodology', 'Discussion']
+```
+
+### Verification
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+......................................                                   [100%]
+38 passed in 47.48s
+```
+
+The new ordering regression tests are in `tests/test_parser_ordering.py`; the full suite passed. A real Google Docs fetch was not verified because this workspace had no concrete public/authenticated document URL, so visual-layout flattening outside the plaintext export remains an external limitation rather than a confirmed backend behavior.

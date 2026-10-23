@@ -617,6 +617,7 @@ async def _execute_scan_pipeline(
         ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
     )
     parsed_sections: Dict[str, str] = parse_result["parsed_sections"]
+    section_order: List[str] = parse_result.get("section_order", list(parsed_sections))
 
     # ------------------------------------------------------------------
     # Step 3 – Embedding / Coherence
@@ -930,7 +931,7 @@ async def _execute_scan_pipeline(
             "flagged_sections": ai_text_result.flagged_sections,
         },
         doc_url=source_identifier,
-        sections_analyzed=list(parsed_sections.keys()),
+        sections_analyzed=section_order,
         missing_sections=missing_sections,
         has_all_required_sections=has_all_required_sections,
         inconsistencies_found=len(inconsistencies_data),
@@ -976,7 +977,7 @@ async def _execute_scan_pipeline(
         manuscript_id=manuscript_id,
         doc_url=source_identifier,
         overall_coherence_score=functional_metric.overall_score,
-        sections_analyzed=list(parsed_sections.keys()),
+        sections_analyzed=section_order,
         missing_sections=missing_sections,
         has_all_required_sections=has_all_required_sections,
         section_scores=coherence_result.section_scores,

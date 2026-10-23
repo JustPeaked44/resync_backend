@@ -1,0 +1,8 @@
+Introduction
+INTRODUCTION_FIRST: The opening section establishes the research context and gives enough detail to make this body longer than the parser heuristic threshold. It remains before methodology in the source export and must remain there when sections are returned.
+Methodology
+METHODOLOGY_BODY: The method section is deliberately between two introduction-role headings so the source order is observable.
+Background
+INTRODUCTION_SECOND: This later background subsection appears after methodology in the source export and must not be pulled ahead of it in an ordered view.
+Results
+RESULTS_BODY: The findings follow the later background subsection in the source export.
