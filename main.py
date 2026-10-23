@@ -29,7 +29,8 @@ torch.set_num_threads(1)
 
 from services.ingestion import DocumentIngestionService
 from services.parser import ManuscriptParserService
-from services.embedding import embedding_service
+from services.embedding import embedding_service, predict_coherence
+from services.xai_utils import explain_pair
 from services.reasoning import reasoning_service
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
@@ -42,6 +43,8 @@ from services.scoring import (
     compute_functional_metric,
     aggregate_role_texts,
     PAR_SCORE,
+    ROLE_PAIR_WEIGHTS,
+    ROLE_PAIR_RATIONALE,
 )
 from services.ai_text import compute_manuscript_ai_text_indicator
 from services.reference_parser import extract_intext_citations
@@ -322,7 +325,7 @@ class ScanRequest(BaseModel):
 
 
 class InconsistencyReport(BaseModel):
-    """Serialisable representation of a single XAI inconsistency finding."""
+    """A material_issue or advisory key_strength finding."""
     section_a: str
     section_b: str
     # Optional: a deterministic numeric-audit flag has no coherence score
@@ -378,6 +381,8 @@ class ScoreBreakdown(BaseModel):
     biggest_lever: Optional[Dict[str, Any]] = None
     structural_detail: Dict[str, Any] = {}
     coherence_detail: Dict[str, Any] = {}
+    # Advisory v6 dimensions keyed by role_a::role_b, separate from the scored pair_scores.
+    v6_dimensions: Optional[Dict[str, Dict[str, Optional[float]]]] = None
     citation_detail: Dict[str, Any] = {}
     research_type: Optional[str] = None
 
@@ -403,7 +408,7 @@ class ScanResponse(BaseModel):
     has_all_required_sections: bool
     section_scores: List[Dict[str, Any]]
     inconsistencies_found: int
-    inconsistencies: List[InconsistencyReport]
+    inconsistencies: List[InconsistencyReport]  # finding_status: material_issue or key_strength
     verifications: List[VerificationReport] = []
     citations_audited: int
     citations: List[CitationReport]
@@ -661,6 +666,41 @@ async def _execute_scan_pipeline(
         item.model_dump() for item in inconsistency_outputs
     ]
 
+    v6_dimensions: Dict[str, Dict[str, Optional[float]]] = {}
+    for role_a, role_b, _ in ROLE_PAIR_WEIGHTS:
+        text_a, text_b = role_texts.get(role_a), role_texts.get(role_b)
+        pair_key = f"{role_a}::{role_b}"
+        dimensions = (await asyncio.to_thread(predict_coherence, text_a, text_b)
+                      if text_a and text_b else dict.fromkeys((
+                          "objectives_alignment", "methodology_fit", "numeric_consistency",
+                          "claim_support", "overall_coherence",
+                      )))
+        v6_dimensions[pair_key] = dimensions
+        existing = next((item for item in inconsistencies_data
+                         if item.get("section_a") == role_a and item.get("section_b") == role_b), None)
+        if existing and text_a and text_b and (not existing.get("evidence_verified") or not existing.get("evidence_a") or not existing.get("evidence_b")):
+            evidence = await asyncio.to_thread(explain_pair, text_a, text_b)
+            for side in ("a", "b"):
+                field = f"evidence_{side}"
+                if not existing.get(field):
+                    existing[field] = " ".join(entry["sentence"] for entry in evidence[field]["top_undermining"])
+            existing["evidence_verified"] = bool(existing.get("evidence_a") and existing.get("evidence_b"))
+        if dimensions["overall_coherence"] is not None and dimensions["overall_coherence"] > 0.80 and existing is None:
+            evidence = await asyncio.to_thread(explain_pair, text_a, text_b)
+            inconsistencies_data.append({
+                "inconsistency_id": str(uuid.uuid4()),
+                "section_a": role_a,
+                "section_b": role_b,
+                "coherence_score": round(dimensions["overall_coherence"] * 100, 2),
+                "explanation_what": f"The v6 model rates {role_a} and {role_b} as strongly coherent.",
+                "explanation_why": f"Advisory model estimate for {ROLE_PAIR_RATIONALE[(role_a, role_b)]}.",
+                "suggested_fix": "Preserve this connection when revising these sections.",
+                "evidence_a": " ".join(entry["sentence"] for entry in evidence["evidence_a"]["top_supporting"]),
+                "evidence_b": " ".join(entry["sentence"] for entry in evidence["evidence_b"]["top_supporting"]),
+                "evidence_verified": True,
+                "finding_status": "key_strength",
+            })
+
     # ------------------------------------------------------------------
     # Step 4b – Deterministic Numeric Audit
     # ------------------------------------------------------------------
@@ -836,6 +876,7 @@ async def _execute_scan_pipeline(
     # coherence_detail dict here rather than in scoring.py -- it already
     # rides whole into both persistence and the API response.
     score_breakdown_dict: Dict[str, Any] = functional_metric.to_dict()
+    score_breakdown_dict["v6_dimensions"] = v6_dimensions
     score_breakdown_dict["research_type"] = parse_result.get("research_type", "unknown")
     score_breakdown_dict.setdefault("coherence_detail", {})
     score_breakdown_dict["coherence_detail"]["dismissed_pairs"] = dismissed_pairs
@@ -870,7 +911,7 @@ async def _execute_scan_pipeline(
             ),
         }
         for item in inconsistencies_data
-        if item.get("suggested_fix")
+        if item.get("suggested_fix") and item.get("finding_status", "material_issue") == "material_issue"
     ]
 
     db_result: Dict[str, Any] = await DatabasePersistenceService.save_scan_transaction(

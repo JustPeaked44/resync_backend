@@ -3,6 +3,10 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 from sentence_transformers import SentenceTransformer
+import logging
+import torch
+from transformers import AutoTokenizer
+from services.v6_model import MultiHeadMiniLM
 
 # Minimum word count to consider a section as having real content
 EMPTY_SECTION_WORD_THRESHOLD = 5
@@ -22,7 +26,7 @@ class EmbeddingService:
         if cls._instance is None:
             cls._instance = super(EmbeddingService, cls).__new__(cls)
             # Singleton model initialization: loads once at app startup
-            cls._model = SentenceTransformer("./models/minilm-dost-v4")
+            cls._model = SentenceTransformer("./models/model_v5b")
         return cls._instance
 
     def _is_empty_section(self, text: str) -> bool:
@@ -170,3 +174,39 @@ class EmbeddingService:
 
 # Module-level singleton instance
 embedding_service = EmbeddingService()
+
+_V6_KEYS = (
+    "objectives_alignment", "methodology_fit", "numeric_consistency",
+    "claim_support", "overall_coherence",
+)
+try:
+    _v6_model = MultiHeadMiniLM()
+    _v6_weights = torch.load("./models/v6_model.pt", map_location="cpu", weights_only=True)
+    # The checkpoint used older layer names; translate names only and keep strict shape/key validation.
+    _v6_names = {
+        "shared.0": "shared", "head_obj": "objectives_alignment",
+        "head_meth": "methodology_fit", "head_num": "numeric_consistency",
+        "head_claim": "claim_support", "head_overall": "overall_coherence",
+    }
+    for old, new in _v6_names.items():
+        for key in list(_v6_weights):
+            if key.startswith(old + "."):
+                _v6_weights[key.replace(old + ".", new + ".", 1)] = _v6_weights.pop(key)
+    _v6_model.load_state_dict(_v6_weights)
+    _v6_model.eval()
+    _v6_tokenizer = AutoTokenizer.from_pretrained("./models/model_v5b", local_files_only=True)
+except Exception:
+    logging.getLogger("resync.embedding").exception("Failed to load v6 coherence model")
+    raise
+
+
+def predict_coherence(section_a_text: str, section_b_text: str) -> dict:
+    if any(len((text or "").strip().split()) < EMPTY_SECTION_WORD_THRESHOLD
+           for text in (section_a_text, section_b_text)):
+        return {key: None for key in _V6_KEYS}
+
+    a = _v6_tokenizer(section_a_text, max_length=256, truncation=True, padding=True, return_tensors="pt")
+    b = _v6_tokenizer(section_b_text, max_length=256, truncation=True, padding=True, return_tensors="pt")
+    with torch.no_grad():
+        result = _v6_model(a["input_ids"], a["attention_mask"], b["input_ids"], b["attention_mask"])
+    return {key: float(result[key].item()) for key in _V6_KEYS}

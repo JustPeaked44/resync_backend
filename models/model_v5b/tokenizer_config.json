@@ -3,7 +3,7 @@
   "cls_token": "[CLS]",
   "do_basic_tokenize": true,
   "do_lower_case": true,
-  "is_local": false,
+  "is_local": true,
   "local_files_only": false,
   "mask_token": "[MASK]",
   "max_length": 128,
