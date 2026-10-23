@@ -1,0 +1,4 @@
+## 2026-10-23 - SSRF Vulnerability via httpx Redirects
+**Vulnerability:** Server-Side Request Forgery (SSRF) bypass when `httpx.AsyncClient` is configured with `follow_redirects=True`. The initial URL was validated to ensure it resolved to a public IP, but redirects could return a `302 Found` with a `Location` header pointing to an internal IP (like 127.0.0.1 or 169.254.169.254), which `httpx` would automatically follow without validating.
+**Learning:** `httpx` does not expose a per-redirect validation hook directly. To ensure every request in a redirect chain is validated, an event hook must be added to the `httpx.AsyncClient` via `event_hooks={"request": [_verify_request_host]}`.
+**Prevention:** Whenever using `httpx` with `follow_redirects=True` for user-provided URLs, always apply an event hook that runs the target host through an IP validation check before the request is executed.
