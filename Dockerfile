@@ -6,11 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cap thread pools before any torch/numpy import — free tier has 0.1 CPU,
-# and torch defaults its thread count to the host's core count otherwise.
-ENV OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    HF_HOME=/app/.cache/huggingface
+# Cap NumPy's thread pool on the free-tier CPU.
+ENV OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 
 # Copy application code
 COPY . .

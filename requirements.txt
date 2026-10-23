@@ -9,9 +9,4 @@ supabase~=2.31.0
 python-docx~=1.1.2
 pypdf~=5.1.0
 python-multipart~=0.0.20
-sentence-transformers>=3.0.0,<6.0.0
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
-torch==2.13.0+cpu
-
-en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+modal~=1.6.2

@@ -21,16 +21,8 @@ from dotenv import load_dotenv
 # override=True ensures .env values WIN over Windows system env vars.
 load_dotenv(override=True)
 
-# Cap torch's intra-op thread pool before any model is imported below —
-# Render free tier gives 0.1 CPU, but torch defaults to os.cpu_count() of
-# the host machine (8-16), causing thread contention under concurrent scans.
-import torch
-torch.set_num_threads(1)
-
 from services.ingestion import DocumentIngestionService
-from services.parser import ManuscriptParserService
-from services.embedding import embedding_service, predict_coherence
-from services.xai_utils import explain_pair
+from services.ml_client import ml_client
 from services.reasoning import reasoning_service
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
@@ -46,7 +38,6 @@ from services.scoring import (
     ROLE_PAIR_WEIGHTS,
     ROLE_PAIR_RATIONALE,
 )
-from services.ai_text import compute_manuscript_ai_text_indicator
 from services.reference_parser import extract_intext_citations
 
 logger = logging.getLogger("resync.main")
@@ -205,6 +196,7 @@ async def test_parser(
     against a mandatory Department Template TOC.
     """
     _require_test_endpoints_enabled()
+    from services.parser import ManuscriptParserService
     raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
     parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
     
@@ -226,11 +218,14 @@ async def test_embedding(
     Endpoint to test sentence-transformers embedding generation & pairwise coherence score calculation.
     """
     _require_test_endpoints_enabled()
+    from services.parser import ManuscriptParserService
     raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
     parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
     parsed_sections = parse_result.get("parsed_sections", {})
     
-    coherence_result = embedding_service.compute_coherence(parsed_sections)
+    from types import SimpleNamespace
+    ml_result = await asyncio.to_thread(ml_client.analyze_batch, parsed_sections, {}, [])
+    coherence_result = SimpleNamespace(**ml_result["coherence"])
     
     return {
         "status": "success",
@@ -255,12 +250,15 @@ async def test_reasoning(
     Endpoint to test Gemini XAI reasoning output for role-pair coherence.
     """
     _require_test_endpoints_enabled()
+    from services.parser import ManuscriptParserService
     raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
     parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
     parsed_sections = parse_result.get("parsed_sections", {})
     section_roles = parse_result.get("section_roles", {})
 
-    coherence_result = embedding_service.compute_coherence(parsed_sections)
+    from types import SimpleNamespace
+    ml_result = await asyncio.to_thread(ml_client.analyze_batch, parsed_sections, {}, [])
+    coherence_result = SimpleNamespace(**ml_result["coherence"])
     cross_chapter_result = compute_cross_chapter_coherence(
         coherence_result.embeddings, section_roles, parsed_sections
     )
@@ -613,6 +611,7 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Offloaded to a worker thread: these are CPU-bound and would otherwise
     # block the event loop, stalling concurrent status-poll requests.
+    from services.parser import ManuscriptParserService
     parse_result: Dict[str, Any] = await asyncio.to_thread(
         ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
     )
@@ -622,11 +621,14 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Step 3 – Embedding / Coherence
     # ------------------------------------------------------------------
-    coherence_result = await asyncio.to_thread(
-        embedding_service.compute_coherence, parsed_sections
-    )
-
     section_roles: Dict[str, str] = parse_result.get("section_roles", {})
+    role_texts: Dict[str, str] = aggregate_role_texts(parsed_sections, section_roles)
+    ml_result = await asyncio.to_thread(
+        ml_client.analyze_batch, parsed_sections, role_texts,
+        [[role_a, role_b] for role_a, role_b, _ in ROLE_PAIR_WEIGHTS],
+    )
+    from types import SimpleNamespace
+    coherence_result = SimpleNamespace(**ml_result["coherence"])
 
     # ------------------------------------------------------------------
     # Step 3b – Structural Completeness
@@ -657,7 +659,6 @@ async def _execute_scan_pipeline(
     # -- see the Aug 2026 review note above Step 3c. role_texts groups
     # section body text by the same canonical role used to compute those
     # scores, so the XAI explains the same content that was scored.
-    role_texts: Dict[str, str] = aggregate_role_texts(parsed_sections, section_roles)
     inconsistency_outputs, verification_outputs, dismissed_pairs = await reasoning_service.analyze_inconsistencies(
         cross_chapter_result, role_texts
     )
@@ -667,27 +668,34 @@ async def _execute_scan_pipeline(
         item.model_dump() for item in inconsistency_outputs
     ]
 
-    v6_dimensions: Dict[str, Dict[str, Optional[float]]] = {}
+    v6_dimensions: Dict[str, Dict[str, Optional[float]]] = ml_result["v6_dimensions"]
+    pairs_to_explain = []
     for role_a, role_b, _ in ROLE_PAIR_WEIGHTS:
         text_a, text_b = role_texts.get(role_a), role_texts.get(role_b)
         pair_key = f"{role_a}::{role_b}"
-        dimensions = (await asyncio.to_thread(predict_coherence, text_a, text_b)
-                      if text_a and text_b else dict.fromkeys((
-                          "objectives_alignment", "methodology_fit", "numeric_consistency",
-                          "claim_support", "overall_coherence",
-                      )))
-        v6_dimensions[pair_key] = dimensions
+        dimensions = v6_dimensions[pair_key]
         existing = next((item for item in inconsistencies_data
                          if item.get("section_a") == role_a and item.get("section_b") == role_b), None)
         if existing and text_a and text_b and (not existing.get("evidence_verified") or not existing.get("evidence_a") or not existing.get("evidence_b")):
-            evidence = await asyncio.to_thread(explain_pair, text_a, text_b)
+            pairs_to_explain.append([pair_key, text_a, text_b])
+        elif dimensions["overall_coherence"] is not None and dimensions["overall_coherence"] > 0.80 and existing is None:
+            pairs_to_explain.append([pair_key, text_a, text_b])
+
+    evidence_by_pair = await asyncio.to_thread(ml_client.explain_batch, pairs_to_explain) if pairs_to_explain else {}
+    for role_a, role_b, _ in ROLE_PAIR_WEIGHTS:
+        pair_key = f"{role_a}::{role_b}"
+        dimensions = v6_dimensions[pair_key]
+        existing = next((item for item in inconsistencies_data
+                         if item.get("section_a") == role_a and item.get("section_b") == role_b), None)
+        if pair_key in evidence_by_pair and existing:
+            evidence = evidence_by_pair[pair_key]
             for side in ("a", "b"):
                 field = f"evidence_{side}"
                 if not existing.get(field):
                     existing[field] = " ".join(entry["sentence"] for entry in evidence[field]["top_undermining"])
             existing["evidence_verified"] = bool(existing.get("evidence_a") and existing.get("evidence_b"))
         if dimensions["overall_coherence"] is not None and dimensions["overall_coherence"] > 0.80 and existing is None:
-            evidence = await asyncio.to_thread(explain_pair, text_a, text_b)
+            evidence = evidence_by_pair[pair_key]
             inconsistencies_data.append({
                 "inconsistency_id": str(uuid.uuid4()),
                 "section_a": role_a,
@@ -888,11 +896,7 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Step 5d – Advisory AI-Text Indicator (never affects the score)
     # ------------------------------------------------------------------
-    ai_text_result = await asyncio.to_thread(
-        compute_manuscript_ai_text_indicator,
-        parsed_sections,
-        embedding_service._model,
-    )
+    ai_text_result = SimpleNamespace(**ml_result["ai_text"])
 
     # ------------------------------------------------------------------
     # Step 6 – Database Persistence

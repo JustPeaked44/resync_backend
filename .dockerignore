@@ -5,4 +5,5 @@ __pycache__/
 .env
 *.log
 tests/
+models/
 .pytest_cache/

@@ -527,3 +527,204 @@ SECTION_ORDER= ['Results', 'Introduction', 'Methodology', 'Discussion']
 ```
 
 The new ordering regression tests are in `tests/test_parser_ordering.py`; the full suite passed. A real Google Docs fetch was not verified because this workspace had no concrete public/authenticated document URL, so visual-layout flattening outside the plaintext export remains an external limitation rather than a confirmed backend behavior.
+
+## Modal ML Offload
+
+The API defaults to `ML_BACKEND=local`. `ML_BACKEND=modal` uses the Modal SDK with `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`; no web endpoint is exposed. The existing scoring formulas, PAR score, bands, v6 checkpoint key translation, and 40-sentence masking cap were not changed.
+
+### Call-site map
+
+| Before | After |
+| --- | --- |
+| `main.py:27-33,49` imported torch, the embedding singleton, explainability, and AI text at startup | `main.py:25` imports the light `ml_client`; `main.py:199,221,252,614` load the parser only when needed. Modal-mode `import main` loads none of the heavy ML modules. |
+| `main.py:233,263` called `embedding_service.compute_coherence` in the debug endpoints | `main.py:227-228,260-261` call the ML client batch. |
+| `main.py:626` called `embedding_service.compute_coherence` for a production scan | `main.py:627-630` sends parsed sections, aggregated role text, and all seven role pairs in one batch to `services/ml_worker.py:6-17`. The worker calls the unchanged `services/embedding.py:92` and `services/embedding.py:203`. |
+| `main.py:674` called `predict_coherence` once per role pair | `main.py:671` consumes all v6 dimensions returned by the first batch. |
+| `main.py:683,690` called `explain_pair` per qualifying pair | `main.py:673-684` collects qualifying pairs and calls the second batch once; `services/ml_worker.py:20-23` invokes the unchanged `services/xai_utils.py:9` for each pair inside the ML container. |
+| `main.py:892-894` called `compute_manuscript_ai_text_indicator` with `embedding_service._model` | `main.py:899` uses the first batch's AI-text result; the same function runs with the same embedder in `services/ml_worker.py:16`. |
+
+`services/ml_client.py:6-33` selects local or Modal execution. `modal_app.py:27-41` defines the CPU worker and loads the v5, v6, and spaCy language models at container entry. A production scan makes **one Modal call** for embeddings, v6 dimensions, and AI-text, plus **one Modal call** for all qualifying sentence-masking explanations. The second call is skipped when no pair qualifies. Inputs and outputs are JSON-shaped plain data.
+
+### Dependencies and deployment
+
+`requirements.txt` is the Render light set, including `modal~=1.6.2` and excluding torch, sentence-transformers, transformers, and `en_core_web_sm`. `requirements-ml.txt` holds the CPU PyTorch index, `torch==2.13.0+cpu`, sentence-transformers, and the `en_core_web_sm` 3.8.0 wheel. Local development installs both files. `modal_app.py:5-14` adds the ML requirements, spaCy, NumPy, service code, and both model artifacts to the Modal Python 3.12 image. It requests 1 CPU, 2048 MiB, a 600-second timeout, and `min_containers=0`. The Render Dockerfile installs only `requirements.txt`; `.dockerignore:8` excludes `models/` from its build context. `render.yaml:13-18` sets `ML_BACKEND=modal` and declares both token variables as unsynced secrets.
+
+The fresh Windows Python 3.12 venv at `C:\Users\NHMIER\.claude\jobs\4a24cd9e\tmp\render-venv` installed **only** `requirements.txt`. With `ML_BACKEND=modal`, `import main` measured **75.0 MB total RSS** via psutil (4.2 MB venv launcher plus 70.8 MB Python child), well under the 512 MB target. Its output was:
+
+```text
+READY torch=False sentence_transformers=False en_core_web_sm=False
+pid=10268 rss_mb=4.2
+pid=29504 rss_mb=70.8
+total_rss_mb=75.0
+```
+
+### Verification
+
+```text
+.venv\Scripts\python.exe -m pytest -q
+........................................                                 [100%]
+40 passed in 63.15s (0:01:03)
+
+.venv\Scripts\python.exe -m pytest -q tests/test_ml_modal_parity.py
+.                                                                        [100%]
+1 passed in 93.66s (0:01:33)
+
+.venv\Scripts\python.exe -m pytest -q tests/test_ml_modal_parity.py::test_modal_error_is_visible
+.                                                                        [100%]
+1 passed in 2.88s
+
+modal_app.py AST parse and import: app resync-ml; modal 1.6.2
+ML_BACKEND=modal import main (full dev venv): torch=False, transformers=False,
+sentence_transformers=False, en_core_web_sm=False, spacy=False
+```
+
+`tests/test_ml_modal_parity.py` runs a realistic multi-section scoring and finding path through the same function bodies exposed by `modal_app.py`, with JSON encode/decode on arguments and results. It compares local and simulated Modal scores, v6 dimensions, findings, and sentence evidence, and confirms two batch calls. Its second test confirms a Modal connection error is surfaced with a clear message. The existing `main.py:1041-1098` background-job exception path records that message as `status="failed"` and refunds the scan credit; no fallback score is produced.
+
+The installed Modal SDK is **1.6.2**. The verified API used is `modal.App("resync-ml")`, `modal.Image.debian_slim(python_version="3.12").pip_install(...).pip_install_from_requirements(...).workdir(...).add_local_dir(...).add_local_file(...)`, `@app.cls(cpu=1.0, memory=2048, timeout=600, min_containers=0)`, `@modal.enter()`, `@modal.method()`, and `modal.Cls.from_name("resync-ml", "MLWorker")().analyze_batch.remote(...)` / `.explain_batch.remote(...)`. The installed SDK's `modal/config.py` confirms `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are the token environment variables.
+
+Deviation: the parser import was also made lazy so spaCy cannot opportunistically import an installed torch package during modal-mode `import main` in a full local venv. The parser still runs on Render during each scan. No Modal deployment or live remote call was made because the owner has no Modal account yet; image build and remote authentication remain unverified.
+
+### Owner setup steps
+
+1. Create a Modal account. Install the CLI with `python -m pip install modal` (or install both repository requirement files for local development: `python -m pip install -r requirements.txt` and `python -m pip install -r requirements-ml.txt`).
+2. Run `modal token new` on your machine.
+3. From the repository root, run `modal deploy modal_app.py`. Confirm that the deployed app is named `resync-ml` and exposes `MLWorker`.
+4. In Render, set `ML_BACKEND=modal`, `MODAL_TOKEN_ID=<your token ID>`, and `MODAL_TOKEN_SECRET=<your token secret>` on the backend service. Keep the existing Supabase and Gemini settings. Redeploy Render so it builds from the light requirements.
+5. Submit an authenticated manuscript to `POST /api/scans/start`, then poll `GET /api/scans/{analysis_run_id}` until `status` is `completed`. Confirm the response contains section scores, `score_breakdown.v6_dimensions`, and any qualifying finding evidence. If it reports `failed`, inspect the returned error and the Render/Modal logs; Modal errors are not replaced with default scores.
+
+## Modal Live Test
+
+Run on 2026-10-24 against the deployed `resync-ml` / `MLWorker`, using the repository `.venv`. No deployment, commit, or push was made. The direct probe used eight three-sentence sections: abstract, introduction, objectives, methodology, results, discussion, conclusion, and references. `aggregate_role_texts` supplied the role text and synthetic `__document__` text. The pair list came from `ROLE_PAIR_WEIGHTS`.
+
+### Task 1 — direct worker call: PASS
+
+Captured output: first `analyze_batch.remote` **19.985 s**; immediate second call **0.895 s**. Response keys were `coherence`, `v6_dimensions`, `ai_text`. `coherence` contained `overall_score`, `section_scores`, `empty_sections`, `embeddings`; `ai_text` contained `overall_score`, `section_scores`, `flagged_sections`, `disclaimer`. Each of the eight section embeddings had **384** values. Every pair returned all five non-null v6 dimensions (`objectives_alignment`, `methodology_fit`, `numeric_consistency`, `claim_support`, `overall_coherence`); there were no `None` values because every role, including `__document__`, had text longer than the worker's five-word gate.
+
+| Pair | Objectives alignment | Methodology fit | Numeric consistency | Claim support | Overall coherence |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| objectives::methodology | 0.46689129 | 0.46370196 | 0.50068617 | 0.46723956 | 0.50735891 |
+| methodology::results | 0.48693544 | 0.44479162 | 0.51105148 | 0.48752189 | 0.51079369 |
+| results::discussion | 0.30931848 | 0.24956772 | 0.33050087 | 0.26293278 | 0.27857506 |
+| objectives::conclusion | 0.37245554 | 0.35242769 | 0.41630989 | 0.33033130 | 0.37112427 |
+| introduction::objectives | 0.47873306 | 0.46718201 | 0.51006758 | 0.45756757 | 0.53076863 |
+| abstract::__document__ | 0.49906191 | 0.45207563 | 0.54089171 | 0.45655629 | 0.54741514 |
+| discussion::conclusion | 0.32962707 | 0.28809288 | 0.35818169 | 0.25707066 | 0.28365481 |
+
+### Task 2 — local parity and explanation: PASS
+
+The same input ran through `services.ml_worker.analyze_batch` locally. Maximum absolute difference across all v6 values was **1.4901161193847656e-7**; across all embedding coordinates it was **1.564621925354004e-7**. The first and second remote v6 results matched exactly (maximum difference **0.0**). No pair's `overall_coherence` exceeded 0.80, so `objectives::methodology` was forced through `explain_batch.remote`; its remote baseline was **0.5073589086532593** and the explanation call took **1.188 s**. The maximum numeric difference from local `explain_batch` (baseline and evidence deltas) was **5.960464477539063e-8**; sentence text and list structure matched. Remote evidence had A: two supporting sentences (deltas 0.16925845, 0.04805008) and one undermining (-0.01104134); B: two supporting (0.10209078, 0.08398521) and one undermining (-0.01543599).
+
+### Task 3 — authenticated API scan: FAIL (resource check incomplete)
+
+A temporary confirmed Supabase user signed in successfully. The temporary `ML_BACKEND=modal` server on 127.0.0.1:8010 accepted the in-memory eight-heading DOCX: `UPLOAD={"http_status":202,"body":{"status":"processing"}}`. After nine polls and **44.305 s** from upload start, the result was `status="completed"`, `db_save_status="success"`, `error_message=null`. `score_breakdown.v6_dimensions` held all seven keys listed in Task 1; every dimension was non-null for every pair. The server log showed a Gemini **429** quota response and no Modal error marker or scan-job-failed marker. The Gemini quota response was separate from the successful Modal scan.
+
+The script reported `server_rss_mb=4.2`, but on Windows that PID was the Python launcher. It did not inspect the serving child process's RSS or loaded modules, so this reading **does not establish** that the server avoided loading torch or sentence-transformers. That missing resource check makes the full task incomplete. The first cleanup attempt also returned Supabase `403 User not allowed`: signing in on the admin client had replaced its service-role session. Cleanup succeeded with a fresh service-role client, as recorded under Task 5. No API scan was repeated.
+
+### Task 4 — Modal-side CLI evidence: NOT-RUN
+
+Verification stopped after the Task 3 resource-check failure. `python -m modal app list` and recent `modal app logs` were not run; Modal-side runtime errors and container seconds were therefore not observed. The direct remote calls and API scan establish that the deployed class responded, but no Modal billing or compute-duration figure was available from the captured output.
+
+### Task 5 — cleanup: PASS after retry
+
+The temporary server launcher was terminated. The immediate port check reported `PORT_8010_FREE=False`, but a later socket connection to 127.0.0.1:8010 returned Windows code **10061** (connection refused), and `Get-NetTCPConnection -LocalPort 8010 -State Listen` returned no listener. With a fresh service-role client, the temporary user deletion request succeeded; a follow-up admin lookup returned **`User not found`**. No temporary user or listener was left by this test.
+
+## Render-Like Scan Test
+
+Run on 2026-10-24 from the `development` working tree. The repository already had uncommitted changes before this run; this test changed only this report. No commit, push, Render action, or Modal deployment was made.
+
+### 1. Render-like copy: PASS
+
+Copied the current working tree to `C:\Users\NHMIER\.claude\jobs\4a24cd9e\tmp\render-sim\app` with the `.dockerignore` exclusions (`.venv/`, `__pycache__/`, `*.pyc`, `.git/`, `.env`, `*.log`, `tests/`, `models/`, `.pytest_cache/`). Copied `.env` into that directory only for this local run. Captured top-level listing and checks:
+
+```text
+.claude  graphify-out  migrations  services  .dockerignore  .env  .gitignore
+check_models.py  check_requirements.py  Dockerfile  main.py  modal_app.py
+render.yaml  requirements-ml.txt  requirements.txt  V6_BACKEND_INTEGRATION_REPORT.md
+MODELS_EXISTS=False
+TESTS_EXISTS=False
+ENV_COPY_EXISTS=True
+```
+
+### 2. Requirements-only venv: PASS
+
+Reused `C:\Users\NHMIER\.claude\jobs\4a24cd9e\tmp\render-venv`. Its installed versions satisfied every current `requirements.txt` specifier, so it was not rebuilt. Captured checks:
+
+```text
+fastapi==0.141.1  modal==1.6.2  spacy==3.8.16
+supabase==2.31.0  uvicorn==0.52.4
+REQUIREMENTS_MATCH=True
+FORBIDDEN={'torch': False, 'sentence_transformers': False, 'transformers': False, 'en_core_web_sm': False}
+No broken requirements found.
+```
+
+The four forbidden packages were absent from `pip list` and their import specs were absent. The venv also had no `psutil`; memory measurement used the separate development venv outside the serving process.
+
+### 3. Server and authenticated scan: PASS
+
+Started the copied app with `ML_BACKEND=modal` and `python -m uvicorn main:app --host 127.0.0.1 --port 8010`. Local Modal authentication used the existing configuration; no `MODAL_TOKEN_*` variables were set. Startup output:
+
+```text
+INFO:     Started server process [18880]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
+```
+
+Created a temporary confirmed Supabase user through a service-role client, signed in through a separate anon-key client, and uploaded an in-memory DOCX with eight headed sections and several sentences in each. Captured API summary:
+
+```text
+TEMP_USER_CREATED=True
+SEPARATE_CLIENT_SIGN_IN=True
+UPLOAD_HTTP=202
+RUN_ID=ae1f34a2-6c32-4cbb-b3fd-6117e2b7710c
+SCAN_RESULT={"status":"completed","seconds":64.922,"polls":10,"db_save_status":"success","error_message":null,"v6_pairs":["results::discussion","methodology::results","abstract::__document__","discussion::conclusion","objectives::conclusion","objectives::methodology","introduction::objectives"],"v6_all_non_null":true}
+```
+
+All five v6 dimension values were non-null for each of the seven returned pairs. The captured server output had no explicit Modal diagnostic line and no `ImportError` or `ModuleNotFoundError`. It showed the upload and polls returning 202/200, plus this separate Gemini quota line (credential masked):
+
+```text
+INFO:     127.0.0.1:64966 - "POST /api/scans/upload HTTP/1.1" 202 Accepted
+Strong-pair verification failed, degrading to empty: Client error '429 Too Many Requests' for url 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=[MASKED]'
+INFO:     127.0.0.1:65121 - "GET /api/scans/ae1f34a2-6c32-4cbb-b3fd-6117e2b7710c HTTP/1.1" 200 OK
+```
+
+### 4. Serving process memory: PASS
+
+Measured the uvicorn PID with `psutil.Process(18880)` and summed its RSS with all recursive descendants. The process tree contained the serving `python.exe` itself, not a launcher PID. Windows `peak_wset` is the process peak working set since start.
+
+```text
+STARTUP_MEMORY={"tree":[[18880,"python.exe",74.0]],"rss_mb":74.0,"peak_wset_mb":74.1}
+FINAL_MEMORY={"tree":[[18880,"python.exe",145.4]],"rss_mb":145.4,"peak_wset_mb":145.9}
+```
+
+Both observed RSS readings and the recorded peak working set were below 512 MB.
+
+### 5. Cleanup and repository state: PASS
+
+Stopped the server before deleting the user. A fresh service-role client performed the deletion and follow-up lookup. Removed the entire temporary `render-sim` directory, including its `.env` copy and probe scripts; kept `render-venv`.
+
+```text
+DELETE_REQUEST=success
+FOLLOWUP_LOOKUP=AuthApiError:User not found
+SERVER_PID_ALIVE=False
+PORT_8010_LISTENER=False
+TEMP_COPY_EXISTS=False
+VENV_EXISTS=True
+```
+
+The pre-run and post-run `git status --short` output matched exactly; only this report's contents were appended. No repository source file was edited by this test.
+
+```text
+ M .dockerignore
+ M Dockerfile
+ M V6_BACKEND_INTEGRATION_REPORT.md
+ M main.py
+ M render.yaml
+ M requirements.txt
+?? debug.log
+?? modal_app.py
+?? requirements-ml.txt
+?? services/ml_client.py
+?? services/ml_worker.py
+?? tests/test_ml_modal_parity.py
+```
