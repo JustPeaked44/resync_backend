@@ -12,9 +12,6 @@ ENV OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     HF_HOME=/app/.cache/huggingface
 
-# Copy local fine-tuned model directly into the image
-COPY models/minilm-dost-v4 /app/models/minilm-dost-v4
-
 # Copy application code
 COPY . .
 
