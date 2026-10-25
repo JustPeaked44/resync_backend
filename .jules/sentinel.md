@@ -1,0 +1,4 @@
+## 2026-10-31 - [CRITICAL] Prevent SSRF in httpx Redirects
+**Vulnerability:** Server-Side Request Forgery (SSRF) in citation auditing. While the initial request host was checked, `httpx.AsyncClient` was instantiated with `follow_redirects=True`, allowing attackers to redirect the client to private or internal metadata endpoints (e.g., `169.254.169.254`).
+**Learning:** Checking URLs only before the initial request is insufficient when the HTTP client automatically follows redirects.
+**Prevention:** Always use httpx event hooks (`event_hooks={'request': [_verify_request_host]}`) to validate the target host of *every* request, including any redirects, against a strict blocklist of private, loopback, and link-local IP addresses. Remember to use `asyncio.to_thread` when calling blocking functions within an async hook, and always pass `request=request` to `httpx.ConnectError`.
