@@ -942,6 +942,20 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     ai_text_result = SimpleNamespace(**ml_result["ai_text"])
 
+    # Findings come out in role-pair/priority order; reorder them to follow the
+    # uploaded manuscript. A role sits where its first occurrence appears.
+    role_position: Dict[str, int] = {}
+    for position, key in enumerate(section_order):
+        role_position.setdefault(key, position)
+        role_position.setdefault(section_roles.get(key, key), position)
+
+    def _manuscript_sort_key(role_a: str, role_b: str) -> tuple:
+        positions = sorted(role_position.get(role, len(section_order)) for role in (role_a, role_b))
+        return tuple(positions)
+
+    inconsistencies_data.sort(key=lambda item: _manuscript_sort_key(item["section_a"], item["section_b"]))
+    verification_outputs.sort(key=lambda v: _manuscript_sort_key(v.role_a, v.role_b))
+
     # ------------------------------------------------------------------
     # Step 6 – Database Persistence
     # ------------------------------------------------------------------
