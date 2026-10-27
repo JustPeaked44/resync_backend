@@ -1,5 +1,7 @@
 """Deploy with `modal deploy modal_app.py` after configuring a Modal token."""
 
+import os
+
 import modal
 
 app = modal.App("resync-ml")
@@ -12,11 +14,19 @@ image = (
     .add_local_dir("models/model_v5b", "/app/models/model_v5b")
     .add_local_file("models/v6_model.pt", "/app/models/v6_model.pt")
 )
+# Optional so deploys keep working until the v7 checkpoint is added to the repo.
+if os.path.exists("models/v7_final_model.pt"):
+    image = image.add_local_file("models/v7_final_model.pt", "/app/models/v7_final_model.pt")
 
 
 def analyze_batch(parsed_sections, role_texts, role_pairs):
     from services.ml_worker import analyze_batch as run
     return run(parsed_sections, role_texts, role_pairs)
+
+
+def analyze_v7(sections):
+    from services.ml_worker import analyze_v7 as run
+    return run(sections)
 
 
 def explain_batch(pairs):
@@ -35,6 +45,10 @@ class MLWorker:
     @modal.method()
     def analyze_batch(self, parsed_sections, role_texts, role_pairs):
         return analyze_batch(parsed_sections, role_texts, role_pairs)
+
+    @modal.method()
+    def analyze_v7(self, sections):
+        return analyze_v7(sections)
 
     @modal.method()
     def explain_batch(self, pairs):

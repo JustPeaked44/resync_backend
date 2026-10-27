@@ -158,6 +158,50 @@ def _require_test_endpoints_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
 
+class V7Section(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    text: str = Field(..., min_length=1, max_length=60000)
+
+
+class V7AnalyzeRequest(BaseModel):
+    # Order matters: sections are compared chronologically, each against the next.
+    sections: List[V7Section] = Field(..., min_length=2, max_length=30)
+
+
+@app.post("/analyze_v7")
+async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authenticated_user_id)):
+    """v7 correlation of consecutive manuscript sections, returned as a nested manuscript_flow."""
+    from services.v7_explain import explain_pair
+
+    await _check_scan_rate_limit(user_id)
+    sections = [s.model_dump() for s in req.sections]
+    async with SCAN_SLOT:
+        try:
+            result = await asyncio.to_thread(ml_client.analyze_v7, sections)
+        except Exception:
+            logger.exception("v7 analysis failed")
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="v7 model is unavailable.")
+
+        manuscript_flow = []
+        for pair in result["pairs"]:
+            entry = {"order": pair["order"], "section_a": pair["section_a"], "section_b": pair["section_b"]}
+            if "skipped" in pair:
+                manuscript_flow.append({**entry, "skipped": pair["skipped"]})
+                continue
+            explanation = await explain_pair(
+                pair["section_a"], sections[pair["order"] - 1]["text"],
+                pair["section_b"], sections[pair["order"]]["text"],
+                pair["scores"], pair["culprits_a"], pair["culprits_b"],
+            )
+            manuscript_flow.append({
+                **entry,
+                "pair_weight": round(pair["scores"]["pair_weight"], 3),
+                "culprit_sentences": {"section_a": pair["culprits_a"], "section_b": pair["culprits_b"]},
+                **explanation,
+            })
+    return {"manuscript_score": result["manuscript_score"], "manuscript_flow": manuscript_flow}
+
+
 @app.get("/api/test-ingestion")
 async def test_ingestion(doc_url: str = Query(..., description="Public Google Docs Link")):
     """Endpoint to test Google Docs text extraction."""

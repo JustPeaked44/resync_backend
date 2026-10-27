@@ -17,6 +17,12 @@ def analyze_batch(parsed_sections, role_texts, role_pairs):
     }
 
 
+def analyze_v7(sections):
+    from services.v7_logic import analyze_manuscript
+
+    return analyze_manuscript(sections)
+
+
 def explain_batch(pairs):
     from services.xai_utils import explain_pair
 

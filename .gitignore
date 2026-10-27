@@ -7,4 +7,5 @@ graphify-out/
 .claude/worktrees/
 .pytest_cache/
 dist/
-build/
+build/
+models/*.pt
