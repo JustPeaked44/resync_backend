@@ -1,11 +1,13 @@
 import asyncio
 from types import SimpleNamespace
+import pytest
 
 import main
 from services import parser, v7_explain
 
 
-def test_scan_contract_and_persistence_with_fakes(monkeypatch):
+@pytest.fixture
+def assembled_scan(monkeypatch):
     captured = {}
     sections = {"Related Studies": "A source sentence with several words.",
                 "Related Studies (2)": "A second source sentence with several words.",
@@ -53,7 +55,7 @@ def test_scan_contract_and_persistence_with_fakes(monkeypatch):
                                              "what": "Partial link", "why": "The shared topic is narrow."}],
             "recommendations": [{"section": "Results", "original_sentence": "fabricated",
                                  "recommended_revision": "Clarify the link."}],
-            "reference_list": []})
+            "reference_list": [{"section": "Related Studies", "sentence": "A source sentence with several words."}]})
 
         class Response:
             def raise_for_status(self):
@@ -86,6 +88,11 @@ def test_scan_contract_and_persistence_with_fakes(monkeypatch):
     req = main.ScanRequest(user_id="user", manuscript_title="Test", filename="test.docx")
     result = asyncio.run(main._execute_scan_pipeline(req, "run", "ms", 4, b"doc", "test.docx"))
     payload = result.model_dump(mode="json")
+    return payload, captured, sections
+
+
+def test_scan_contract_and_persistence_with_fakes(assembled_scan):
+    payload, captured, sections = assembled_scan
     assert captured["ml_sections"] == [
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
@@ -98,6 +105,54 @@ def test_scan_contract_and_persistence_with_fakes(monkeypatch):
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
     assert captured["save"]["coherence_score"] == 60.0
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
+
+
+def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
+    payload, _, _ = assembled_scan
+    assert set(payload) == {
+        "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "result_version",
+        "overall_coherence_score", "sections_analyzed", "manuscript_flow", "inconsistencies_found",
+        "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
+        "score_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
+        "credits_remaining"}
+    assert payload["result_version"] == "v7"
+    assert len(payload["manuscript_flow"]) == 1
+    pair = payload["manuscript_flow"][0]
+    assert set(pair) == {"order", "section_a", "section_b", "pair_weight", "scores",
+                         "skipped_reason", "culprit_sentences", "explanation"}
+    assert set(pair["scores"]) == {"objectives_alignment", "methodology_fit", "numeric_consistency",
+                                   "claim_support", "overall_coherence"}
+    assert set(pair["culprit_sentences"]) == {"section_a", "section_b"}
+    assert set(pair["explanation"]) == {"coherence_scores", "highlighted_inconsistencies",
+                                        "recommendations", "reference_list"}
+    assert set(pair["explanation"]["coherence_scores"]) == {"overall", "objectives", "methodology", "numeric", "claims"}
+    assert set(pair["explanation"]["highlighted_inconsistencies"][0]) == {"section", "quote", "what", "why"}
+    assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "recommended_revision"}
+    assert pair["explanation"]["reference_list"] == [{"section": "Related Studies", "sentence": "A source sentence with several words."}]
+    assert set(payload["inconsistencies"][0]) == {"section_a", "section_b", "pair_order", "coherence_score",
+                                                  "explanation_what", "explanation_why", "suggested_fix",
+                                                  "inconsistency_id", "evidence_a", "evidence_b", "evidence_quotes",
+                                                  "evidence_verified", "finding_status"}
+    assert payload["inconsistencies"][0]["inconsistency_id"]
+    assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
+    assert set(payload["recommendations"][0]) == {"recommendation_id", "section_a", "section_b",
+                                                "pair_order", "original_sentence", "recommended_revision",
+                                                "recommendation_text", "recommendation_priority"}
+    assert payload["recommendations"][0]["recommendation_id"]
+    assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair"}
+    for key in ("strongest_pair", "weakest_pair"):
+        assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}
+    assert set(payload["score_breakdown"]) == {"overall_score", "band", "cross_chapter_coherence_score",
+                                               "citation_integrity_score", "dimensions", "citation_detail"}
+    assert set(payload["score_breakdown"]["dimensions"]) == {"objectives_alignment", "methodology_fit",
+                                                               "numeric_consistency", "claim_support"}
+    assert set(payload["score_breakdown"]["citation_detail"]) == {"well_formed_ratio", "link_resolution_rate",
+                                                                    "cross_match_score", "total_entries"}
+    assert set(payload["ai_text_indicator"]) == {"overall_score", "section_scores", "flagged_sections", "disclaimer"}
+    legacy = dict(payload)
+    legacy.pop("result_version")
+    assert main.ScanResponse.model_validate(legacy).result_version is None
+    assert main.ScanResponse.model_validate(dict(legacy, result_version=None)).result_version is None
 
 
 def test_legacy_poll_model_passes_payload_through():
