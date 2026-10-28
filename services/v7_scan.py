@@ -7,6 +7,33 @@ import uuid
 
 DIMENSIONS = ("objectives_alignment", "methodology_fit", "numeric_consistency", "claim_support")
 SCORE_KEYS = (*DIMENSIONS, "overall_coherence")
+NUMERIC_RULE = "both"
+
+
+def has_figures(text):
+    text = re.sub(r"https?://\S+|\bdoi\s*:\s*\S+|\b10\.\d{4,9}/\S+", " ", text, flags=re.I)
+    text = re.sub(r"\([^()]*\b(?:19|20)\d{2}[a-z]?\s*\)", " ", text)
+    text = re.sub(r"\b(?:[A-Z][A-Za-z-]+(?:\s+et\s+al\.)?|et\s+al\.),\s*(?:19|20)\d{2}[a-z]?\b", " ", text)
+    text = re.sub(r"\b(?:figure|fig\.?|table|chapter|section|page|pp?\.)\s*\d+(?:\.\d+)*\b", " ", text, flags=re.I)
+    text = re.sub(r"(?m)^\s*(?:\d+(?:\.\d+)*[.)]\s+|\d+\s*$)", " ", text)
+    return bool(re.search(r"(?<![\w.])\d+(?:\.\d+)?\s*%?\b|(?<![\w.])\d+(?:\.\d+)?%", text))
+
+
+def numeric_applicable(text_a, text_b, rule=None):
+    present = (has_figures(text_a), has_figures(text_b))
+    return all(present) if (rule or NUMERIC_RULE) == "both" else any(present)
+
+
+def four_part_score(pairs):
+    scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
+    values = {key: [p["scores"][key] for p in scored
+                    if key != "numeric_consistency" or p["numeric_applicable"]] for key in DIMENSIONS}
+    applicable = sum(bool(items) for items in values.values())
+    averages = {key: round(sum(items) / len(items), 4) if items else None for key, items in values.items()}
+    weights = {key: 1 / applicable if items else 0.0 for key, items in values.items()}
+    score = round(100 * sum(sum(items) / len(items) * weights[key]
+                            for key, items in values.items() if items), 2)
+    return score, averages, weights
 
 
 def merge_repeated_sections(parsed_sections, section_order):
