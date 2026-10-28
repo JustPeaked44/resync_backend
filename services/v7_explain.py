@@ -23,7 +23,8 @@ Return JSON with exactly four top-level keys: coherence_scores (copy model score
 highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, recommended_revision),
 reference_list (array of objects with section, sentence).
-Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text."""
+Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text.
+A recommended revision must preserve the original sentence's meaning and repair only its logical link to the neighboring section; never adopt the neighboring section's topic."""
 SUMMARY_PROMPT = """Summarize correlation of these neighboring manuscript pairs in one concise paragraph.
 {rules}
 Never mention the model, PyTorch, or how scores are produced. Express any score as a whole-number percentage (e.g. 80%), never a raw decimal.
@@ -68,9 +69,11 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
             continue
         section = section_name(item.get("section"))
         revision = item.get("recommended_revision")
-        if section and isinstance(revision, str) and revision.strip() and revision != "No major inconsistencies found.":
+        original = verified(section, item.get("original_sentence"))
+        if (section and original and isinstance(revision, str) and revision.strip()
+                and revision != "No major inconsistencies found."):
             recommendations.append({"section": section,
-                                    "original_sentence": verified(section, item.get("original_sentence")),
+                                    "original_sentence": original,
                                     "recommended_revision": revision})
     references = []
     for item in raw.get("reference_list", []) if isinstance(raw.get("reference_list"), list) else []:

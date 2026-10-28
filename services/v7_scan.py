@@ -26,7 +26,7 @@ def merge_repeated_sections(parsed_sections, section_order):
 
 def select_worst_pairs(pairs):
     return sorted((p for p in pairs if p["scores"]["overall_coherence"] is not None),
-                  key=lambda p: (p["scores"]["overall_coherence"], p["order"]))[:8]
+                  key=lambda p: (p["scores"]["overall_coherence"], p["order"]))[:12]
 
 
 def weighted_score(pairs):

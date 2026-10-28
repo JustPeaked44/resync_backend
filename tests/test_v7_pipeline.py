@@ -53,7 +53,7 @@ def assembled_scan(monkeypatch):
             "coherence_scores": {"overall": 1},
             "highlighted_inconsistencies": [{"section": "Results", "quote": "The resulting text also contains several words.",
                                              "what": "Partial link", "why": "The shared topic is narrow."}],
-            "recommendations": [{"section": "Results", "original_sentence": "fabricated",
+            "recommendations": [{"section": "Results", "original_sentence": "The resulting text also contains several words.",
                                  "recommended_revision": "Clarify the link."}],
             "reference_list": [{"section": "Related Studies", "sentence": "A source sentence with several words."}]})
 
@@ -101,7 +101,7 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert payload["manuscript_flow"][0]["explanation"]["coherence_scores"]["overall"] == 0.6
     assert payload["inconsistencies_found"] == 1
     assert payload["inconsistencies"][0]["evidence_verified"] is True
-    assert payload["recommendations"][0]["original_sentence"] is None
+    assert payload["recommendations"][0]["original_sentence"] == "The resulting text also contains several words."
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
     assert captured["save"]["coherence_score"] == 60.0
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]

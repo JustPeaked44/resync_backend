@@ -21,7 +21,7 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
     assert result["coherence_scores"]["overall"] == 0.4
     assert len(result["highlighted_inconsistencies"]) == 2
     assert result["highlighted_inconsistencies"][1]["quote"] is None
-    assert result["recommendations"][0]["original_sentence"] is None
+    assert result["recommendations"] == []
     assert result["reference_list"] == [{"section": "A", "sentence": "A  curly 'quote'."}]
 
 
@@ -67,7 +67,7 @@ def test_summary_failure_returns_null(monkeypatch):
                                     "what": "Contradiction", "why": "A and B disagree."}],
       "recommendations": [{"section": "Section B (B)", "original_sentence": "fabricated",
                            "recommended_revision": "Align the statement with A."}],
-      "reference_list": [{"section": "Section A (A)", "sentence": "A says improvement."}]}, 1, 1, 1),
+      "reference_list": [{"section": "Section A (A)", "sentence": "A says improvement."}]}, 1, 0, 1),
     ({"highlighted_inconsistencies": [{"section": "B", "quote": "B says no effect.",
                                     "what": "No major inconsistencies found.", "why": "placeholder"}],
       "recommendations": [{"section": "B", "original_sentence": "B says no effect.",
@@ -97,12 +97,11 @@ def test_fake_gemini_preserves_findings_but_rejects_unsupported_evidence(monkeyp
     assert len(result["reference_list"]) == references
     if issues:
         assert result["highlighted_inconsistencies"][0]["quote"] is None
-        assert result["recommendations"][0]["original_sentence"] is None
         flow = assemble_flow([{"name": "A", "text": "A says improvement."},
                               {"name": "B", "text": "B says no effect."}], [{"scores": dict(SCORES, pair_weight=1)}])
         flow[0]["explanation"] = result
         findings, revisions = flatten_explanations(flow)
-        assert len(findings) == len(revisions) == 1
+        assert len(findings) == 1 and revisions == []
         assert findings[0]["evidence_verified"] is True
         assert findings[0]["evidence_quotes"] == [{"section": "A", "text": "A says improvement."}]
 
@@ -120,3 +119,29 @@ def test_fabricated_quote_never_becomes_a_highlight():
     assert findings[0]["evidence_quotes"] == []
     assert findings[0]["evidence_a"] == findings[0]["evidence_b"] == ""
     assert findings[0]["evidence_verified"] is False
+
+
+def test_recommendation_sentence_must_be_in_its_own_pair(monkeypatch):
+    raw = {"recommendations": [
+        {"section": "A", "original_sentence": "Only in a different section.",
+         "recommended_revision": "Wrong pair."},
+        {"section": "A", "original_sentence": "A says improvement.",
+         "recommended_revision": "A says improvement, consistent with B."},
+        {"section": "B", "original_sentence": "B says no effect.",
+         "recommended_revision": "B says no effect, despite A."}]}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(raw)}]}}]}
+
+    async def fake(_):
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    result = asyncio.run(v7_explain.explain_pair(
+        "A", "A says improvement.", "B", "B says no effect.", SCORES, [], []))
+    assert [r["original_sentence"] for r in result["recommendations"]] == [
+        "A says improvement.", "B says no effect."]
