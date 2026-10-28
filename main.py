@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
 import asyncio
-from services.deterministic import DeterministicAuditService
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_serializer
 from dotenv import load_dotenv
@@ -23,12 +22,11 @@ load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService
 from services.ml_client import ml_client
-from services.reasoning import reasoning_service
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
 from services.notification import NotificationDeliveryService
 from services.credits import credits_service, InsufficientCreditsError
-from services.scoring import compute_citation_integrity, PAR_SCORE
+from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
                               weighted_score, band, dimension_averages)
 from services.reference_parser import extract_intext_citations
@@ -227,80 +225,6 @@ async def test_parser(
         "doc_url": doc_url,
         "analysis": parse_result
     }
-
-@app.post("/api/test-embedding")
-async def test_embedding(
-    doc_url: str = Query(..., description="Public Google Docs Link"),
-    template_toc: Optional[List[str]] = Body(
-        default=[],
-        description="Optional custom Department TOC headers list."
-    )
-):
-    """
-    Endpoint to test sentence-transformers embedding generation & pairwise coherence score calculation.
-    """
-    _require_test_endpoints_enabled()
-    from services.parser import ManuscriptParserService
-    raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
-    parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
-    parsed_sections = parse_result.get("parsed_sections", {})
-    
-    from types import SimpleNamespace
-    ml_result = await asyncio.to_thread(ml_client.analyze_batch, parsed_sections, {}, [])
-    coherence_result = SimpleNamespace(**ml_result["coherence"])
-    
-    return {
-        "status": "success",
-        "doc_url": doc_url,
-        "sections_analyzed": list(parsed_sections.keys()),
-        "sections_with_content": [s for s in parsed_sections.keys() if s not in coherence_result.empty_sections],
-        "empty_sections": coherence_result.empty_sections,
-        "overall_coherence_score": coherence_result.overall_score,
-        "section_scores": coherence_result.section_scores
-    }
-
-@app.post("/api/test-reasoning")
-async def test_reasoning(
-    doc_url: str = Query(..., description="Public Google Docs Link"),
-    par: float = Query(PAR_SCORE, description="Calibrated coherence PAR (0-100). Pairs below this get explained; pairs at/above get verified."),
-    template_toc: Optional[List[str]] = Body(
-        default=[],
-        description="Optional custom Department TOC headers list."
-    )
-):
-    """
-    Endpoint to test Gemini XAI reasoning output for role-pair coherence.
-    """
-    _require_test_endpoints_enabled()
-    from services.parser import ManuscriptParserService
-    raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
-    parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
-    parsed_sections = parse_result.get("parsed_sections", {})
-    section_roles = parse_result.get("section_roles", {})
-
-    from types import SimpleNamespace
-    ml_result = await asyncio.to_thread(ml_client.analyze_batch, parsed_sections, {}, [])
-    coherence_result = SimpleNamespace(**ml_result["coherence"])
-    cross_chapter_result = compute_cross_chapter_coherence(
-        coherence_result.embeddings, section_roles, parsed_sections
-    )
-    role_texts = aggregate_role_texts(parsed_sections, section_roles)
-    inconsistencies, verifications, dismissed_pairs = await reasoning_service.analyze_inconsistencies(
-        cross_chapter_result, role_texts, par=par
-    )
-
-    return {
-        "status": "success",
-        "doc_url": doc_url,
-        "par_used": par,
-        "cross_chapter_coherence_score": cross_chapter_result.score,
-        "pair_scores": cross_chapter_result.pair_scores,
-        "inconsistencies_found": len(inconsistencies),
-        "inconsistencies": inconsistencies,
-        "verifications": verifications,
-        "dismissed_pairs": dismissed_pairs,
-    }
-
 
 # ---------------------------------------------------------------------------
 # Master Production Scan Endpoint
@@ -571,26 +495,7 @@ async def _execute_scan_pipeline(
     file_bytes: Optional[bytes] = None,
     filename: Optional[str] = None,
 ) -> ScanResponse:
-    """
-    Runs the full RESYNC analysis pipeline against an already-provisioned
-    analysis_run row and returns the consolidated report.
-
-    Pipeline sequence
-    -----------------
-    1. Ingestion    – fetch plaintext from uploaded file, base64 payload, or Google Docs
-    2. Parser       – segment text into sections using the Department TOC template
-    3. Embedding    – compute pairwise cosine-similarity coherence scores
-    3b. Structural  – score completeness against the required/optional roles
-    3c. Coherence   – role-aware weighted cross-chapter coherence matrix
-    4. Reasoning    – call Gemini for XAI analysis on low-scoring section pairs
-    5. Citation     – segment references, verify links, cross-match in-text citations
-    5b. Citation    – score citation integrity from the audit output
-    5c. Composite   – combine the three sub-scores into the functional metric
-    5d. AI-text     – advisory stylometric indicator (never affects the score)
-    6. Database     – persist analysis_run, inconsistencies, citations to Supabase
-    7. Notification – fire OneSignal push alert
-    8. Return consolidated ScanResponse JSON report
-    """
+    """Run the v7 scan and persist the contract response."""
     db_client = DatabasePersistenceService.get_client()
 
     # ------------------------------------------------------------------

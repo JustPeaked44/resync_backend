@@ -2,7 +2,7 @@
 
 import json
 import logging
-from services.reasoning import reasoning_service
+from services import gemini
 
 logger = logging.getLogger("resync.v7_explain")
 STRICT_RULES = """STRICT RULES:
@@ -42,7 +42,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
     def verified(section, quote):
         if not isinstance(section, str) or section not in source or not isinstance(quote, str) or not quote.strip():
             return None
-        match, ok = reasoning_service._verify_quote(quote, source[section])
+        match, ok = gemini.verify_quote(quote, source[section])
         return match if ok else None
 
     issues = []
@@ -73,15 +73,15 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
 async def _generate(prompt):
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
                "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
-    response = await reasoning_service._post_gemini_with_retry(payload)
+    response = await gemini.post_gemini_with_retry(payload)
     response.raise_for_status()
     return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
 
 
 async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culprits_b):
     prompt = PAIR_PROMPT.format(rules=STRICT_RULES, a=role_a, b=role_b,
-                                text_a=reasoning_service._truncate_text(text_a),
-                                text_b=reasoning_service._truncate_text(text_b),
+                                text_a=gemini.truncate_text(text_a),
+                                text_b=gemini.truncate_text(text_b),
                                 scores=json.dumps(coherence_scores(scores)),
                                 culprits_a=json.dumps(culprits_a), culprits_b=json.dumps(culprits_b))
     try:

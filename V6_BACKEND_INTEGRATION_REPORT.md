@@ -1,3 +1,7 @@
+# Historical v6 integration report (superseded by the v7 contract)
+
+This document records the former v6 implementation. The supported scan response is specified in the external `P1_BACKEND_CONTRACT.md`; do not use this report as the current API contract.
+
 # V6 backend integration report
 
 ## Changes

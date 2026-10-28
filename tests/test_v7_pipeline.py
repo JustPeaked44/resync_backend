@@ -79,7 +79,7 @@ def test_scan_contract_and_persistence_with_fakes(monkeypatch):
     monkeypatch.setattr(parser.ManuscriptParserService, "parse_manuscript_sections", parse)
     monkeypatch.setattr(main.ml_client, "analyze_v7", ml_v7)
     monkeypatch.setattr(main.ml_client, "analyze_ai_text", ai_text)
-    monkeypatch.setattr(v7_explain.reasoning_service, "_post_gemini_with_retry", fake_gemini)
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake_gemini)
     monkeypatch.setattr(main.CitationAuditService, "audit_citations", citation)
     monkeypatch.setattr(main.NotificationDeliveryService, "send_scan_completion_alert", notify)
 

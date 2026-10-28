@@ -23,17 +23,10 @@ class MLClient:
         except Exception as exc:
             raise RuntimeError(f"Modal ML {method} failed: {exc}") from exc
 
-    def analyze_batch(self, parsed_sections, role_texts, role_pairs):
-        return self._call("analyze_batch", parsed_sections, role_texts, role_pairs)
-
     def analyze_v7(self, sections):
         return self._call("analyze_v7", sections)
 
     def analyze_ai_text(self, sections):
         return self._call("analyze_ai_text", sections)
-
-    def explain_batch(self, pairs):
-        return self._call("explain_batch", pairs)
-
 
 ml_client = MLClient()

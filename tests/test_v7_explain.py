@@ -39,7 +39,7 @@ def test_fake_gemini_pair_and_summary(monkeypatch):
         prompts.append(payload["contents"][0]["parts"][0]["text"])
         return Response()
 
-    monkeypatch.setattr(v7_explain.reasoning_service, "_post_gemini_with_retry", fake)
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
     result = asyncio.run(v7_explain.explain_pair("A", "A text.", "B", "B text.", SCORES, [], []))
     summary = asyncio.run(v7_explain.explain_summary([], []))
     assert result["coherence_scores"]["overall"] == 0.4

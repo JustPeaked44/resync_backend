@@ -2,7 +2,7 @@ from pathlib import Path
 
 from services.ingestion import DocumentIngestionService
 from services.parser import ManuscriptParserService
-from services.scoring import aggregate_role_texts
+from services.v7_scan import merge_repeated_sections
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "google_docs_plaintext_ordering_export.txt"
@@ -31,8 +31,8 @@ def test_plaintext_export_keeps_repeated_roles_in_source_order():
     assert "INTRODUCTION_SECOND" in result["parsed_sections"]["introduction (2)"]
     assert result["section_order"] == list(result["parsed_sections"])
 
-    role_texts = aggregate_role_texts(result["parsed_sections"], result["section_roles"])
-    assert role_texts["introduction"].index("INTRODUCTION_FIRST") < role_texts["introduction"].index("INTRODUCTION_SECOND")
+    merged = merge_repeated_sections(result["parsed_sections"], result["section_order"])
+    assert merged[0]["text"].index("INTRODUCTION_FIRST") < merged[0]["text"].index("INTRODUCTION_SECOND")
 
 
 def test_template_sections_follow_source_order_before_missing_template_sections():

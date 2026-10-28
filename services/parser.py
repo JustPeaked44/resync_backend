@@ -166,10 +166,6 @@ class ManuscriptParserService:
         heuristically from the document itself and keyed by source-ordered
         occurrence names; `section_roles` maps those names to canonical roles.
 
-        Detects missing mandatory sections based on the template
-        (TOC-driven path) or against a minimal required role set
-        (auto-detect path).
-
         Args:
             text: Raw manuscript text to parse.
             template_toc: Optional ordered list of mandatory section
@@ -177,8 +173,7 @@ class ManuscriptParserService:
                 requiring a template.
 
         Returns:
-            Dict with keys: "parsed_sections", "missing_sections",
-            "has_all_required_sections", "total_sections_count",
+            Dict with keys: "parsed_sections", "total_sections_count",
             "section_roles", "auto_detected", "detection_confidence",
             "section_order".
         """
@@ -207,25 +202,12 @@ class ManuscriptParserService:
                 {role: role for role in parsed_sections},
             )
 
-            required_roles = {"introduction", "methodology", "results", "discussion"}
-            role_lengths: Dict[str, int] = {}
-            for heading, content in parsed_sections.items():
-                role = section_roles.get(heading, heading)
-                role_lengths[role] = role_lengths.get(role, 0) + len(content)
-            missing_sections = [
-                role for role in required_roles
-                if role_lengths.get(role, 0) < 20
-            ]
-
             return {
                 "parsed_sections": parsed_sections,
-                "missing_sections": missing_sections,
-                "has_all_required_sections": len(missing_sections) == 0,
                 "total_sections_count": len(parsed_sections),
                 "section_roles": section_roles,
                 "auto_detected": True,
                 "detection_confidence": detection["confidence"],
-                "research_type": detection.get("research_type", "unknown"),
                 "section_order": detection.get("section_order", list(parsed_sections)),
             }
 
@@ -284,11 +266,6 @@ class ManuscriptParserService:
         }
 
         # 4. Identify missing mandatory sections (< 20 characters)
-        missing_sections = [
-            s for s, content in parsed_sections.items()
-            if len(content) < 20 and s.lower() != "title"
-        ]
-
         # 5. Build section_roles: map each heading → standardized internal role
         section_roles: Dict[str, str] = {
             heading: cls.normalize_role(heading)
@@ -297,13 +274,10 @@ class ManuscriptParserService:
 
         return {
             "parsed_sections": parsed_sections,
-            "missing_sections": missing_sections,
-            "has_all_required_sections": len(missing_sections) == 0,
             "total_sections_count": len(parsed_sections),
             "section_roles": section_roles,  # heading → standardized role
             "auto_detected": False,
             "detection_confidence": 1.0,
-            "research_type": "unknown",
             "section_order": list(parsed_sections),
         }
 
@@ -426,28 +400,10 @@ class ManuscriptParserService:
 
         confidence = max(0.0, min(1.0, confidence))
 
-        # Quali/Quanti heuristic detection
-        quanti_keywords = {"survey", "respondents", "n =", "p <", "statistical", "questionnaire", "likert"}
-        quali_keywords = {"thematic analysis", "interview", "coding", "purposive", "narrative", "phenomenology"}
-        
-        text_lower = text.lower()
-        quanti_score = sum(1 for kw in quanti_keywords if kw in text_lower)
-        quali_score = sum(1 for kw in quali_keywords if kw in text_lower)
-        
-        if quanti_score > 0 and quali_score > 0:
-            research_type = "mixed" if abs(quanti_score - quali_score) <= 1 else ("quantitative" if quanti_score > quali_score else "qualitative")
-        elif quanti_score > 0:
-            research_type = "quantitative"
-        elif quali_score > 0:
-            research_type = "qualitative"
-        else:
-            research_type = "unknown"
-
         return {
             "sections": sections,
             "confidence": confidence,
             "detected_headings": detected_headings,
-            "research_type": research_type,
             "section_roles": section_roles,
             "section_order": list(sections),
         }

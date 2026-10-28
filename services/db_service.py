@@ -46,8 +46,6 @@ class DatabasePersistenceService:
         citations: List[Dict[str, Any]],
         doc_url: Optional[str] = None,
         sections_analyzed: Optional[List[str]] = None,
-        missing_sections: Optional[List[str]] = None,
-        has_all_required_sections: Optional[bool] = None,
         inconsistencies_found: Optional[int] = None,
         citations_audited: Optional[int] = None,
         crossmatch_issues: Optional[Dict[str, List[Dict[str, Any]]]] = None,
@@ -86,10 +84,6 @@ class DatabasePersistenceService:
         }
         if sections_analyzed is not None:
             analysis_run_update["sections_analyzed"] = sections_analyzed
-        if missing_sections is not None:
-            analysis_run_update["missing_sections"] = missing_sections
-        if has_all_required_sections is not None:
-            analysis_run_update["has_all_required_sections"] = has_all_required_sections
         if inconsistencies_found is not None:
             analysis_run_update["inconsistencies_found"] = inconsistencies_found
         if citations_audited is not None:
@@ -176,7 +170,6 @@ class DatabasePersistenceService:
                     "evidence_a": data.get("evidence_a") or "",
                     "evidence_b": data.get("evidence_b") or "",
                     "evidence_verified": bool(data.get("evidence_verified", False)),
-                    "objectives_unaddressed": data.get("objectives_unaddressed") or [],
                 }
                 if "inconsistency_id" in data:
                     row["inconsistency_id"] = data["inconsistency_id"]

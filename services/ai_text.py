@@ -160,7 +160,7 @@ def compute_ai_text_indicator(
 ) -> AITextIndicatorResult:
     """embedder must expose .encode(list[str]) -> np.ndarray, matching the
     sentence-transformers SentenceTransformer interface (the pipeline
-    should pass in embedding_service._model). If omitted, the
+    should pass in the retained v5 embedder). If omitted, the
     sentence-embedding self-similarity feature is skipped and its weight
     is redistributed across the remaining features."""
     text = (section_text or "").strip()
