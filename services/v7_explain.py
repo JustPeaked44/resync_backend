@@ -2,9 +2,17 @@
 
 import json
 import logging
+import re
 from services import gemini
 
 logger = logging.getLogger("resync.v7_explain")
+
+
+def plain_text(value):
+    value = re.sub(r"(?m)^\s*(?:#{1,6}\s*|[-*•●○■☐☑☒]\s+|\d+[.)]\s+)+", "", value)
+    return value.replace("*", "").replace("`", "").strip()
+
+
 STRICT_RULES = """STRICT RULES:
 1. Do not assume or mention research type.
 2. Do not demand specific structural changes or missing chapters.
@@ -52,7 +60,8 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
     def verified(section, quote):
         if not isinstance(section, str) or section not in source or not isinstance(quote, str) or not quote.strip():
             return None
-        match, ok = gemini.verify_quote(quote, source[section])
+        cleaned = plain_text(quote)
+        match, ok = gemini.verify_quote(cleaned, source[section])
         return match if ok else None
 
     issues = []
@@ -62,7 +71,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
             if (section and item.get("what") != "No major inconsistencies found."
                     and all(isinstance(item.get(k), str) and item[k].strip() for k in ("what", "why"))):
                 issues.append({"section": section, "quote": verified(section, item.get("quote")),
-                               "what": item["what"], "why": item["why"]})
+                               "what": plain_text(item["what"]), "why": plain_text(item["why"])})
     recommendations = []
     for item in raw.get("recommendations", []) if isinstance(raw.get("recommendations"), list) else []:
         if not isinstance(item, dict):
@@ -70,11 +79,12 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
         section = section_name(item.get("section"))
         revision = item.get("recommended_revision")
         original = verified(section, item.get("original_sentence"))
-        if (section and original and isinstance(revision, str) and revision.strip()
+        # shortcut: multiline quotes often join table cells, revisit with sentence spans if wrapped prose is lost.
+        if (section and original and "\n" not in original and isinstance(revision, str) and revision.strip()
                 and revision != "No major inconsistencies found."):
             recommendations.append({"section": section,
                                     "original_sentence": original,
-                                    "recommended_revision": revision})
+                                    "recommended_revision": plain_text(revision)})
     references = []
     for item in raw.get("reference_list", []) if isinstance(raw.get("reference_list"), list) else []:
         if isinstance(item, dict):
@@ -114,7 +124,8 @@ async def explain_summary(flow, findings):
     try:
         raw = await _generate(prompt)
         summary = raw.get("summary") if isinstance(raw, dict) else None
-        return summary.strip() if isinstance(summary, str) and summary.strip() else None
+        cleaned = plain_text(summary) if isinstance(summary, str) else ""
+        return cleaned or None
     except Exception:
         logger.exception("v7 Gemini summary failed")
         return None

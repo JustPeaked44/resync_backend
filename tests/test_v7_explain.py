@@ -33,7 +33,7 @@ def test_fake_gemini_pair_and_summary(monkeypatch):
             pass
 
         def json(self):
-            value = {"summary": "B correlates partly with A."} if "Summarize" in prompts[-1] else {
+            value = {"summary": "## **B correlates partly with A.**"} if "Summarize" in prompts[-1] else {
                 "coherence_scores": {"overall": 1.0}, "highlighted_inconsistencies": [],
                 "recommendations": [], "reference_list": []}
             return {"candidates": [{"content": {"parts": [{"text": json.dumps(value)}]}}]}
@@ -127,6 +127,8 @@ def test_recommendation_sentence_must_be_in_its_own_pair(monkeypatch):
          "recommended_revision": "Wrong pair."},
         {"section": "A", "original_sentence": "A says improvement.",
          "recommended_revision": "A says improvement, consistent with B."},
+        {"section": "A", "original_sentence": "Time Frame:\n2 Weeks\nand produce a package.",
+         "recommended_revision": "Rewrite the table as a sentence."},
         {"section": "B", "original_sentence": "B says no effect.",
          "recommended_revision": "B says no effect, despite A."}]}
 
@@ -142,6 +144,39 @@ def test_recommendation_sentence_must_be_in_its_own_pair(monkeypatch):
 
     monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
     result = asyncio.run(v7_explain.explain_pair(
-        "A", "A says improvement.", "B", "B says no effect.", SCORES, [], []))
+        "A", "A says improvement.\nTime Frame:\n2 Weeks\nand produce a package.",
+        "B", "B says no effect.", SCORES, [], []))
     assert [r["original_sentence"] for r in result["recommendations"]] == [
         "A says improvement.", "B says no effect."]
+
+
+def test_user_facing_gemini_strings_are_plain_text(monkeypatch):
+    raw = {"highlighted_inconsistencies": [{
+        "section": "A", "quote": "**`A says improvement.`**",
+        "what": "## **`claim_support`** — unsupported link",
+        "why": "- **Because** the arguments differ."}],
+        "recommendations": [{"section": "B", "original_sentence": "**B says no effect.**",
+                             "recommended_revision": "1. **B** says no effect, despite A."}],
+        "reference_list": [{"section": "A", "sentence": "A says improvement."}]}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(raw)}]}}]}
+
+    async def fake(_):
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    result = asyncio.run(v7_explain.explain_pair(
+        "A", "A says improvement.", "B", "B says no effect.", SCORES, [], []))
+    assert result["highlighted_inconsistencies"][0]["what"] == "claim_support — unsupported link"
+    assert result["highlighted_inconsistencies"][0]["quote"] == "A says improvement."
+    assert result["highlighted_inconsistencies"][0]["why"] == "Because the arguments differ."
+    assert result["recommendations"][0]["recommended_revision"] == "B says no effect, despite A."
+    assert result["recommendations"][0]["original_sentence"] == "B says no effect."
+    assert result["reference_list"][0]["sentence"] == "A says improvement."
+    assert v7_explain.plain_text("# **`AI-text note`**") == "AI-text note"
+    assert v7_explain.plain_text("● **A listed recommendation.**") == "A listed recommendation."
