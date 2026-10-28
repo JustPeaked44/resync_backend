@@ -64,9 +64,8 @@ def read_root():
 
 # ponytail: single-slot global lock — one scan at a time on 0.1 CPU / 512MB.
 # Raise to 2+ only on a Standard (2GB) instance. Held across the whole
-# pipeline (not just the CPU-bound steps) so it also serializes the Gemini
-# calls in reasoning.py, keeping two concurrent scans from doubling the
-# request rate against the shared 15 RPM free-tier quota.
+# pipeline (not just the CPU-bound steps) so concurrent scans do not
+# multiply the Gemini pair and summary request rate.
 SCAN_SLOT = asyncio.Semaphore(1)
 
 
@@ -771,7 +770,7 @@ async def _run_scan_job(
     summary="Master Production Scan (synchronous)",
     description=(
         "Runs the full RESYNC analysis pipeline and blocks until it finishes: "
-        "Ingestion → Parser → Embedding → Reasoning → Citation → DB → Notification. "
+        "Ingestion → Parser → v7 scoring and explanation → Citation → DB → Notification. "
         "Retained for the Android client. Long manuscripts can exceed upstream "
         "proxy request timeouts on this endpoint — new clients should prefer "
         "POST /api/scans/start."

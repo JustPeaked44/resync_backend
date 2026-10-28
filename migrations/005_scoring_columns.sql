@@ -1,5 +1,5 @@
 -- 005_scoring_columns.sql
--- Adds the three-criteria functional metric score to analysis_run.
+-- Historical scoring columns retained for existing analysis_run rows.
 -- Run in the Supabase SQL Editor after 004_credits.sql.
 
 ALTER TABLE public.analysis_run
@@ -14,9 +14,6 @@ ALTER TABLE public.analysis_run
     ADD COLUMN IF NOT EXISTS ai_text_indicator_score real,
     ADD COLUMN IF NOT EXISTS ai_text_indicator_json jsonb;
 
--- overall_coherence_score / analysis_run_coherence_score remain the
--- authoritative columns the existing frontend history query and the
--- mobile app already read. The pipeline sets both of those to the new
--- functional_metric_score so nothing downstream needs to change to keep
--- working, while functional_metric_score plus the three sub-scores give
--- the new criteria breakdown UI something to render.
+-- Current v7 scans store the exact weighted score in functional_metric_score
+-- and result_json; the legacy integer analysis_run_coherence_score is rounded.
+-- Other legacy columns remain available for older rows.
