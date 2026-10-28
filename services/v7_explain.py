@@ -65,7 +65,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
         if isinstance(item, dict):
             quote = verified(item.get("section"), item.get("sentence"))
             if quote:
-                references.append({"section": item["section"], "quote": quote})
+                references.append({"section": item["section"], "sentence": quote})
     return {"coherence_scores": coherence_scores(scores), "highlighted_inconsistencies": issues,
             "recommendations": recommendations, "reference_list": references}
 

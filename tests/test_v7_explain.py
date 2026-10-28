@@ -19,7 +19,7 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
     assert result["coherence_scores"]["overall"] == 0.4
     assert len(result["highlighted_inconsistencies"]) == 1
     assert result["recommendations"][0]["original_sentence"] is None
-    assert result["reference_list"] == [{"section": "A", "quote": "A  curly 'quote'."}]
+    assert result["reference_list"] == [{"section": "A", "sentence": "A  curly 'quote'."}]
 
 
 def test_fake_gemini_pair_and_summary(monkeypatch):

@@ -107,9 +107,9 @@ def flatten_explanations(flow):
         pair_recommendations = explanation["recommendations"]
         for item in explanation["highlighted_inconsistencies"]:
             quotes = [{"section": item["section"], "text": item["quote"]}]
-            quotes.extend({"section": ref["section"], "text": ref["quote"]}
+            quotes.extend({"section": ref["section"], "text": ref["sentence"]}
                           for ref in explanation["reference_list"] if ref["section"] in names and
-                          (ref["section"], ref["quote"]) != (item["section"], item["quote"]))
+                          (ref["section"], ref["sentence"]) != (item["section"], item["quote"]))
             matching_revision = next((r["recommended_revision"] for r in pair_recommendations
                                       if r["section"] == item["section"]), "")
             findings.append({"section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
