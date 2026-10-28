@@ -107,10 +107,20 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
 
 
+def test_google_doc_title_comes_from_cleaned_first_line(assembled_scan, monkeypatch):
+    async def fetch(_):
+        return "\n# **`A Useful Manuscript Title`**\nBody text."
+
+    monkeypatch.setattr(main.DocumentIngestionService, "fetch_plaintext_from_gdoc", fetch)
+    req = main.ScanRequest(user_id="user", doc_url="https://docs.google.com/document/d/test/edit")
+    result = asyncio.run(main._execute_scan_pipeline(req, "run2", "ms2"))
+    assert result.manuscript_title == "A Useful Manuscript Title"
+
+
 def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     payload, _, _ = assembled_scan
     assert set(payload) == {
-        "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "result_version",
+            "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
         "overall_coherence_score", "sections_analyzed", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
         "score_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",

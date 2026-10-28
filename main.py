@@ -30,6 +30,7 @@ from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
                               weighted_score, band, dimension_averages)
 from services.reference_parser import extract_intext_citations
+from services.v7_explain import plain_text
 
 logger = logging.getLogger("resync.main")
 
@@ -336,6 +337,7 @@ class ScanResponse(BaseModel):
     user_id: str
     manuscript_id: str
     doc_url: str
+    manuscript_title: Optional[str] = None
     result_version: Optional[str] = None
     overall_coherence_score: float
     sections_analyzed: List[str]
@@ -523,6 +525,9 @@ async def _execute_scan_pipeline(
             detail="No valid manuscript provided. Please provide a public Google Docs link or upload a .docx/.pdf file."
         )
 
+    derived_title = (plain_text(next((line for line in raw_text.splitlines() if line.strip()), ""))[:120]
+                     if req.doc_url and not req.manuscript_title else None)
+
     # ------------------------------------------------------------------
     # Step 2 – Parser
     # ------------------------------------------------------------------
@@ -627,7 +632,7 @@ async def _execute_scan_pipeline(
     # Derive a human-readable manuscript title for the push message.
     # We use the source identifier as a fallback since the title may not be
     # in the request model; the notification service only needs a string.
-    manuscript_title: str = req.manuscript_title or source_identifier
+    manuscript_title: str = req.manuscript_title or derived_title or source_identifier
     try:
         ms_row = (
             db_client
@@ -637,7 +642,7 @@ async def _execute_scan_pipeline(
             .single()
             .execute()
         )
-        if ms_row and ms_row.data and ms_row.data.get("manuscript_title"):
+        if not derived_title and ms_row and ms_row.data and ms_row.data.get("manuscript_title"):
             manuscript_title = ms_row.data["manuscript_title"]
     except Exception:
         pass  # silently fall back to URL/filename — non-critical
@@ -658,6 +663,7 @@ async def _execute_scan_pipeline(
         user_id=req.user_id,
         manuscript_id=manuscript_id,
         doc_url=source_identifier,
+        manuscript_title=req.manuscript_title or derived_title,
         result_version="v7",
         overall_coherence_score=overall_score,
         sections_analyzed=[section["name"] for section in sections],
