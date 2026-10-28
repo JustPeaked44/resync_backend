@@ -34,6 +34,13 @@ from services.v7_explain import plain_text
 
 logger = logging.getLogger("resync.main")
 
+
+def _references_text(parsed_sections: Dict[str, str], section_roles: Dict[str, str]) -> str:
+    return max((text for heading, text in parsed_sections.items()
+                if section_roles.get(heading) == "references"
+                and re.sub(r" \(\d+\)$", "", heading.strip().lower()) in ("references", "bibliography")),
+               key=len, default="")
+
 gemini_key = os.getenv("GEMINI_API_KEY")
 supabase_url = os.getenv("SUPABASE_URL")
 
@@ -557,17 +564,7 @@ async def _execute_scan_pipeline(
     # No 20,000-char slice here anymore — that cap silently truncated a
     # real 150-reference APA list mid-entry. CitationAuditService applies
     # its own much larger DoS-guard cap (150,000 chars) internally.
-    references_text: str = ""
-    for heading, text in parsed_sections.items():
-        role = section_roles.get(heading, heading.strip().lower())
-        if role == "references":
-            references_text = text
-            break
-    if not references_text:
-        for heading, text in parsed_sections.items():
-            if heading.strip().lower() == "references":
-                references_text = text
-                break
+    references_text = _references_text(parsed_sections, section_roles)
     citation_audit_result: Dict[str, Any] = await CitationAuditService.audit_citations(
         references_text, body_text=raw_text
     )
