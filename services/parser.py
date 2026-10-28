@@ -334,15 +334,17 @@ class ManuscriptParserService:
         detected_roles_in_order: List[str] = []
         current_section_key: Optional[str] = None
 
-        # Regex to detect TOC-style "heading . . . . . . 12" lines
-        toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
-
         # 1. Walk lines, classifying each as a heading (role-mapped) or body text
-        for line in lines:
-            # Skip TOC-style lines (e.g. "Methodology ...... 14" or "Results   12")
-            if toc_line_re.search(line):
-                continue
-            role = cls._detect_heading_role(line, prefix_re)
+        table_neighbors = {"test case description", "expected result", "actual result", "pre-condition",
+                           "remarks", "critical", "number", "table name", "fk referenced table"}
+        for index, line in enumerate(lines):
+            previous = lines[index - 1].lower() if index else ""
+            following = lines[index + 1].lower() if index + 1 < len(lines) else ""
+            in_table = ((line.lower() in {"expected result", "actual result", "test results"}
+                         and (previous in table_neighbors or following in table_neighbors))
+                        or (line.lower() == "recommendation" and
+                            (re.match(r"table\s+\d", previous) or previous == "fk referenced table")))
+            role = None if in_table else cls._detect_heading_role(line, prefix_re)
             if role:
                 heading = re.sub(r" \(\d+\)$", "", prefix_re.sub("", line).strip().lower())
                 # If we already have this literal heading and its content so far is very
@@ -433,17 +435,31 @@ class ManuscriptParserService:
             The matched role string, or None if the line is not a
             recognizable heading.
         """
-        if len(line) >= 80 or line.rstrip().endswith("."):
+        if (len(line) >= 80 or line.rstrip().endswith(".")
+                or re.match(r"^(?:[*•☐☑☒\-]\s*|\d+[.)]\s+)", line)
+                or re.search(r"\s{2,}\d{1,3}$", line)
+                or re.match(r"(?i)^(?:figure|fig\.|table|chart)\s+\d+", line)):
             return None
 
-        cleaned = prefix_re.sub("", line).strip().lower()
+        remainder = prefix_re.sub("", line).strip()
+        if remainder.endswith(":") or ":" in remainder or len(remainder) < 3:
+            return None
+        cleaned = remainder.lower()
         # Remove any remaining leading non-alpha characters
         cleaned = re.sub(r"^[^a-z]+", "", cleaned).strip()
 
         if not cleaned:
             return None
 
-        return cls._best_role_match(cleaned)
+        if cleaned in ROLE_MAPPING:
+            return ROLE_MAPPING[cleaned]
+        words = re.findall(r"[A-Za-z]+", remainder)
+        if (len(words) < 2 or sum(word[0].isupper() for word in words) < 2
+                or sum(word[0].isupper() for word in words) < len(words) / 2):
+            return None
+        matches = [(keyword, role) for keyword, role in ROLE_MAPPING.items()
+                   if re.search(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", cleaned)]
+        return max(matches, key=lambda match: len(match[0]))[1] if matches else None
 
     @staticmethod
     def _best_role_match(cleaned: str) -> Optional[str]:
