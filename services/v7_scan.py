@@ -106,7 +106,7 @@ def flatten_explanations(flow):
         score = round(pair["scores"]["overall_coherence"] * 100, 2)
         pair_recommendations = explanation["recommendations"]
         for item in explanation["highlighted_inconsistencies"]:
-            quotes = [{"section": item["section"], "text": item["quote"]}]
+            quotes = [{"section": item["section"], "text": item["quote"]}] if item["quote"] else []
             quotes.extend({"section": ref["section"], "text": ref["sentence"]}
                           for ref in explanation["reference_list"] if ref["section"] in names and
                           (ref["section"], ref["sentence"]) != (item["section"], item["quote"]))

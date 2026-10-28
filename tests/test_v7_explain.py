@@ -1,6 +1,8 @@
 import asyncio
 import json
+import pytest
 from services import v7_explain
+from services.v7_scan import assemble_flow, flatten_explanations
 
 SCORES = {"overall_coherence": 0.4, "objectives_alignment": 0.8, "methodology_fit": 0.7,
           "numeric_consistency": 0.6, "claim_support": 0.5}
@@ -17,7 +19,8 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
     result = v7_explain.normalize_explanation(raw, SCORES, "A", 'A curly ‘quote’.', "B", "B text.")
     assert set(result) == {"coherence_scores", "highlighted_inconsistencies", "recommendations", "reference_list"}
     assert result["coherence_scores"]["overall"] == 0.4
-    assert len(result["highlighted_inconsistencies"]) == 1
+    assert len(result["highlighted_inconsistencies"]) == 2
+    assert result["highlighted_inconsistencies"][1]["quote"] is None
     assert result["recommendations"][0]["original_sentence"] is None
     assert result["reference_list"] == [{"section": "A", "sentence": "A  curly 'quote'."}]
 
@@ -55,3 +58,63 @@ def test_summary_failure_returns_null(monkeypatch):
 
     monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fail)
     assert asyncio.run(v7_explain.explain_summary([], [])) is None
+
+
+@pytest.mark.parametrize("raw,issues,recommendations,references", [
+    ({"highlighted_inconsistencies": [{"section": "Section B (B)", "quote": "fabricated",
+                                    "what": "Contradiction", "why": "A and B disagree."}],
+      "recommendations": [{"section": "Section B (B)", "original_sentence": "fabricated",
+                           "recommended_revision": "Align the statement with A."}],
+      "reference_list": [{"section": "Section A (A)", "sentence": "A says improvement."}]}, 1, 1, 1),
+    ({"highlighted_inconsistencies": [{"section": "B", "quote": "B says no effect.",
+                                    "what": "No major inconsistencies found.", "why": "placeholder"}],
+      "recommendations": [{"section": "B", "original_sentence": "B says no effect.",
+                           "recommended_revision": "No major inconsistencies found."}]}, 0, 0, 0),
+    ({"highlighted_inconsistencies": [{"section": "unknown", "quote": "fabricated",
+                                    "what": "gap", "why": "reason"},
+                                   {"section": "B", "quote": "B says no effect.", "what": "gap"}],
+      "recommendations": [{"section": "unknown", "recommended_revision": "Revise."},
+                          {"section": "B", "recommended_revision": ""}],
+      "reference_list": [{"section": "B", "sentence": "fabricated"}]}, 0, 0, 0),
+])
+def test_fake_gemini_preserves_findings_but_rejects_unsupported_evidence(monkeypatch, raw, issues, recommendations, references):
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(raw)}]}}]}
+
+    async def fake(_):
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    result = asyncio.run(v7_explain.explain_pair("A", "A says improvement.", "B", "B says no effect.", SCORES, [], []))
+    assert len(result["highlighted_inconsistencies"]) == issues
+    assert len(result["recommendations"]) == recommendations
+    assert len(result["reference_list"]) == references
+    if issues:
+        assert result["highlighted_inconsistencies"][0]["quote"] is None
+        assert result["recommendations"][0]["original_sentence"] is None
+        flow = assemble_flow([{"name": "A", "text": "A says improvement."},
+                              {"name": "B", "text": "B says no effect."}], [{"scores": dict(SCORES, pair_weight=1)}])
+        flow[0]["explanation"] = result
+        findings, revisions = flatten_explanations(flow)
+        assert len(findings) == len(revisions) == 1
+        assert findings[0]["evidence_verified"] is True
+        assert findings[0]["evidence_quotes"] == [{"section": "A", "text": "A says improvement."}]
+
+
+def test_fabricated_quote_never_becomes_a_highlight():
+    explanation = v7_explain.normalize_explanation(
+        {"highlighted_inconsistencies": [{"section": "B", "quote": "fabricated",
+                                         "what": "Contradiction", "why": "A and B disagree."}]},
+        SCORES, "A", "A says improvement.", "B", "B says no effect.")
+    flow = assemble_flow([{"name": "A", "text": "A says improvement."},
+                          {"name": "B", "text": "B says no effect."}], [{"scores": dict(SCORES, pair_weight=1)}])
+    flow[0]["explanation"] = explanation
+    findings, _ = flatten_explanations(flow)
+    assert findings[0]["explanation_what"] == "Contradiction"
+    assert findings[0]["evidence_quotes"] == []
+    assert findings[0]["evidence_a"] == findings[0]["evidence_b"] == ""
+    assert findings[0]["evidence_verified"] is False

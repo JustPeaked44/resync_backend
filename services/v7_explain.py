@@ -22,7 +22,7 @@ Return JSON with exactly four top-level keys: coherence_scores (copy model score
 highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, recommended_revision),
 reference_list (array of objects with section, sentence).
-Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text."""
+Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text."""
 SUMMARY_PROMPT = """Summarize correlation of these neighboring manuscript pairs in one concise paragraph.
 {rules}
 Use only these scored pairs and verified findings: {data}
@@ -38,6 +38,13 @@ def coherence_scores(scores):
 def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
     raw = raw if isinstance(raw, dict) else {}
     source = {role_a: text_a, role_b: text_b}
+    aliases = {"Section A": role_a, "Section B": role_b,
+               f"Section A ({role_a})": role_a, f"Section B ({role_b})": role_b}
+
+    def section_name(value):
+        if not isinstance(value, str):
+            return None
+        return value if value in source else aliases.get(value)
 
     def verified(section, quote):
         if not isinstance(section, str) or section not in source or not isinstance(quote, str) or not quote.strip():
@@ -48,24 +55,28 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
     issues = []
     for item in raw.get("highlighted_inconsistencies", []) if isinstance(raw.get("highlighted_inconsistencies"), list) else []:
         if isinstance(item, dict):
-            quote = verified(item.get("section"), item.get("quote"))
-            if quote and all(isinstance(item.get(k), str) and item[k].strip() for k in ("what", "why")):
-                issues.append({"section": item["section"], "quote": quote, "what": item["what"], "why": item["why"]})
+            section = section_name(item.get("section"))
+            if (section and item.get("what") != "No major inconsistencies found."
+                    and all(isinstance(item.get(k), str) and item[k].strip() for k in ("what", "why"))):
+                issues.append({"section": section, "quote": verified(section, item.get("quote")),
+                               "what": item["what"], "why": item["why"]})
     recommendations = []
     for item in raw.get("recommendations", []) if isinstance(raw.get("recommendations"), list) else []:
-        if not isinstance(item, dict) or item.get("section") not in source:
+        if not isinstance(item, dict):
             continue
+        section = section_name(item.get("section"))
         revision = item.get("recommended_revision")
-        if isinstance(revision, str) and revision.strip():
-            recommendations.append({"section": item["section"],
-                                    "original_sentence": verified(item["section"], item.get("original_sentence")),
+        if section and isinstance(revision, str) and revision.strip() and revision != "No major inconsistencies found.":
+            recommendations.append({"section": section,
+                                    "original_sentence": verified(section, item.get("original_sentence")),
                                     "recommended_revision": revision})
     references = []
     for item in raw.get("reference_list", []) if isinstance(raw.get("reference_list"), list) else []:
         if isinstance(item, dict):
-            quote = verified(item.get("section"), item.get("sentence"))
+            section = section_name(item.get("section"))
+            quote = verified(section, item.get("sentence"))
             if quote:
-                references.append({"section": item["section"], "sentence": quote})
+                references.append({"section": section, "sentence": quote})
     return {"coherence_scores": coherence_scores(scores), "highlighted_inconsistencies": issues,
             "recommendations": recommendations, "reference_list": references}
 
