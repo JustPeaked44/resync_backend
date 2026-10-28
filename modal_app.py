@@ -1,10 +1,14 @@
-"""Deploy with `modal deploy modal_app.py` after configuring a Modal token."""
+"""Deploy the isolated v7 ML worker with `modal deploy modal_app.py`."""
 
-import os
-
+from pathlib import Path
 import modal
+from services.ml_client import MODAL_APP_NAME
 
-app = modal.App("resync-ml")
+CHECKPOINT = Path(__file__).parent / "models" / "v7_final_model.pt"
+if not CHECKPOINT.is_file():
+    raise FileNotFoundError(f"Required v7 checkpoint missing: {CHECKPOINT}")
+
+app = modal.App(MODAL_APP_NAME)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("numpy~=2.5.1", "spacy~=3.8.14")
@@ -12,26 +16,8 @@ image = (
     .workdir("/app")
     .add_local_dir("services", "/app/services")
     .add_local_dir("models/model_v5b", "/app/models/model_v5b")
-    .add_local_file("models/v6_model.pt", "/app/models/v6_model.pt")
+    .add_local_file(str(CHECKPOINT), "/app/models/v7_final_model.pt")
 )
-# Optional so deploys keep working until the v7 checkpoint is added to the repo.
-if os.path.exists("models/v7_final_model.pt"):
-    image = image.add_local_file("models/v7_final_model.pt", "/app/models/v7_final_model.pt")
-
-
-def analyze_batch(parsed_sections, role_texts, role_pairs):
-    from services.ml_worker import analyze_batch as run
-    return run(parsed_sections, role_texts, role_pairs)
-
-
-def analyze_v7(sections):
-    from services.ml_worker import analyze_v7 as run
-    return run(sections)
-
-
-def explain_batch(pairs):
-    from services.ml_worker import explain_batch as run
-    return run(pairs)
 
 
 @app.cls(image=image, cpu=1.0, memory=2048, timeout=600, min_containers=0)
@@ -40,16 +26,15 @@ class MLWorker:
     def load_models(self):
         import torch
         torch.set_num_threads(1)
-        from services import embedding, xai_utils  # noqa: F401 - load once per container
-
-    @modal.method()
-    def analyze_batch(self, parsed_sections, role_texts, role_pairs):
-        return analyze_batch(parsed_sections, role_texts, role_pairs)
+        from services.v7_logic import get_model
+        get_model()
 
     @modal.method()
     def analyze_v7(self, sections):
+        from services.ml_worker import analyze_v7
         return analyze_v7(sections)
 
     @modal.method()
-    def explain_batch(self, pairs):
-        return explain_batch(pairs)
+    def analyze_ai_text(self, sections):
+        from services.ml_worker import analyze_ai_text
+        return analyze_ai_text(sections)

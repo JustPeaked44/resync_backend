@@ -2,6 +2,8 @@
 
 import os
 
+MODAL_APP_NAME = "resync-ml-v7"
+
 
 class MLClient:
     def __init__(self, backend=None):
@@ -18,7 +20,7 @@ class MLClient:
 
         import modal
         try:
-            worker = modal.Cls.from_name("resync-ml", "MLWorker")()
+            worker = modal.Cls.from_name(MODAL_APP_NAME, "MLWorker")()
             return getattr(worker, method).remote(*args)
         except Exception as exc:
             raise RuntimeError(f"Modal ML {method} failed: {exc}") from exc

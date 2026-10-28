@@ -13,7 +13,7 @@ import torch
 from services.v7_model import MultiHeadMiniLM_v7
 
 V7_WEIGHTS_PATH = os.getenv("V7_WEIGHTS_PATH", "./models/v7_final_model.pt")
-V7_BACKBONE = os.getenv("V7_BACKBONE", "sentence-transformers/all-MiniLM-L6-v2")
+V7_BACKBONE = os.getenv("V7_BACKBONE", "./models/model_v5b")
 
 CULPRIT_THRESHOLD = 0.65
 MAX_CULPRITS = 3
