@@ -13,6 +13,7 @@ STRICT_RULES = """STRICT RULES:
 5. Never change model scores; they come from the PyTorch model."""
 PAIR_PROMPT = """Explain correlation between neighboring manuscript sections.
 {rules}
+In user-facing text, never mention the model, PyTorch, or how scores are produced. Express any score as a whole-number percentage (e.g. 80%), never a raw decimal.
 Section A ({a}): {text_a}
 Section B ({b}): {text_b}
 Model scores (0 to 1): {scores}
@@ -25,6 +26,7 @@ reference_list (array of objects with section, sentence).
 Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text."""
 SUMMARY_PROMPT = """Summarize correlation of these neighboring manuscript pairs in one concise paragraph.
 {rules}
+Never mention the model, PyTorch, or how scores are produced. Express any score as a whole-number percentage (e.g. 80%), never a raw decimal.
 Use only these scored pairs and verified findings: {data}
 Return JSON with one string key, summary. Do not invent evidence or alter scores."""
 
