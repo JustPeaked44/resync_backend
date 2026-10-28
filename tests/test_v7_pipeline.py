@@ -104,3 +104,27 @@ def test_legacy_poll_model_passes_payload_through():
     legacy = {"status": "completed", "overall_coherence_score": 42}
     result = main.ScanStatusResponse(status="completed", analysis_run_id="old", result=legacy)
     assert result.model_dump()["result"] == legacy
+
+
+def test_persistence_rounds_only_legacy_integer_mirror(monkeypatch):
+    updates = []
+
+    class Table:
+        def update(self, payload):
+            updates.append(payload)
+            return self
+
+        def eq(self, *_):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[])
+
+    monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: SimpleNamespace(table=lambda *_: Table()))
+    asyncio.run(main.DatabasePersistenceService.save_scan_transaction(
+        user_id="u", manuscript_id="m", analysis_run_id="r", coherence_score=77.1,
+        inconsistencies=[], recommendations=[], citations=[],
+        score_breakdown={"overall_score": 77.1, "band": "Solid", "cross_chapter_coherence_score": 77.1}))
+    assert updates[0]["analysis_run_coherence_score"] == 77
+    assert updates[0]["functional_metric_score"] == 77.1
+    assert "structural_completeness_score" not in updates[0]

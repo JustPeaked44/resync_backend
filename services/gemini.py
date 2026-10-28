@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import logging
 import httpx
 
 _WHITESPACE = re.compile(r"\s+")
@@ -29,15 +30,18 @@ async def post_gemini_with_retry(payload):
 
     async def send():
         async with httpx.AsyncClient(timeout=30.0) as client:
-            return await client.post(url, params={"key": key}, json=payload,
-                                     headers={"Content-Type": "application/json"})
+            return await client.post(url, json=payload,
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": key})
 
     response = await send()
     if response.status_code == 429:
+        logging.getLogger("resync.gemini").warning("Gemini returned 429")
         try:
             delay = float(response.headers.get("Retry-After", 5.0))
         except (TypeError, ValueError):
             delay = 5.0
         await asyncio.sleep(delay)
         response = await send()
+        if response.status_code == 429:
+            logging.getLogger("resync.gemini").warning("Gemini returned 429")
     return response

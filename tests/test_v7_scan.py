@@ -1,4 +1,6 @@
-from services.v7_scan import (assemble_flow, band, dimension_averages, merge_repeated_sections,
+import asyncio
+from services import v7_explain
+from services.v7_scan import (assemble_flow, band, dimension_averages, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs, weighted_score)
 
 
@@ -32,3 +34,43 @@ def test_flow_score_dimensions_and_worst_eight():
     assert pair_pointer(flow[1])["score"] == 10.0
     assert band(85) == "Strong" and band(70) == "Solid" and band(69.99) == "Needs Revision"
     assert weighted_score(assemble_flow(sections[:2], [{"skipped": "too short"}])) == 0.0
+
+
+def test_worst_pair_selection_at_boundaries():
+    sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(11)]
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 10,
+                       "objectives_alignment": 0.5, "methodology_fit": 0.5,
+                       "numeric_consistency": 0.5, "claim_support": 0.5}} for i in range(10)]
+    for n in (0, 1, 8, 9):
+        flow = assemble_flow(sections[:n + 1], raw[:n])
+        assert len(select_worst_pairs(flow)) == min(n, 8)
+
+
+def test_explanation_cap_and_single_summary(monkeypatch):
+    sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(10)]
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 10,
+                       "objectives_alignment": 0.5, "methodology_fit": 0.5,
+                       "numeric_consistency": 0.5, "claim_support": 0.5}} for i in range(9)]
+    flow = assemble_flow(sections, raw)
+    state = {"active": 0, "peak": 0, "summary_calls": 0}
+
+    async def fake_pair(*_):
+        state["active"] += 1
+        state["peak"] = max(state["peak"], state["active"])
+        await asyncio.sleep(0.01)
+        state["active"] -= 1
+        return {"coherence_scores": {}, "highlighted_inconsistencies": [],
+                "recommendations": [], "reference_list": []}
+
+    async def fake_summary(*_):
+        state["summary_calls"] += 1
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_pair", fake_pair)
+    monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
+    findings, recommendations, synthesis = asyncio.run(explain_flow(sections, flow))
+    assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 9))
+    assert flow[8]["explanation"] is None
+    assert state["peak"] <= 4 and state["summary_calls"] == 1
+    assert findings == recommendations == []
+    assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 9

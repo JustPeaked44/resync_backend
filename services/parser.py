@@ -328,7 +328,7 @@ class ManuscriptParserService:
         lines = [line.strip() for line in text.split("\n") if line.strip()]
 
         sections_lines: Dict[str, List[str]] = {}
-        role_keys: Dict[str, List[str]] = {}
+        heading_keys: Dict[str, List[str]] = {}
         section_roles: Dict[str, str] = {}
         detected_headings: List[str] = []
         detected_roles_in_order: List[str] = []
@@ -344,18 +344,19 @@ class ManuscriptParserService:
                 continue
             role = cls._detect_heading_role(line, prefix_re)
             if role:
-                # If we already have this role and its content so far is very
+                heading = re.sub(r" \(\d+\)$", "", prefix_re.sub("", line).strip().lower())
+                # If we already have this literal heading and its content so far is very
                 # short (< 150 chars), it was likely a TOC entry — discard it
                 # and restart accumulation from this real heading occurrence.
-                previous_keys = role_keys.get(role, [])
+                previous_keys = heading_keys.get(heading, [])
                 previous_key = previous_keys[-1] if previous_keys else None
                 if previous_key and len("\n".join(sections_lines[previous_key]).strip()) < 150:
                     section_key = previous_key
                     sections_lines[section_key] = []
                 else:
                     occurrence = len(previous_keys) + 1
-                    section_key = role if occurrence == 1 else f"{role} ({occurrence})"
-                    role_keys.setdefault(role, []).append(section_key)
+                    section_key = heading if occurrence == 1 else f"{heading} ({occurrence})"
+                    heading_keys.setdefault(heading, []).append(section_key)
                     sections_lines[section_key] = []
                 section_roles[section_key] = role
                 current_section_key = section_key

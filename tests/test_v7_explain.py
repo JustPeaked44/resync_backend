@@ -47,3 +47,11 @@ def test_fake_gemini_pair_and_summary(monkeypatch):
     assert all(rule in prompt for rule in ("Do not assume or mention research type", "Do not demand specific structural changes",
                                       "Do not use outside knowledge", "Only assess whether Section B logically correlates",
                                       "Never change model scores") for prompt in prompts)
+
+
+def test_summary_failure_returns_null(monkeypatch):
+    async def fail(_):
+        raise RuntimeError("quota exhausted")
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fail)
+    assert asyncio.run(v7_explain.explain_summary([], [])) is None

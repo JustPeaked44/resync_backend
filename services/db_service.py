@@ -79,7 +79,7 @@ class DatabasePersistenceService:
         # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
         analysis_run_update: Dict[str, Any] = {
             "analysis_run_status": "completed", # Bug 6: Valid enum is 'completed'
-            "analysis_run_coherence_score": coherence_score,
+            "analysis_run_coherence_score": round(coherence_score),
             "analysis_run_completed_at": now_iso,
         }
         if sections_analyzed is not None:
