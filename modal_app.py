@@ -5,7 +5,7 @@ import modal
 from services.ml_client import MODAL_APP_NAME
 
 CHECKPOINT = Path(__file__).parent / "models" / "v7_final_model.pt"
-if not CHECKPOINT.is_file():
+if modal.is_local() and not CHECKPOINT.is_file():
     raise FileNotFoundError(f"Required v7 checkpoint missing: {CHECKPOINT}")
 
 app = modal.App(MODAL_APP_NAME)

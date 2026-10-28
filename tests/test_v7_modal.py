@@ -1,7 +1,10 @@
 import importlib
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+
+import modal
 
 from services.ml_client import MLClient, MODAL_APP_NAME
 
@@ -14,6 +17,19 @@ def test_modal_app_constructs_without_importing_torch():
                            "import modal_app,sys; assert 'torch' not in sys.modules; print(modal_app.app.name)"],
                           capture_output=True, text=True, check=True)
     assert isolated.stdout.strip() == MODAL_APP_NAME
+
+
+def test_modal_app_remote_import_skips_local_checkpoint_check(monkeypatch):
+    app = importlib.import_module("modal_app")
+    checkpoint_is_file = Path.is_file
+
+    def is_file(path):
+        return False if path == app.CHECKPOINT else checkpoint_is_file(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(modal, "is_local", lambda: False)
+        patch.setattr(Path, "is_file", is_file)
+        assert importlib.reload(app).app.name == MODAL_APP_NAME
 
 
 def test_modal_client_calls_only_v7_worker_methods(monkeypatch):
