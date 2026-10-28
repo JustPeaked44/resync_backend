@@ -98,11 +98,22 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
         {"name": "Results", "text": sections["Results"]}]
     assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 66.67
     assert payload["score_breakdown"]["band"] == "Needs Revision"
+    assert payload["score_breakdown"]["dimensions"] == {
+        "objectives_alignment": 0.7, "methodology_fit": 0.8,
+        "numeric_consistency": None, "claim_support": 0.5}
+    assert payload["score_breakdown"]["dimension_weights"] == {
+        "objectives_alignment": 1 / 3, "methodology_fit": 1 / 3,
+        "numeric_consistency": 0.0, "claim_support": 1 / 3}
+    assert payload["manuscript_flow"][0]["pair_score"] == pytest.approx(2 / 3)
+    assert payload["manuscript_flow"][0]["numeric_applicable"] is False
     assert payload["manuscript_flow"][0]["explanation"]["coherence_scores"]["overall"] == 0.6
     assert payload["inconsistencies_found"] == 1
     assert payload["inconsistencies"][0]["evidence_verified"] is True
+    assert payload["inconsistencies"][0]["coherence_score"] == 66.67
     assert payload["recommendations"][0]["original_sentence"] == "The resulting text also contains several words."
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
+    assert payload["ai_synthesis"]["strongest_pair"]["score"] == 66.67
+    assert payload["ai_synthesis"]["strongest_pair"]["overall_coherence"] == 0.6
     assert captured["save"]["coherence_score"] == 66.67
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
 
@@ -156,13 +167,51 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                                "citation_integrity_score", "dimensions", "dimension_weights", "citation_detail"}
     assert set(payload["score_breakdown"]["dimensions"]) == {"objectives_alignment", "methodology_fit",
                                                                "numeric_consistency", "claim_support"}
+    assert set(payload["score_breakdown"]["dimension_weights"]) == set(payload["score_breakdown"]["dimensions"])
     assert set(payload["score_breakdown"]["citation_detail"]) == {"well_formed_ratio", "link_resolution_rate",
                                                                     "cross_match_score", "total_entries"}
     assert set(payload["ai_text_indicator"]) == {"overall_score", "section_scores", "flagged_sections", "disclaimer"}
+
+
+def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
+    payload, _, _ = assembled_scan
     legacy = dict(payload)
     legacy.pop("result_version")
-    assert main.ScanResponse.model_validate(legacy).result_version is None
+    legacy["manuscript_flow"] = [dict(pair) for pair in payload["manuscript_flow"]]
+    for pair in legacy["manuscript_flow"]:
+        pair.pop("pair_score")
+        pair.pop("numeric_applicable")
+    legacy["score_breakdown"] = dict(payload["score_breakdown"])
+    legacy["score_breakdown"].pop("dimension_weights")
+    loaded = main.ScanResponse.model_validate(legacy)
+    assert loaded.result_version is None
+    assert loaded.score_breakdown.dimension_weights is None
     assert main.ScanResponse.model_validate(dict(legacy, result_version=None)).result_version is None
+
+
+def test_analyze_v7_uses_same_four_part_contract(monkeypatch):
+    async def no_limit(_):
+        pass
+
+    async def no_explanation(*_):
+        return [], [], {"summary": None, "strongest_pair": None, "weakest_pair": None}
+
+    monkeypatch.setattr(main, "_check_scan_rate_limit", no_limit)
+    monkeypatch.setattr(main, "explain_flow", no_explanation)
+    monkeypatch.setattr(main.ml_client, "analyze_v7", lambda _: {"manuscript_score": 0.01, "pairs": [{
+        "scores": {"objectives_alignment": 1, "methodology_fit": 0.5,
+                   "claim_support": 0.75, "numeric_consistency": 0.1,
+                   "overall_coherence": 0.2, "pair_weight": 0.9}}]})
+    request = main.V7AnalyzeRequest(sections=[
+        {"name": "A", "text": "The sample included n = 120 participants."},
+        {"name": "B", "text": "Results reached 78% among the participants."}])
+    result = asyncio.run(main.analyze_v7(request, user_id="user"))
+    assert result["result_version"] == "v7"
+    assert result["manuscript_score"] == 58.75
+    assert result["dimensions"] == {"objectives_alignment": 1.0, "methodology_fit": 0.5,
+                                    "numeric_consistency": 0.1, "claim_support": 0.75}
+    assert set(result["dimension_weights"].values()) == {0.25}
+    assert result["manuscript_flow"][0]["pair_score"] == pytest.approx(0.5875)
 
 
 def test_legacy_poll_model_passes_payload_through():

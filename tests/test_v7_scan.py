@@ -46,6 +46,25 @@ def test_worst_pair_selection_at_boundaries():
         assert len(select_worst_pairs(flow)) == min(n, 12)
 
 
+def test_pair_score_drives_ranking_and_skipped_pair_has_no_score():
+    sections = [{"name": str(i), "text": "The result was 78% for n = 120."} for i in range(4)]
+    raw = [
+        {"scores": {"pair_weight": 0.9, "overall_coherence": 0.1,
+                    "objectives_alignment": 0.8, "methodology_fit": 0.8,
+                    "numeric_consistency": 0.8, "claim_support": 0.8}},
+        {"scores": {"pair_weight": 0.1, "overall_coherence": 0.9,
+                    "objectives_alignment": 0.2, "methodology_fit": 0.2,
+                    "numeric_consistency": 0.2, "claim_support": 0.2}},
+        {"skipped": "too short"},
+    ]
+    flow = assemble_flow(sections, raw)
+    assert [p["order"] for p in select_worst_pairs(flow)] == [2, 1]
+    assert flow[0]["pair_score"] == 0.8 and flow[0]["numeric_applicable"] is True
+    assert flow[2]["pair_score"] is None and flow[2]["numeric_applicable"] is False
+    assert pair_pointer(flow[1]) == {"order": 2, "section_a": "1", "section_b": "2",
+                                     "overall_coherence": 0.9, "score": 20.0}
+
+
 def test_explanation_cap_and_single_summary(monkeypatch):
     sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(14)]
     raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 10,
