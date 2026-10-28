@@ -25,6 +25,7 @@ def numeric_applicable(text_a, text_b, rule=None):
 
 
 def four_part_score(pairs):
+    # The API score does not read v7_logic.calculate_manuscript_score's raw worker output.
     scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
     values = {key: [p["scores"][key] for p in scored
                     if key != "numeric_consistency" or p["numeric_applicable"]] for key in DIMENSIONS}
@@ -52,38 +53,27 @@ def merge_repeated_sections(parsed_sections, section_order):
 
 
 def select_worst_pairs(pairs):
-    return sorted((p for p in pairs if p["scores"]["overall_coherence"] is not None),
-                  key=lambda p: (p["scores"]["overall_coherence"], p["order"]))[:12]
-
-
-def weighted_score(pairs):
-    scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
-    weight = sum(p["pair_weight"] for p in scored)
-    if not scored:
-        return 0.0
-    if weight <= 1e-9:
-        return round(100 * sum(p["scores"]["overall_coherence"] for p in scored) / len(scored), 2)
-    return round(100 * sum(p["scores"]["overall_coherence"] * p["pair_weight"] for p in scored) / weight, 2)
+    return sorted((p for p in pairs if p["pair_score"] is not None),
+                  key=lambda p: (p["pair_score"], p["order"]))[:12]
 
 
 def band(score):
     return "Strong" if score >= 85 else "Solid" if score >= 70 else "Needs Revision"
 
 
-def dimension_averages(pairs):
-    scored = [p["scores"] for p in pairs if p["scores"]["overall_coherence"] is not None]
-    return {key: round(sum(p[key] for p in scored) / len(scored), 4) if scored else None for key in DIMENSIONS}
-
-
 def assemble_flow(sections, ml_pairs):
     flow = []
     for index, raw in enumerate(ml_pairs):
         scores = raw.get("scores")
+        applicable = numeric_applicable(sections[index]["text"], sections[index + 1]["text"]) if scores else False
+        pair_dimensions = DIMENSIONS if applicable else tuple(key for key in DIMENSIONS if key != "numeric_consistency")
         flow.append({
             "order": index + 1,
             "section_a": sections[index]["name"],
             "section_b": sections[index + 1]["name"],
             "pair_weight": scores["pair_weight"] if scores else None,
+            "pair_score": sum(scores[key] for key in pair_dimensions) / len(pair_dimensions) if scores else None,
+            "numeric_applicable": applicable,
             "scores": {key: scores[key] if scores else None for key in SCORE_KEYS},
             "skipped_reason": raw.get("skipped") if not scores else None,
             "culprit_sentences": {"section_a": raw.get("culprits_a", []), "section_b": raw.get("culprits_b", [])},
@@ -97,7 +87,7 @@ def pair_pointer(pair):
         return None
     overall = pair["scores"]["overall_coherence"]
     return {"order": pair["order"], "section_a": pair["section_a"], "section_b": pair["section_b"],
-            "overall_coherence": overall, "score": round(overall * 100, 2)}
+            "overall_coherence": overall, "score": round(pair["pair_score"] * 100, 2)}
 
 
 async def explain_flow(sections, flow):
@@ -108,7 +98,7 @@ async def explain_flow(sections, flow):
     async def explain(pair):
         async with semaphore:
             index = pair["order"] - 1
-            scores = dict(pair["scores"], pair_weight=pair["pair_weight"])
+            scores = dict(pair["scores"], pair_weight=pair["pair_weight"], pair_score=pair["pair_score"])
             culprits = pair["culprit_sentences"]
             pair["explanation"] = await explain_pair(
                 pair["section_a"], sections[index]["text"], pair["section_b"], sections[index + 1]["text"],
@@ -116,10 +106,10 @@ async def explain_flow(sections, flow):
 
     await asyncio.gather(*(explain(pair) for pair in select_worst_pairs(flow)))
     findings, recommendations = flatten_explanations(flow)
-    scored = [p for p in flow if p["scores"]["overall_coherence"] is not None]
+    scored = [p for p in flow if p["pair_score"] is not None]
     synthesis = {"summary": await explain_summary(flow, findings),
-                 "strongest_pair": pair_pointer(max(scored, key=lambda p: p["scores"]["overall_coherence"])) if scored else None,
-                 "weakest_pair": pair_pointer(min(scored, key=lambda p: p["scores"]["overall_coherence"])) if scored else None}
+                 "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
+                 "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None}
     return findings, recommendations, synthesis
 
 
@@ -130,7 +120,7 @@ def flatten_explanations(flow):
         if explanation is None:
             continue
         names = (pair["section_a"], pair["section_b"])
-        score = round(pair["scores"]["overall_coherence"] * 100, 2)
+        score = round(pair["pair_score"] * 100, 2)
         pair_recommendations = explanation["recommendations"]
         for item in explanation["highlighted_inconsistencies"]:
             quotes = [{"section": item["section"], "text": item["quote"]}] if item["quote"] else []

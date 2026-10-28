@@ -1,7 +1,7 @@
 import asyncio
 from services import v7_explain
-from services.v7_scan import (assemble_flow, band, dimension_averages, explain_flow, merge_repeated_sections,
-                              pair_pointer, select_worst_pairs, weighted_score)
+from services.v7_scan import (assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
+                              pair_pointer, select_worst_pairs)
 
 
 def test_merge_literal_repeats_in_first_occurrence_order():
@@ -29,11 +29,11 @@ def test_flow_score_dimensions_and_worst_twelve():
     assert flow[0]["pair_weight"] is None
     assert flow[0]["skipped_reason"] == "too short"
     assert [p["order"] for p in select_worst_pairs(flow)] == list(range(2, 11))
-    assert weighted_score(flow) == 50.0
-    assert dimension_averages(flow)["claim_support"] == 0.5
+    assert four_part_score(flow)[0] == 50.0
+    assert four_part_score(flow)[1]["claim_support"] == 0.5
     assert pair_pointer(flow[1])["score"] == 10.0
     assert band(85) == "Strong" and band(70) == "Solid" and band(69.99) == "Needs Revision"
-    assert weighted_score(assemble_flow(sections[:2], [{"skipped": "too short"}])) == 0.0
+    assert four_part_score(assemble_flow(sections[:2], [{"skipped": "too short"}]))[0] == 0.0
 
 
 def test_worst_pair_selection_at_boundaries():
@@ -49,8 +49,8 @@ def test_worst_pair_selection_at_boundaries():
 def test_explanation_cap_and_single_summary(monkeypatch):
     sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(14)]
     raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 10,
-                       "objectives_alignment": 0.5, "methodology_fit": 0.5,
-                       "numeric_consistency": 0.5, "claim_support": 0.5}} for i in range(13)]
+                       "objectives_alignment": i / 10, "methodology_fit": i / 10,
+                       "numeric_consistency": i / 10, "claim_support": i / 10}} for i in range(13)]
     flow = assemble_flow(sections, raw)
     state = {"active": 0, "peak": 0, "summary_calls": 0}
 

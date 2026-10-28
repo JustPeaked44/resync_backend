@@ -25,6 +25,7 @@ In user-facing text, never mention the model, PyTorch, or how scores are produce
 Section A ({a}): {text_a}
 Section B ({b}): {text_b}
 Model scores (0 to 1): {scores}
+Pair score for the Strong/Fair/Weak assessment (0 to 1): {pair_score}
 Culprit sentences in A: {culprits_a}
 Culprit sentences in B: {culprits_b}
 Return JSON with exactly four top-level keys: coherence_scores (copy model scores),
@@ -109,6 +110,7 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
                                 text_a=gemini.truncate_text(text_a),
                                 text_b=gemini.truncate_text(text_b),
                                 scores=json.dumps(coherence_scores(scores)),
+                                pair_score=scores.get("pair_score", scores["overall_coherence"]),
                                 culprits_a=json.dumps(culprits_a), culprits_b=json.dumps(culprits_b))
     try:
         return normalize_explanation(await _generate(prompt), scores, role_a, text_a, role_b, text_b)
@@ -119,7 +121,7 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
 
 async def explain_summary(flow, findings):
     data = [{"order": p["order"], "section_a": p["section_a"], "section_b": p["section_b"],
-             "scores": p["scores"]} for p in flow if p["scores"]["overall_coherence"] is not None]
+             "scores": p["scores"], "pair_score": p["pair_score"]} for p in flow if p["pair_score"] is not None]
     prompt = SUMMARY_PROMPT.format(rules=STRICT_RULES, data=json.dumps({"pairs": data, "findings": findings}))
     try:
         raw = await _generate(prompt)

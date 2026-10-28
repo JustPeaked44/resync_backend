@@ -28,7 +28,7 @@ from services.notification import NotificationDeliveryService
 from services.credits import credits_service, InsufficientCreditsError
 from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
-                              weighted_score, band, dimension_averages)
+                              four_part_score, band)
 from services.reference_parser import extract_intext_citations
 from services.v7_explain import plain_text
 
@@ -180,7 +180,9 @@ async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authentic
 
         manuscript_flow = assemble_flow(sections, result["pairs"])
         findings, recommendations, synthesis = await explain_flow(sections, manuscript_flow)
-    return {"result_version": "v7", "manuscript_score": weighted_score(manuscript_flow),
+    score, dimensions, dimension_weights = four_part_score(manuscript_flow)
+    return {"result_version": "v7", "manuscript_score": score,
+            "dimensions": dimensions, "dimension_weights": dimension_weights,
             "manuscript_flow": manuscript_flow, "inconsistencies": findings,
             "recommendations": recommendations, "ai_synthesis": synthesis}
 
@@ -326,6 +328,7 @@ class ScoreBreakdown(BaseModel):
     cross_chapter_coherence_score: float
     citation_integrity_score: Optional[float] = None
     dimensions: Dict[str, Optional[float]]
+    dimension_weights: Optional[Dict[str, float]] = None
     citation_detail: Dict[str, Any]
 
 
@@ -553,7 +556,7 @@ async def _execute_scan_pipeline(
     ml_result = await asyncio.to_thread(ml_client.analyze_v7, sections)
     manuscript_flow = assemble_flow(sections, ml_result["pairs"])
     inconsistencies_data, recommendations, ai_synthesis = await explain_flow(sections, manuscript_flow)
-    overall_score = weighted_score(manuscript_flow)
+    overall_score, dimensions, dimension_weights = four_part_score(manuscript_flow)
     ai_text_result = await asyncio.to_thread(
         ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}
     )
@@ -589,7 +592,8 @@ async def _execute_scan_pipeline(
         "band": band(overall_score),
         "cross_chapter_coherence_score": overall_score,
         "citation_integrity_score": citation_integrity_result.score,
-        "dimensions": dimension_averages(manuscript_flow),
+        "dimensions": dimensions,
+        "dimension_weights": dimension_weights,
         "citation_detail": {
             "well_formed_ratio": citation_integrity_result.well_formed_ratio,
             "link_resolution_rate": citation_integrity_result.link_resolution_rate,

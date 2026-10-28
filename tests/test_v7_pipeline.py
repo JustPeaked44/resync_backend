@@ -96,14 +96,14 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert captured["ml_sections"] == [
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
-    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 60.0
+    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 66.67
     assert payload["score_breakdown"]["band"] == "Needs Revision"
     assert payload["manuscript_flow"][0]["explanation"]["coherence_scores"]["overall"] == 0.6
     assert payload["inconsistencies_found"] == 1
     assert payload["inconsistencies"][0]["evidence_verified"] is True
     assert payload["recommendations"][0]["original_sentence"] == "The resulting text also contains several words."
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
-    assert captured["save"]["coherence_score"] == 60.0
+    assert captured["save"]["coherence_score"] == 66.67
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
 
 
@@ -128,7 +128,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     assert payload["result_version"] == "v7"
     assert len(payload["manuscript_flow"]) == 1
     pair = payload["manuscript_flow"][0]
-    assert set(pair) == {"order", "section_a", "section_b", "pair_weight", "scores",
+    assert set(pair) == {"order", "section_a", "section_b", "pair_weight", "pair_score", "numeric_applicable", "scores",
                          "skipped_reason", "culprit_sentences", "explanation"}
     assert set(pair["scores"]) == {"objectives_alignment", "methodology_fit", "numeric_consistency",
                                    "claim_support", "overall_coherence"}
@@ -153,7 +153,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     for key in ("strongest_pair", "weakest_pair"):
         assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}
     assert set(payload["score_breakdown"]) == {"overall_score", "band", "cross_chapter_coherence_score",
-                                               "citation_integrity_score", "dimensions", "citation_detail"}
+                                               "citation_integrity_score", "dimensions", "dimension_weights", "citation_detail"}
     assert set(payload["score_breakdown"]["dimensions"]) == {"objectives_alignment", "methodology_fit",
                                                                "numeric_consistency", "claim_support"}
     assert set(payload["score_breakdown"]["citation_detail"]) == {"well_formed_ratio", "link_resolution_rate",
