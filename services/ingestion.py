@@ -4,6 +4,10 @@ import io
 import httpx
 from fastapi import HTTPException, status
 
+
+def looks_like_html_document(text: str) -> bool:
+    return bool(re.match(r"(?is)^\s*(?:<!doctype\s+html\b|<html\b)", text.lstrip("\ufeff")))
+
 class DocumentIngestionService:
     """
     Handles fetching and cleaning plaintext from public Google Docs URLs.
@@ -59,7 +63,7 @@ class DocumentIngestionService:
                 raw_text = response.text
                 
                 # Catch Private Document Redirect (Google returns HTML login page)
-                if "<html" in raw_text.lower() or "<!doctype html>" in raw_text.lower():
+                if looks_like_html_document(raw_text):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="Document access restricted. Please change Google Doc permissions to 'Anyone with the link can view'."

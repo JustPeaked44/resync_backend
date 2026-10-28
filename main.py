@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 # override=True ensures .env values WIN over Windows system env vars.
 load_dotenv(override=True)
 
-from services.ingestion import DocumentIngestionService
+from services.ingestion import DocumentIngestionService, looks_like_html_document
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
@@ -1168,14 +1168,14 @@ async def get_manuscript_preview(
 
             # Google returns an HTML login-redirect page instead of 403
             # when the doc is private. Catch it here.
-            if "<html" in raw_text[:500].lower():
+            if looks_like_html_document(raw_text):
                 return {"available": False, "reason": "private"}
 
     except Exception as exc:
         logger.warning("Failed to fetch manuscript %s from Google Docs: %s", doc_id, exc)
-        return {"available": False, "reason": "unreachable"}
+        return {"available": False, "reason": "google_fetch_failed"}
         
-    processed_text = DocumentIngestionService.strip_document_noise(raw_text)
+    processed_text = DocumentIngestionService.strip_document_noise(raw_text.lstrip("\ufeff"))
     
     if len(_manuscript_cache) >= 100:
         oldest_key = min(_manuscript_cache.keys(), key=lambda k: _manuscript_cache[k]["expires_at"])
