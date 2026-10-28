@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
 import asyncio
-from services.deterministic import DeterministicAuditService, deterministic_service
+from services.deterministic import DeterministicAuditService
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_serializer
 from dotenv import load_dotenv
@@ -28,16 +28,9 @@ from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
 from services.notification import NotificationDeliveryService
 from services.credits import credits_service, InsufficientCreditsError
-from services.scoring import (
-    compute_structural_completeness,
-    compute_cross_chapter_coherence,
-    compute_citation_integrity,
-    compute_functional_metric,
-    aggregate_role_texts,
-    PAR_SCORE,
-    ROLE_PAIR_WEIGHTS,
-    ROLE_PAIR_RATIONALE,
-)
+from services.scoring import compute_citation_integrity, PAR_SCORE
+from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
+                              weighted_score, band, dimension_averages)
 from services.reference_parser import extract_intext_citations
 
 logger = logging.getLogger("resync.main")
@@ -171,8 +164,6 @@ class V7AnalyzeRequest(BaseModel):
 @app.post("/analyze_v7")
 async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authenticated_user_id)):
     """v7 correlation of consecutive manuscript sections, returned as a nested manuscript_flow."""
-    from services.v7_explain import explain_pair
-
     await _check_scan_rate_limit(user_id)
     sections = [s.model_dump() for s in req.sections]
     async with SCAN_SLOT:
@@ -182,24 +173,11 @@ async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authentic
             logger.exception("v7 analysis failed")
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="v7 model is unavailable.")
 
-        manuscript_flow = []
-        for pair in result["pairs"]:
-            entry = {"order": pair["order"], "section_a": pair["section_a"], "section_b": pair["section_b"]}
-            if "skipped" in pair:
-                manuscript_flow.append({**entry, "skipped": pair["skipped"]})
-                continue
-            explanation = await explain_pair(
-                pair["section_a"], sections[pair["order"] - 1]["text"],
-                pair["section_b"], sections[pair["order"]]["text"],
-                pair["scores"], pair["culprits_a"], pair["culprits_b"],
-            )
-            manuscript_flow.append({
-                **entry,
-                "pair_weight": round(pair["scores"]["pair_weight"], 3),
-                "culprit_sentences": {"section_a": pair["culprits_a"], "section_b": pair["culprits_b"]},
-                **explanation,
-            })
-    return {"manuscript_score": result["manuscript_score"], "manuscript_flow": manuscript_flow}
+        manuscript_flow = assemble_flow(sections, result["pairs"])
+        findings, recommendations, synthesis = await explain_flow(sections, manuscript_flow)
+    return {"result_version": "v7", "manuscript_score": weighted_score(manuscript_flow),
+            "manuscript_flow": manuscript_flow, "inconsistencies": findings,
+            "recommendations": recommendations, "ai_synthesis": synthesis}
 
 
 @app.get("/api/test-ingestion")
@@ -367,33 +345,31 @@ class ScanRequest(BaseModel):
 
 
 class InconsistencyReport(BaseModel):
-    """A material_issue or advisory key_strength finding."""
+    """A quote-verified v7 finding."""
     section_a: str
     section_b: str
-    # Optional: a deterministic numeric-audit flag has no coherence score
-    # at all -- None is distinguishable from a real score of zero, which
-    # a hardcoded 0.0 default was not.
-    coherence_score: Optional[float] = None
+    pair_order: int
+    coherence_score: float
     explanation_what: str
     explanation_why: str
     suggested_fix: str
     inconsistency_id: str = ""
     evidence_a: str = ""
     evidence_b: str = ""
+    evidence_quotes: List[Dict[str, str]] = []
     evidence_verified: bool = False
-    objectives_unaddressed: List[str] = []
     finding_status: str = "material_issue"
 
 
-class VerificationReport(BaseModel):
-    """A high-scoring (>= PAR) role pair, checked for whether its
-    calibrated score reflects substantive alignment or just shared
-    academic vocabulary/register."""
-    role_a: str
-    role_b: str
-    score: float
-    alignment: str
-    note: str
+class RecommendationReport(BaseModel):
+    recommendation_id: str
+    section_a: str
+    section_b: str
+    pair_order: int
+    original_sentence: Optional[str]
+    recommended_revision: str
+    recommendation_text: str
+    recommendation_priority: str
 
 
 class CitationReport(BaseModel):
@@ -414,19 +390,12 @@ class CitationReport(BaseModel):
 
 
 class ScoreBreakdown(BaseModel):
-    """The three-criteria functional metric, replacing a single flat score."""
     overall_score: float
     band: str
-    structural_completeness_score: Optional[float] = None
-    cross_chapter_coherence_score: Optional[float] = None
+    cross_chapter_coherence_score: float
     citation_integrity_score: Optional[float] = None
-    biggest_lever: Optional[Dict[str, Any]] = None
-    structural_detail: Dict[str, Any] = {}
-    coherence_detail: Dict[str, Any] = {}
-    # Advisory v6 dimensions keyed by role_a::role_b, separate from the scored pair_scores.
-    v6_dimensions: Optional[Dict[str, Dict[str, Optional[float]]]] = None
-    citation_detail: Dict[str, Any] = {}
-    research_type: Optional[str] = None
+    dimensions: Dict[str, Optional[float]]
+    citation_detail: Dict[str, Any]
 
 
 class AITextIndicatorReport(BaseModel):
@@ -444,14 +413,14 @@ class ScanResponse(BaseModel):
     user_id: str
     manuscript_id: str
     doc_url: str
+    result_version: Optional[str] = None
     overall_coherence_score: float
     sections_analyzed: List[str]
-    missing_sections: List[str]
-    has_all_required_sections: bool
-    section_scores: List[Dict[str, Any]]
+    manuscript_flow: List[Dict[str, Any]]
     inconsistencies_found: int
-    inconsistencies: List[InconsistencyReport]  # finding_status: material_issue or key_strength
-    verifications: List[VerificationReport] = []
+    inconsistencies: List[InconsistencyReport]
+    recommendations: List[RecommendationReport]
+    ai_synthesis: Dict[str, Any]
     citations_audited: int
     citations: List[CitationReport]
     score_breakdown: Optional[ScoreBreakdown] = None
@@ -661,224 +630,17 @@ async def _execute_scan_pipeline(
     )
     parsed_sections: Dict[str, str] = parse_result["parsed_sections"]
     section_order: List[str] = parse_result.get("section_order", list(parsed_sections))
-
-    # ------------------------------------------------------------------
-    # Step 3 – Embedding / Coherence
-    # ------------------------------------------------------------------
     section_roles: Dict[str, str] = parse_result.get("section_roles", {})
-    role_texts: Dict[str, str] = aggregate_role_texts(parsed_sections, section_roles)
-    ml_result = await asyncio.to_thread(
-        ml_client.analyze_batch, parsed_sections, role_texts,
-        [[role_a, role_b] for role_a, role_b, _ in ROLE_PAIR_WEIGHTS],
+
+    # Score physical neighbors after merging repeated literal headings.
+    sections = merge_repeated_sections(parsed_sections, section_order)
+    ml_result = await asyncio.to_thread(ml_client.analyze_v7, sections)
+    manuscript_flow = assemble_flow(sections, ml_result["pairs"])
+    inconsistencies_data, recommendations, ai_synthesis = await explain_flow(sections, manuscript_flow)
+    overall_score = weighted_score(manuscript_flow)
+    ai_text_result = await asyncio.to_thread(
+        ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}
     )
-    from types import SimpleNamespace
-    coherence_result = SimpleNamespace(**ml_result["coherence"])
-
-    # ------------------------------------------------------------------
-    # Step 3b – Structural Completeness
-    # ------------------------------------------------------------------
-    structural_result = compute_structural_completeness(
-        parsed_sections, section_roles,
-        detection_confidence=parse_result.get("detection_confidence", 1.0),
-    )
-    missing_sections: List[str] = structural_result.missing_required
-    has_all_required_sections: bool = len(structural_result.missing_required) == 0
-
-    # ------------------------------------------------------------------
-    # Step 3c – Cross-Chapter Coherence (role-aware weighted pair matrix,
-    # replacing the flat adjacent-pair mean as the scoring signal — the
-    # legacy adjacent-pair coherence_result.section_scores below is still
-    # computed and returned as-is for the existing Reports tab / mobile
-    # app, but no longer drives the manuscript score).
-    # ------------------------------------------------------------------
-    cross_chapter_result = compute_cross_chapter_coherence(
-        coherence_result.embeddings, section_roles, parsed_sections
-    )
-
-    # ------------------------------------------------------------------
-    # Step 4 – Reasoning (sequential to respect Gemini free-tier RPM)
-    # ------------------------------------------------------------------
-    # Driven by the calibrated role-pair scores (cross_chapter_result),
-    # not the deprecated linear adjacent-pair coherence_result.section_scores
-    # -- see the Aug 2026 review note above Step 3c. role_texts groups
-    # section body text by the same canonical role used to compute those
-    # scores, so the XAI explains the same content that was scored.
-    inconsistency_outputs, verification_outputs, dismissed_pairs = await reasoning_service.analyze_inconsistencies(
-        cross_chapter_result, role_texts
-    )
-
-    # Serialise to plain dicts for the DB service and response model
-    inconsistencies_data: List[Dict[str, Any]] = [
-        item.model_dump() for item in inconsistency_outputs
-    ]
-
-    v6_dimensions: Dict[str, Dict[str, Optional[float]]] = ml_result["v6_dimensions"]
-    pairs_to_explain = []
-    for role_a, role_b, _ in ROLE_PAIR_WEIGHTS:
-        text_a, text_b = role_texts.get(role_a), role_texts.get(role_b)
-        pair_key = f"{role_a}::{role_b}"
-        dimensions = v6_dimensions[pair_key]
-        existing = next((item for item in inconsistencies_data
-                         if item.get("section_a") == role_a and item.get("section_b") == role_b), None)
-        if existing and text_a and text_b and (not existing.get("evidence_verified") or not existing.get("evidence_a") or not existing.get("evidence_b")):
-            pairs_to_explain.append([pair_key, text_a, text_b])
-        elif dimensions["overall_coherence"] is not None and dimensions["overall_coherence"] > 0.80 and existing is None:
-            pairs_to_explain.append([pair_key, text_a, text_b])
-
-    evidence_by_pair = await asyncio.to_thread(ml_client.explain_batch, pairs_to_explain) if pairs_to_explain else {}
-    for role_a, role_b, _ in ROLE_PAIR_WEIGHTS:
-        pair_key = f"{role_a}::{role_b}"
-        dimensions = v6_dimensions[pair_key]
-        existing = next((item for item in inconsistencies_data
-                         if item.get("section_a") == role_a and item.get("section_b") == role_b), None)
-        if pair_key in evidence_by_pair and existing:
-            evidence = evidence_by_pair[pair_key]
-            for side in ("a", "b"):
-                field = f"evidence_{side}"
-                if not existing.get(field):
-                    existing[field] = " ".join(entry["sentence"] for entry in evidence[field]["top_undermining"])
-            existing["evidence_verified"] = bool(existing.get("evidence_a") and existing.get("evidence_b"))
-        if dimensions["overall_coherence"] is not None and dimensions["overall_coherence"] > 0.80 and existing is None:
-            evidence = evidence_by_pair[pair_key]
-            inconsistencies_data.append({
-                "inconsistency_id": str(uuid.uuid4()),
-                "section_a": role_a,
-                "section_b": role_b,
-                "coherence_score": round(dimensions["overall_coherence"] * 100, 2),
-                "explanation_what": f"The v6 model rates {role_a} and {role_b} as strongly coherent.",
-                "explanation_why": f"Advisory model estimate for {ROLE_PAIR_RATIONALE[(role_a, role_b)]}.",
-                "suggested_fix": "Preserve this connection when revising these sections.",
-                "evidence_a": " ".join(entry["sentence"] for entry in evidence["evidence_a"]["top_supporting"]),
-                "evidence_b": " ".join(entry["sentence"] for entry in evidence["evidence_b"]["top_supporting"]),
-                "evidence_verified": True,
-                "finding_status": "key_strength",
-            })
-
-    # ------------------------------------------------------------------
-    # Step 4b – Deterministic Numeric Audit
-    # ------------------------------------------------------------------
-    deterministic_flags: List[Dict[str, Any]] = []
-    for pair in coherence_result.section_scores:
-        sec_a_name = pair.get("section_a", "")
-        sec_b_name = pair.get("section_b", "")
-        role_a = section_roles.get(sec_a_name, sec_a_name.lower())
-        role_b = section_roles.get(sec_b_name, sec_b_name.lower())
-        text_a = parsed_sections.get(sec_a_name, "")
-        text_b = parsed_sections.get(sec_b_name, "")
-        flags = deterministic_service.audit_numeric_consistency(text_a, text_b, role_a, role_b)
-        deterministic_flags.extend(flags)
-
-    # Merge deterministic flags into inconsistencies_data
-    for flag in deterministic_flags:
-        sections_list = flag.get("sections") or []
-        section_a = sections_list[0] if sections_list else ""
-        section_b = sections_list[1] if len(sections_list) > 1 else section_a
-
-        flag_type = flag.get("type")
-        if flag_type == "deterministic_invalid_value":
-            value_type = flag.get("value_type", "numeric").replace("_", " ")
-            found = flag.get("found")
-            explanation_what = f"Deterministic check: invalid {value_type} reported ({found})."
-            explanation_why = (
-                f"The reported {value_type} falls outside the range that is statistically "
-                "possible, which usually indicates a typo or reporting error."
-            )
-            suggested_fix = (
-                f"Verify and correct the {value_type} value ({found}) against the "
-                "source data or statistical output."
-            )
-        elif flag_type == "deterministic_significance_mismatch":
-            p_value = flag.get("p_value")
-            claimed = flag.get("claimed_significance")
-            implied = flag.get("implied_significance")
-            explanation_what = (
-                f"Deterministic check: text claims the result is '{claimed}' but the "
-                f"reported p-value (p = {p_value}) implies it is '{implied}'."
-            )
-            explanation_why = (
-                "The stated significance conclusion contradicts the reported p-value, "
-                "which can mislead readers about the strength of the evidence."
-            )
-            suggested_fix = (
-                f"Reconcile the wording with the reported p-value (p = {p_value}), or "
-                "correct the p-value if the significance claim is the intended one."
-            )
-        else:  # deterministic_numeric_mismatch (sample size / percentage)
-            value_type = flag.get("value_type", "numeric")
-            explanation_what = (
-                f"Deterministic check: {value_type} mismatch. "
-                f"Expected {flag.get('expected')}, found {flag.get('found')}."
-            )
-            explanation_why = (
-                "A numeric value in the Methodology section does not match the value "
-                "reported in the Results section. This may indicate a data entry error "
-                "or inconsistent reporting."
-            )
-            suggested_fix = (
-                f"Verify that the {value_type} value "
-                f"({flag.get('expected')} vs {flag.get('found')}) is consistent "
-                "across both sections and matches the actual study data."
-            )
-
-        inconsistencies_data.append({
-            "inconsistency_id": str(uuid.uuid4()),
-            "section_a": section_a,
-            "section_b": section_b,
-            # None, not 0.0 -- a deterministic numeric check has no
-            # coherence score at all; 0.0 was indistinguishable from a
-            # real (and catastrophic) coherence score of zero.
-            "coherence_score": None,
-            "explanation_what": explanation_what,
-            "explanation_why": explanation_why,
-            "suggested_fix": suggested_fix,
-            "evidence_a": flag.get("evidence_a", ""),
-            "evidence_b": flag.get("evidence_b", ""),
-            # Extracted directly from the source text, not model-generated.
-            "evidence_verified": True,
-            "objectives_unaddressed": [],
-            "finding_status": "material_issue",
-        })
-
-    # ------------------------------------------------------------------
-    # Step 4c – Missing Required Sections → Issue entries
-    # structural_result is assigned at Step 3b (line 624), well before
-    # this point. Surface each structurally-absent required section as
-    # an explicit issue so it appears in the Issues tab.
-    # ------------------------------------------------------------------
-    _MISSING_SECTION_GUIDANCE: Dict[str, str] = {
-        "abstract":     "a concise summary of the study, methods, results, and conclusions.",
-        "introduction": "background context, research gap, and motivation for the study.",
-        "objectives":   "the specific aims or research questions being investigated.",
-        "methodology":  "the research design, participants, instruments, and procedures.",
-        "results":      "the findings presented clearly with supporting data.",
-        "discussion":   "interpretation of results in relation to prior literature.",
-        "conclusion":   "a synthesis of findings, limitations, and future directions.",
-        "references":   "all cited sources formatted consistently (e.g. APA 7th ed.).",
-    }
-    for missing_role in structural_result.missing_required:
-        inconsistencies_data.append({
-            "inconsistency_id": str(uuid.uuid4()),
-            "section_a": missing_role,
-            "section_b": "",
-            "coherence_score": None,
-            "explanation_what": (
-                f"Required section '{missing_role}' is missing from the manuscript."
-            ),
-            "explanation_why": (
-                f"A complete research manuscript requires a '{missing_role}' section. "
-                "Its absence weakens the structural integrity of the work and may lower "
-                "the evaluation score."
-            ),
-            "suggested_fix": (
-                f"Add a '{missing_role}' section covering "
-                + _MISSING_SECTION_GUIDANCE.get(missing_role, "its expected scholarly content.")
-            ),
-            "evidence_a": "",
-            "evidence_b": "",
-            "evidence_verified": True,
-            "objectives_unaddressed": [],
-            "finding_status": "material_issue",
-        })
 
     # ------------------------------------------------------------------
     # Step 5 – Citation Audit
@@ -916,86 +678,40 @@ async def _execute_scan_pipeline(
         citations, citation_crossmatch, intext_citation_count, references_section_present
     )
 
-    # ------------------------------------------------------------------
-    # Step 5c – Composite Functional Metric
-    # ------------------------------------------------------------------
-    functional_metric = compute_functional_metric(
-        structural_result, cross_chapter_result, citation_integrity_result
-    )
-
-    # scoring.py is deterministic-only and knows nothing about the XAI
-    # layer, so the reasoning-layer outputs (dismissed false-positive
-    # pairs, strong-pair verification notes) are folded into the same
-    # coherence_detail dict here rather than in scoring.py -- it already
-    # rides whole into both persistence and the API response.
-    score_breakdown_dict: Dict[str, Any] = functional_metric.to_dict()
-    score_breakdown_dict["v6_dimensions"] = v6_dimensions
-    score_breakdown_dict["research_type"] = parse_result.get("research_type", "unknown")
-    score_breakdown_dict.setdefault("coherence_detail", {})
-    score_breakdown_dict["coherence_detail"]["dismissed_pairs"] = dismissed_pairs
-    score_breakdown_dict["coherence_detail"]["verifications"] = [
-        v.model_dump() for v in verification_outputs
-    ]
-
-    # ------------------------------------------------------------------
-    # Step 5d – Advisory AI-Text Indicator (never affects the score)
-    # ------------------------------------------------------------------
-    ai_text_result = SimpleNamespace(**ml_result["ai_text"])
-
-    # Findings come out in role-pair/priority order; reorder them to follow the
-    # uploaded manuscript. A role sits where its first occurrence appears.
-    role_position: Dict[str, int] = {}
-    for position, key in enumerate(section_order):
-        role_position.setdefault(key, position)
-        role_position.setdefault(section_roles.get(key, key), position)
-
-    def _manuscript_sort_key(role_a: str, role_b: str) -> tuple:
-        positions = sorted(role_position.get(role, len(section_order)) for role in (role_a, role_b))
-        return tuple(positions)
-
-    inconsistencies_data.sort(key=lambda item: _manuscript_sort_key(item["section_a"], item["section_b"]))
-    verification_outputs.sort(key=lambda v: _manuscript_sort_key(v.role_a, v.role_b))
+    score_breakdown_dict = {
+        "overall_score": overall_score,
+        "band": band(overall_score),
+        "cross_chapter_coherence_score": overall_score,
+        "citation_integrity_score": citation_integrity_result.score,
+        "dimensions": dimension_averages(manuscript_flow),
+        "citation_detail": {
+            "well_formed_ratio": citation_integrity_result.well_formed_ratio,
+            "link_resolution_rate": citation_integrity_result.link_resolution_rate,
+            "cross_match_score": citation_integrity_result.cross_match_score,
+            "total_entries": citation_integrity_result.total_entries,
+        },
+    }
 
     # ------------------------------------------------------------------
     # Step 6 – Database Persistence
     # ------------------------------------------------------------------
-    # Build lightweight section-level recommendations from the XAI output
-    # (one entry per low-coherence pair directing the researcher to the fix).
-    recommendations: List[Dict[str, Any]] = [
-        {
-            "target_section_name": item["section_a"],
-            "recommendation_text": item["suggested_fix"],
-            "recommendation_priority": (
-                # A deterministic numeric-audit flag has no coherence
-                # score (None) and is always actionable -- treat that the
-                # same as a severe coherence gap.
-                "High" if item["coherence_score"] is None or item["coherence_score"] < 50
-                else "Medium"
-            ),
-        }
-        for item in inconsistencies_data
-        if item.get("suggested_fix") and item.get("finding_status", "material_issue") == "material_issue"
-    ]
-
     db_result: Dict[str, Any] = await DatabasePersistenceService.save_scan_transaction(
         user_id=req.user_id,
         manuscript_id=manuscript_id,
         analysis_run_id=analysis_run_id,
-        coherence_score=int(functional_metric.overall_score),
+        coherence_score=overall_score,
         inconsistencies=inconsistencies_data,   # accepts Pydantic models or dicts
         recommendations=recommendations,
         citations=citations,
         crossmatch_issues=citation_crossmatch,
         score_breakdown=score_breakdown_dict,
         ai_text_indicator={
-            "overall_score": ai_text_result.overall_score,
-            "section_scores": ai_text_result.section_scores,
-            "flagged_sections": ai_text_result.flagged_sections,
+            "overall_score": ai_text_result["overall_score"],
+            "section_scores": ai_text_result["section_scores"],
+            "flagged_sections": ai_text_result["flagged_sections"],
         },
         doc_url=source_identifier,
-        sections_analyzed=section_order,
-        missing_sections=missing_sections,
-        has_all_required_sections=has_all_required_sections,
+        sections_analyzed=[section["name"] for section in sections],
         inconsistencies_found=len(inconsistencies_data),
         citations_audited=len(citations),
     )
@@ -1025,7 +741,7 @@ async def _execute_scan_pipeline(
     notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
         user_id=req.user_id,
         manuscript_title=manuscript_title,
-        coherence_score=int(functional_metric.overall_score),
+        coherence_score=int(overall_score),
         analysis_run_id=analysis_run_id
     )
 
@@ -1038,43 +754,31 @@ async def _execute_scan_pipeline(
         user_id=req.user_id,
         manuscript_id=manuscript_id,
         doc_url=source_identifier,
-        overall_coherence_score=functional_metric.overall_score,
-        sections_analyzed=section_order,
-        missing_sections=missing_sections,
-        has_all_required_sections=has_all_required_sections,
-        section_scores=coherence_result.section_scores,
+        result_version="v7",
+        overall_coherence_score=overall_score,
+        sections_analyzed=[section["name"] for section in sections],
+        manuscript_flow=manuscript_flow,
         inconsistencies_found=len(inconsistencies_data),
-        inconsistencies=[
-            InconsistencyReport(**item) for item in inconsistencies_data
-        ],
-        verifications=[
-            VerificationReport(**v.model_dump()) for v in verification_outputs
-        ],
+        inconsistencies=[InconsistencyReport(**item) for item in inconsistencies_data],
+        recommendations=[RecommendationReport(**item) for item in recommendations],
+        ai_synthesis=ai_synthesis,
         citations_audited=len(citations),
-        citations=[
-            CitationReport(
-                citation_raw_reference_text=c.get("citation_raw_reference_text", ""),
-                citation_is_accessible=c.get("citation_is_accessible", False),
-                citation_status=c.get("citation_status", "no_link"),
-                citation_primary_link=c.get("citation_primary_link"),
-                citation_authors_parsed=c.get("citation_authors_parsed"),
-                citation_year_parsed=c.get("citation_year_parsed"),
-                citation_crossref_title=c.get("citation_crossref_title"),
-                citation_title_match_score=c.get("citation_title_match_score"),
-                citation_is_cited_in_text=c.get("citation_is_cited_in_text"),
-            )
-            for c in citations
-        ],
+        citations=[CitationReport(
+            citation_raw_reference_text=c.get("citation_raw_reference_text", ""),
+            citation_is_accessible=c.get("citation_is_accessible", False),
+            citation_status=c.get("citation_status", "no_link"),
+            citation_primary_link=c.get("citation_primary_link"),
+            citation_authors_parsed=c.get("citation_authors_parsed"),
+            citation_year_parsed=c.get("citation_year_parsed"),
+            citation_crossref_title=c.get("citation_crossref_title"),
+            citation_title_match_score=c.get("citation_title_match_score"),
+            citation_is_cited_in_text=c.get("citation_is_cited_in_text"),
+        ) for c in citations],
         score_breakdown=ScoreBreakdown(**score_breakdown_dict),
-        ai_text_indicator=AITextIndicatorReport(
-            overall_score=ai_text_result.overall_score,
-            section_scores=ai_text_result.section_scores,
-            flagged_sections=ai_text_result.flagged_sections,
-            disclaimer=ai_text_result.disclaimer,
-        ),
+        ai_text_indicator=AITextIndicatorReport(**ai_text_result),
         credits_remaining=credits_remaining,
         db_save_status=db_save_status,
-        notification_dispatched=notification_dispatched
+        notification_dispatched=notification_dispatched,
     )
 
 
@@ -1093,7 +797,7 @@ class ScanStatusResponse(BaseModel):
     status: str = Field(..., description="processing | completed | failed")
     analysis_run_id: str
     error: Optional[str] = None
-    result: Optional[ScanResponse] = None
+    result: Optional[Dict[str, Any]] = None
 
 
 async def _run_scan_job(
@@ -1457,7 +1161,7 @@ async def get_scan_status(
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result=ScanResponse(**result_json)
+            result=result_json
         )
 
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id)

@@ -40,7 +40,7 @@ class DatabasePersistenceService:
         user_id: str,
         manuscript_id: str,
         analysis_run_id: str,
-        coherence_score: int,
+        coherence_score: float,
         inconsistencies: List[Dict[str, Any]],
         recommendations: List[Dict[str, Any]],
         citations: List[Dict[str, Any]],
@@ -81,7 +81,7 @@ class DatabasePersistenceService:
         # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
         analysis_run_update: Dict[str, Any] = {
             "analysis_run_status": "completed", # Bug 6: Valid enum is 'completed'
-            "analysis_run_coherence_score": int(coherence_score),
+            "analysis_run_coherence_score": coherence_score,
             "analysis_run_completed_at": now_iso,
         }
         if sections_analyzed is not None:
@@ -95,14 +95,10 @@ class DatabasePersistenceService:
         if citations_audited is not None:
             analysis_run_update["citations_audited"] = citations_audited
         if score_breakdown is not None:
-            analysis_run_update["structural_completeness_score"] = score_breakdown.get("structural_completeness_score")
             analysis_run_update["cross_chapter_coherence_score"] = score_breakdown.get("cross_chapter_coherence_score")
             analysis_run_update["citation_integrity_score"] = score_breakdown.get("citation_integrity_score")
             analysis_run_update["functional_metric_score"] = score_breakdown.get("overall_score")
             analysis_run_update["functional_metric_band"] = score_breakdown.get("band")
-            lever = score_breakdown.get("biggest_lever") or {}
-            analysis_run_update["biggest_lever"] = lever.get("criterion")
-            analysis_run_update["biggest_lever_detail"] = lever
             analysis_run_update["score_breakdown_json"] = score_breakdown
         if ai_text_indicator is not None:
             analysis_run_update["ai_text_indicator_score"] = ai_text_indicator.get("overall_score")

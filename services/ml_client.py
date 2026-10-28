@@ -29,6 +29,9 @@ class MLClient:
     def analyze_v7(self, sections):
         return self._call("analyze_v7", sections)
 
+    def analyze_ai_text(self, sections):
+        return self._call("analyze_ai_text", sections)
+
     def explain_batch(self, pairs):
         return self._call("explain_batch", pairs)
 
