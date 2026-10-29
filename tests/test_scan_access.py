@@ -39,9 +39,11 @@ def test_locked_view_withholds_report_content_everywhere():
     locked = locked_scan_view(full)
     raw = json.dumps(locked)
     assert full == original
-    assert locked["manuscript_sections"] == [
-        original["manuscript_sections"][0],
-        {"name": "Discussion", "text": None}, {"name": "References", "text": None}]
+    assert locked["manuscript_sections"][0] == original["manuscript_sections"][0]
+    for source, projected in zip(original["manuscript_sections"][1:], locked["manuscript_sections"][1:]):
+        assert projected["name"] == source["name"] and projected["text"] is None
+        assert len(projected["placeholder"]["heading"]) == len(source["name"])
+        assert projected["placeholder"]["paragraphs"]
     assert [r["id"] for r in locked["recommendations"]] == ["r-1-1", "r-1-2"]
     assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1}
     assert locked["citations"] == locked["inconsistencies"] == []
@@ -55,6 +57,39 @@ def test_locked_view_withholds_report_content_everywhere():
     assert locked_scan_view(dict(original, access={"unlocked": True})) == dict(original, access={"unlocked": True})
     assert locked_scan_view({k: v for k, v in original.items() if k != "access"}) == {
         k: v for k, v in original.items() if k != "access"}
+
+
+def test_placeholders_are_bounded_deterministic_and_do_not_echo_withheld_words():
+    words = ("albatross ambergris anemone antelope aperture armadillo asparagus avalanche "
+             "basilisk bellflower blackbird bluegrass breadfruit brontosaurus buttercup "
+             "caterpillar chamomile chestnut cinnamon clockwork cloudburst coralreef "
+             "crocodile dandelion dragonfly eucalyptus firefly flamingo foxglove "
+             "galapagos gardenia goldfinch grapeseed grasshopper hammerhead hawthorn "
+             "hibiscus honeycomb hummingbird jacaranda kingfisher lavender lemongrass "
+             "magnolia marigold moonflower nightingale oleander peppermint periwinkle "
+             "pineapple primrose rhinoceros rosemary sandpiper seahorse snowdrop "
+             "starfish sunflower tamarind tangerine watercress woodpecker").split()
+    assert len(set(words)) >= 50 and all(len(word) >= 6 for word in words)
+    full = {
+        "analysis_run_id": "fixed-scan", "access": {"unlocked": False},
+        "manuscript_sections": [{"name": "First", "text": "Readable opening."}] + [
+            {"name": f"Chapter {index}", "text": " ".join(words) + "\n\n" + "a" * 9000}
+            for index in range(12)],
+        "recommendations": [], "citations": [], "inconsistencies": [],
+        "ai_synthesis": {"summary": None}, "manuscript_flow": [],
+    }
+    locked = locked_scan_view(full)
+    assert locked == locked_scan_view(full)
+    assert locked != locked_scan_view(dict(full, analysis_run_id="another-scan"))
+    placeholders = [section["placeholder"] for section in locked["manuscript_sections"][1:]]
+    assert all(len(item["heading"]) == len(section["name"]) for item, section in zip(placeholders, full["manuscript_sections"][1:]))
+    assert all(len(item["paragraphs"]) == 2 for item in placeholders[:10])
+    assert all(sum(map(len, item["paragraphs"])) + len(item["heading"]) <= 4000 for item in placeholders)
+    assert sum(len(item["heading"]) + sum(map(len, item["paragraphs"])) for item in placeholders) <= 40000
+    assert len(placeholders[0]["paragraphs"][0]) % 40 == 0
+    raw = json.dumps(locked).lower()
+    assert all(word not in raw for word in words)
+    assert all("placeholder" not in section for section in locked_scan_view(dict(full, access={"unlocked": True}))["manuscript_sections"])
 
 
 def test_scan_provision_keeps_zero_balance_and_rate_limit(monkeypatch):

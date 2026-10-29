@@ -26,3 +26,7 @@ Numeric applies when both adjacent section texts contain figures (`NUMERIC_RULE 
 | `POST /api/scans/{id}/unlock` | Absent | Authenticated owner can unlock once for one credit. A single database transaction locks the row, debits the wallet, appends the ledger entry, and updates `result_json`; repeat requests return `charged:false`. Insufficient credit returns 402. The credit kill switch unlocks without a charge. | Atomic and idempotent unlock, including concurrent requests. |
 
 Install `migrations/009_scan_unlock.sql` in the Supabase SQL editor before enabling the paywall. Existing results without `access` remain fully visible.
+
+## P21 locked manuscript blur
+
+Locked `manuscript_sections` still expose every `name`, the first section's `text`, and `text: null` for later sections. Each withheld section also has `placeholder: {heading, paragraphs}` made only from a fixed neutral vocabulary. Its heading matches the real heading's character length; paragraph lengths are rounded to 40 characters, capped at about 4,000 characters per section and 40,000 across the response. The filler is deterministic from `analysis_run_id`. The browser blurs it as manuscript text and hides it from selection and assistive technology, with a centered unlock card above it. Unlocked and older results have no placeholder.

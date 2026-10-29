@@ -353,7 +353,7 @@ class ScanResponse(BaseModel):
     result_version: Optional[str] = None
     overall_coherence_score: float
     sections_analyzed: List[str]
-    manuscript_sections: Optional[List[Dict[str, Optional[str]]]] = None
+    manuscript_sections: Optional[List[Dict[str, Any]]] = None
     access: Optional[Dict[str, Any]] = None
     manuscript_flow: List[Dict[str, Any]]
     inconsistencies_found: int

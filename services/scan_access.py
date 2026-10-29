@@ -1,6 +1,19 @@
 """The sole projection from a stored scan result to its locked API view."""
 
 from copy import deepcopy
+from hashlib import sha256
+import random
+import re
+
+
+FILLER_WORDS = ("calm", "pale", "soft", "open", "clear", "quiet", "light", "plain")
+
+
+def _filler(length, rng):
+    words = []
+    while len(" ".join(words)) < length:
+        words.append(rng.choice(FILLER_WORDS))
+    return " ".join(words)[:length]
 
 
 def locked_scan_view(result):
@@ -9,6 +22,8 @@ def locked_scan_view(result):
 
     view = deepcopy(result)
     sections = view.get("manuscript_sections") or []
+    rng = random.Random(int.from_bytes(sha256(str(result.get("analysis_run_id", "")).encode()).digest(), "big"))
+    remaining = max(0, 40000 - sum(len(section["name"]) for section in sections[1:]))
     full_recommendations = view.get("recommendations") or []
     section_order = {item["name"]: index for index, item in enumerate(sections)}
 
@@ -24,6 +39,19 @@ def locked_scan_view(result):
         "citations": len(view.get("citations") or []),
     }
     for section in sections[1:]:
+        heading = _filler(len(section["name"]), rng)
+        budget = min(4000 - len(heading), remaining)
+        paragraphs = []
+        for paragraph in re.split(r"\n\s*\n", section.get("text") or ""):
+            if not paragraph:
+                continue
+            if budget <= 0:
+                break
+            length = min(max(40, ((len(paragraph) + 20) // 40) * 40), budget)
+            paragraphs.append(_filler(length, rng))
+            budget -= length
+        section["placeholder"] = {"heading": heading, "paragraphs": paragraphs}
+        remaining -= sum(map(len, paragraphs))
         section["text"] = None
     view["citations"] = []
     view["inconsistencies"] = []
