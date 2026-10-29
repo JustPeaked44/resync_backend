@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
+from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_serializer
@@ -1062,6 +1063,23 @@ async def get_scan_status(
         )
 
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id)
+
+
+@app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])
+async def unlock_scan(scan_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    try:
+        return await credits_service.unlock_report(authenticated_user_id, scan_id)
+    except Exception as exc:
+        message = str(exc)
+        if "INSUFFICIENT_CREDITS" in message:
+            return JSONResponse(status_code=402, content={
+                "detail": "Not enough credits to unlock this report.", "credits_remaining": 0})
+        if "SCAN_NOT_FOUND" in message:
+            raise HTTPException(status_code=404, detail="Scan not found.") from exc
+        if "SCAN_NOT_READY" in message:
+            raise HTTPException(status_code=409, detail="Scan is not ready.") from exc
+        logger.exception("Failed to unlock scan %s", scan_id)
+        raise HTTPException(status_code=503, detail="Could not unlock report.") from exc
 
 
 import httpx

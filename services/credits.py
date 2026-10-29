@@ -64,6 +64,21 @@ class CreditsService:
         return await asyncio.to_thread(_fetch)
 
     @classmethod
+    async def unlock_report(cls, user_id: str, analysis_run_id: str) -> Dict[str, Any]:
+        """Run the database's atomic report unlock transaction."""
+        import asyncio
+        client = cls._client()
+
+        def _call():
+            return client.rpc("unlock_scan_report", {
+                "p_user_id": user_id,
+                "p_analysis_run_id": analysis_run_id,
+                "p_charge": CREDITS_ENABLED,
+            }).execute().data
+
+        return await asyncio.to_thread(_call)
+
+    @classmethod
     async def debit_scan_credit(cls, user_id: str, analysis_run_id: str) -> int:
         """Atomically debits one credit for a scan. Raises
         InsufficientCreditsError if the user's balance is 0."""
