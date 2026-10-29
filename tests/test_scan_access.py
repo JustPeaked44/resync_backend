@@ -73,7 +73,7 @@ def test_placeholders_are_bounded_deterministic_and_do_not_echo_withheld_words()
     full = {
         "analysis_run_id": "fixed-scan", "access": {"unlocked": False},
         "manuscript_sections": [{"name": "First", "text": "Readable opening."}] + [
-            {"name": f"Chapter {index}", "text": " ".join(words) + "\n\n" + "a" * 9000}
+            {"name": f"Chapter {index}", "text": " ".join(words) + "\n" + "a" * 9000}
             for index in range(12)],
         "recommendations": [], "citations": [], "inconsistencies": [],
         "ai_synthesis": {"summary": None}, "manuscript_flow": [],

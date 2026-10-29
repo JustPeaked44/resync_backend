@@ -42,7 +42,7 @@ def locked_scan_view(result):
         heading = _filler(len(section["name"]), rng)
         budget = min(4000 - len(heading), remaining)
         paragraphs = []
-        for paragraph in re.split(r"\n\s*\n", section.get("text") or ""):
+        for paragraph in re.split(r"\n+", section.get("text") or ""):
             if not paragraph:
                 continue
             if budget <= 0:
