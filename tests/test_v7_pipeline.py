@@ -4,6 +4,13 @@ import pytest
 
 import main
 from services import parser, v7_explain
+from services import v7_scan
+
+@pytest.fixture(autouse=True)
+def identity_calibration(monkeypatch):
+    """These tests check the scoring structure on raw values; the real curve is tested in test_v7_calibration."""
+    monkeypatch.setattr(v7_scan, "CALIBRATION", ((0.0, 0.0), (1.0, 1.0)))
+
 
 
 @pytest.fixture
@@ -145,11 +152,11 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     assert set(pair["scores"]) == {"objectives_alignment", "methodology_fit", "numeric_consistency",
                                    "claim_support", "overall_coherence"}
     assert set(pair["culprit_sentences"]) == {"section_a", "section_b"}
-    assert set(pair["explanation"]) == {"coherence_scores", "highlighted_inconsistencies",
+    assert set(pair["explanation"]) == {"coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies",
                                         "recommendations", "reference_list"}
     assert set(pair["explanation"]["coherence_scores"]) == {"overall", "objectives", "methodology", "numeric", "claims"}
     assert set(pair["explanation"]["highlighted_inconsistencies"][0]) == {"section", "quote", "what", "why"}
-    assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "recommended_revision", "category"}
+    assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "issue", "recommended_revision", "category"}
     assert pair["explanation"]["reference_list"] == [{"section": "Related Studies", "sentence": "A source sentence with several words."}]
     assert set(payload["inconsistencies"][0]) == {"section_a", "section_b", "pair_order", "coherence_score",
                                                   "explanation_what", "explanation_why", "suggested_fix",
@@ -159,7 +166,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
     assert set(payload["recommendations"][0]) == {"id", "section", "recommendation_id", "section_a", "section_b",
                                                 "pair_order", "category", "original_sentence", "recommended_revision",
-                                                "recommendation_text", "recommendation_priority"}
+                                                "recommendation_text", "recommendation_priority", "issue"}
     assert payload["recommendations"][0]["recommendation_id"]
     assert payload["recommendations"][0]["id"] == "r-1-1"
     assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair"}

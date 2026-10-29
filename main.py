@@ -305,6 +305,7 @@ class RecommendationReport(BaseModel):
     category: Optional[Literal["objectives", "methodology", "claims", "numeric"]] = Field(
         default=None, exclude_if=lambda value: value is None)
     original_sentence: Optional[str]
+    issue: str = ""
     recommended_revision: str
     recommendation_text: str
     recommendation_priority: str
@@ -538,7 +539,9 @@ async def _execute_scan_pipeline(
     section_roles: Dict[str, str] = parse_result.get("section_roles", {})
 
     # Score physical neighbors after merging repeated literal headings.
-    sections = merge_repeated_sections(parsed_sections, section_order)
+    # A reference list is not prose, so it has no meaningful link to the section before it.
+    sections = [section for section in merge_repeated_sections(parsed_sections, section_order)
+                if section_roles.get(section["name"]) != "references"]
     ml_result = await asyncio.to_thread(ml_client.analyze_v7, sections)
     manuscript_flow = assemble_flow(sections, ml_result["pairs"])
     inconsistencies_data, recommendations, ai_synthesis = await explain_flow(sections, manuscript_flow)

@@ -17,7 +17,7 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
            "reference_list": [{"section": "A", "sentence": "A  curly 'quote'."},
                               {"section": "B", "sentence": "fabricated"}]}
     result = v7_explain.normalize_explanation(raw, SCORES, "A", 'A curly ‘quote’.', "B", "B text.")
-    assert set(result) == {"coherence_scores", "highlighted_inconsistencies", "recommendations", "reference_list"}
+    assert set(result) == {"coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies", "recommendations", "reference_list"}
     assert result["coherence_scores"]["overall"] == 0.4
     assert len(result["highlighted_inconsistencies"]) == 2
     assert result["highlighted_inconsistencies"][1]["quote"] is None

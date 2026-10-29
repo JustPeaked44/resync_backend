@@ -2,6 +2,14 @@ import asyncio
 from services import v7_explain
 from services.v7_scan import (final_score, DEFAULT_RECOMMENDATION, assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs)
+import pytest
+from services import v7_scan
+
+@pytest.fixture(autouse=True)
+def identity_calibration(monkeypatch):
+    """These tests check the scoring structure on raw values; the real curve is tested in test_v7_calibration."""
+    monkeypatch.setattr(v7_scan, "CALIBRATION", ((0.0, 0.0), (1.0, 1.0)))
+
 
 
 def test_merge_literal_repeats_in_first_occurrence_order():
@@ -66,10 +74,10 @@ def test_pair_score_drives_ranking_and_skipped_pair_has_no_score():
 
 
 def test_explanation_cap_and_single_summary(monkeypatch):
-    sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(14)]
-    raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 10,
-                       "objectives_alignment": i / 10, "methodology_fit": i / 10,
-                       "numeric_consistency": i / 10, "claim_support": i / 10}} for i in range(13)]
+    sections = [{"name": str(i), "text": "enough words for a valid section"} for i in range(31)]
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": i / 40,
+                       "objectives_alignment": i / 40, "methodology_fit": i / 40,
+                       "numeric_consistency": i / 40, "claim_support": i / 40}} for i in range(30)]
     flow = assemble_flow(sections, raw)
     state = {"active": 0, "peak": 0, "summary_calls": 0}
 
@@ -88,12 +96,12 @@ def test_explanation_cap_and_single_summary(monkeypatch):
     monkeypatch.setattr(v7_explain, "explain_pair", fake_pair)
     monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
     findings, recommendations, synthesis = asyncio.run(explain_flow(sections, flow))
-    assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 13))
-    assert flow[12]["explanation"] is None
+    assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 25))
+    assert flow[24]["explanation"] is None
     assert state["peak"] <= 4 and state["summary_calls"] == 1
     assert findings == []
     assert recommendations and {r["recommendation_text"] for r in recommendations} == {DEFAULT_RECOMMENDATION}
-    assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 13
+    assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 30
 
 
 def test_final_score_penalizes_one_critical_pair_once():

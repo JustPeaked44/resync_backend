@@ -1,4 +1,12 @@
 from services.v7_scan import four_part_score, has_figures, numeric_applicable
+import pytest
+from services import v7_scan
+
+@pytest.fixture(autouse=True)
+def identity_calibration(monkeypatch):
+    """These tests check the scoring structure on raw values; the real curve is tested in test_v7_calibration."""
+    monkeypatch.setattr(v7_scan, "CALIBRATION", ((0.0, 0.0), (1.0, 1.0)))
+
 
 
 def pair(objectives, methodology, claims, numeric, applicable, overall=0.1, weight=0.9):
