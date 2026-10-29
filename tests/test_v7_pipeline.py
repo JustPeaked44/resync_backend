@@ -96,6 +96,7 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert captured["ml_sections"] == [
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
+    assert payload["manuscript_sections"] == captured["ml_sections"]
     assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 66.67
     assert payload["score_breakdown"]["band"] == "Needs Revision"
     assert payload["score_breakdown"]["dimensions"] == {
@@ -132,7 +133,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     payload, _, _ = assembled_scan
     assert set(payload) == {
             "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
-        "overall_coherence_score", "sections_analyzed", "manuscript_flow", "inconsistencies_found",
+        "overall_coherence_score", "sections_analyzed", "manuscript_sections", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
         "score_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
         "credits_remaining"}
@@ -177,6 +178,7 @@ def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
     payload, _, _ = assembled_scan
     legacy = dict(payload)
     legacy.pop("result_version")
+    legacy.pop("manuscript_sections")
     legacy["manuscript_flow"] = [dict(pair) for pair in payload["manuscript_flow"]]
     for pair in legacy["manuscript_flow"]:
         pair.pop("pair_score")
@@ -185,6 +187,7 @@ def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
     legacy["score_breakdown"].pop("dimension_weights")
     loaded = main.ScanResponse.model_validate(legacy)
     assert loaded.result_version is None
+    assert loaded.manuscript_sections is None
     assert loaded.score_breakdown.dimension_weights is None
     assert main.ScanResponse.model_validate(dict(legacy, result_version=None)).result_version is None
 

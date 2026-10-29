@@ -351,6 +351,7 @@ class ScanResponse(BaseModel):
     result_version: Optional[str] = None
     overall_coherence_score: float
     sections_analyzed: List[str]
+    manuscript_sections: Optional[List[Dict[str, Optional[str]]]] = None
     manuscript_flow: List[Dict[str, Any]]
     inconsistencies_found: int
     inconsistencies: List[InconsistencyReport]
@@ -668,6 +669,7 @@ async def _execute_scan_pipeline(
         result_version="v7",
         overall_coherence_score=overall_score,
         sections_analyzed=[section["name"] for section in sections],
+        manuscript_sections=sections,
         manuscript_flow=manuscript_flow,
         inconsistencies_found=len(inconsistencies_data),
         inconsistencies=[InconsistencyReport(**item) for item in inconsistencies_data],
