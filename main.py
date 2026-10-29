@@ -1122,7 +1122,7 @@ async def get_manuscript_preview(
         return {"available": False, "reason": "unreachable"}
         
     result_json = row.get("result_json") or {}
-    if result_json.get("access") and (result_json["access"].get("unlocked") is False or result_json.get("manuscript_sections")):
+    if result_json.get("manuscript_sections"):
         sections = locked_scan_view(result_json).get("manuscript_sections") or []
         return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
     doc_url = result_json.get("doc_url")

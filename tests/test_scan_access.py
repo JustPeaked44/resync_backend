@@ -125,3 +125,6 @@ def test_get_and_manuscript_routes_use_locked_view(monkeypatch):
     assert preview == {"available": True, "text": "Visible first."}
     result["access"]["unlocked"] = True
     assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first.\n\nSECRET SECOND."
+    result.pop("access")
+    result["doc_url"] = "legacy.docx"
+    assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first.\n\nSECRET SECOND."
