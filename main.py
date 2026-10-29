@@ -29,7 +29,7 @@ from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
-                              four_part_score, band)
+                              final_score, band)
 from services.reference_parser import extract_intext_citations
 from services.v7_explain import plain_text
 from services.scan_access import locked_scan_view
@@ -97,7 +97,8 @@ async def get_authenticated_user_id(authorization: Optional[str] = Header(None))
     db_client = DatabasePersistenceService.get_client()
     try:
         user_resp = await asyncio.to_thread(db_client.auth.get_user, token)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Supabase token check failed: %s: %s", type(exc).__name__, str(exc)[:200])
         user_resp = None
     if not user_resp or not user_resp.user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session.")
@@ -180,8 +181,8 @@ async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authentic
 
         manuscript_flow = assemble_flow(sections, result["pairs"])
         findings, recommendations, synthesis = await explain_flow(sections, manuscript_flow)
-    score, dimensions, dimension_weights = four_part_score(manuscript_flow)
-    return {"result_version": "v7", "manuscript_score": score,
+    score, dimensions, dimension_weights, critical_penalty = final_score(manuscript_flow)
+    return {"result_version": "v7", "manuscript_score": score, "critical_penalty": critical_penalty,
             "dimensions": dimensions, "dimension_weights": dimension_weights,
             "manuscript_flow": manuscript_flow, "inconsistencies": findings,
             "recommendations": recommendations, "ai_synthesis": synthesis}
@@ -333,6 +334,7 @@ class ScoreBreakdown(BaseModel):
     citation_integrity_score: Optional[float] = None
     dimensions: Dict[str, Optional[float]]
     dimension_weights: Optional[Dict[str, float]] = None
+    critical_penalty: float = 0.0
     citation_detail: Dict[str, Any]
 
 
@@ -540,7 +542,7 @@ async def _execute_scan_pipeline(
     ml_result = await asyncio.to_thread(ml_client.analyze_v7, sections)
     manuscript_flow = assemble_flow(sections, ml_result["pairs"])
     inconsistencies_data, recommendations, ai_synthesis = await explain_flow(sections, manuscript_flow)
-    overall_score, dimensions, dimension_weights = four_part_score(manuscript_flow)
+    overall_score, dimensions, dimension_weights, critical_penalty = final_score(manuscript_flow)
     ai_text_result = await asyncio.to_thread(
         ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}
     )
@@ -578,6 +580,7 @@ async def _execute_scan_pipeline(
         "citation_integrity_score": citation_integrity_result.score,
         "dimensions": dimensions,
         "dimension_weights": dimension_weights,
+        "critical_penalty": critical_penalty,
         "citation_detail": {
             "well_formed_ratio": citation_integrity_result.well_formed_ratio,
             "link_resolution_rate": citation_integrity_result.link_resolution_rate,

@@ -2,7 +2,7 @@ import asyncio
 import json
 import pytest
 from services import v7_explain
-from services.v7_scan import assemble_flow, flatten_explanations
+from services.v7_scan import DEFAULT_RECOMMENDATION, assemble_flow, flatten_explanations
 
 SCORES = {"overall_coherence": 0.4, "objectives_alignment": 0.8, "methodology_fit": 0.7,
           "numeric_consistency": 0.6, "claim_support": 0.5}
@@ -165,7 +165,8 @@ def test_fake_gemini_preserves_findings_but_rejects_unsupported_evidence(monkeyp
                               {"name": "B", "text": "B says no effect."}], [{"scores": dict(SCORES, pair_weight=1)}])
         flow[0]["explanation"] = result
         findings, revisions = flatten_explanations(flow)
-        assert len(findings) == 1 and revisions == []
+        assert len(findings) == 1
+        assert [r["recommendation_text"] for r in revisions] == [DEFAULT_RECOMMENDATION]  # low score never has zero advice
         assert findings[0]["evidence_verified"] is True
         assert findings[0]["evidence_quotes"] == [{"section": "A", "text": "A says improvement."}]
 

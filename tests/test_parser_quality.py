@@ -75,3 +75,18 @@ Author, C. (2022). A third source. https://doi.org/10.1234/third
     assert len(build_parsed_entries(selected)[0]) == 3
     assert _references_text({"references the user": "wrong", "references": "real"},
                             {"references the user": "references", "references": "references"}) == "real"
+
+
+def test_table_rows_and_appendix_text_are_not_sections():
+    body = "This sentence is body text that fills the section with enough words to count. " * 4
+    text = "\n".join([
+        "Introduction", body,
+        "Research Methodology", body,
+        "Sprints | Planning | Design | Development | Testing", body,
+        "Conclusion", body,
+        "References", "Doe, J. (2020). A reference entry that is long enough to count as real content here. " * 3,
+        "Appendix A Design Tables", "Method Description | varchar | 200", "Results", body,
+    ])
+    result = ManuscriptParserService.parse_manuscript_sections(text, None)
+    assert list(result["parsed_sections"]) == ["introduction", "research methodology", "conclusion", "references"]
+    assert "Sprints | Planning" in result["parsed_sections"]["research methodology"]

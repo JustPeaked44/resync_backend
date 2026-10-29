@@ -8,6 +8,11 @@ import uuid
 DIMENSIONS = ("objectives_alignment", "methodology_fit", "numeric_consistency", "claim_support")
 SCORE_KEYS = (*DIMENSIONS, "overall_coherence")
 NUMERIC_RULE = "both"
+CRITICAL_THRESHOLD = 0.40
+CRITICAL_PENALTY = 10
+RECOMMENDATION_THRESHOLD = 0.85
+DEFAULT_RECOMMENDATION = ("Consider adding transitional sentences to better connect the logical flow "
+                          "between these sections.")
 
 
 def has_figures(text):
@@ -35,6 +40,19 @@ def four_part_score(pairs):
     score = round(100 * sum(sum(items) / len(items) * weights[key]
                             for key, items in values.items() if items), 2)
     return score, averages, weights
+
+
+def final_score(pairs):
+    """Four-part average (0-100) minus a flat penalty when any single pair is a critical flaw.
+
+    The penalty applies once, not per pair, so many minor issues never stack up to zero.
+    Returns (score, dimension averages, dimension weights, penalty applied).
+    """
+    score, averages, weights = four_part_score(pairs)
+    critical = any(p["scores"]["overall_coherence"] is not None
+                   and p["scores"]["overall_coherence"] < CRITICAL_THRESHOLD for p in pairs)
+    penalty = CRITICAL_PENALTY if critical else 0
+    return round(max(0.0, score - penalty), 2), averages, weights, penalty
 
 
 def merge_repeated_sections(parsed_sections, section_order):
@@ -121,16 +139,22 @@ def flatten_explanations(flow, sections=None):
     highlighted = set()
     for pair in flow:
         explanation = pair["explanation"]
-        if explanation is None:
+        overall = pair["scores"]["overall_coherence"]
+        if explanation is None and overall is None:
             continue
         names = (pair["section_a"], pair["section_b"])
         score = round(pair["pair_score"] * 100, 2)
+        explanation = explanation or {"highlighted_inconsistencies": [], "recommendations": [], "reference_list": []}
         fallback_category = recommendation_category(
             None, dict(pair["scores"], numeric_applicable=pair["numeric_applicable"]))
         pair_recommendations = sorted(explanation["recommendations"],
                                       key=lambda r: (names.index(r["section"]),
                                                      sections[pair["order"] - 1 + names.index(r["section"])]["text"].find(r["original_sentence"])
                                                      if sections else r["original_sentence"]))
+        if overall < RECOMMENDATION_THRESHOLD and not pair_recommendations:
+            # A low score never ships with zero advice, whether Gemini returned none or was never asked.
+            pair_recommendations = [{"section": names[1], "original_sentence": None,
+                                     "recommended_revision": DEFAULT_RECOMMENDATION}]
         for item in explanation["highlighted_inconsistencies"]:
             quotes = [{"section": item["section"], "text": item["quote"]}] if item["quote"] else []
             quotes.extend({"section": ref["section"], "text": ref["sentence"]}
@@ -149,9 +173,10 @@ def flatten_explanations(flow, sections=None):
         number = 0
         for item in pair_recommendations:
             key = (item["section"], item["original_sentence"])
-            if key in highlighted:
-                continue
-            highlighted.add(key)
+            if item["original_sentence"] is not None:  # the default advice has no sentence to dedupe on
+                if key in highlighted:
+                    continue
+                highlighted.add(key)
             revision = item["recommended_revision"]
             number += 1
             recommendations.append({"recommendation_id": str(uuid.uuid4()),

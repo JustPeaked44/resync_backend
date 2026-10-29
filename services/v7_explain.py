@@ -33,7 +33,8 @@ highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, recommended_revision, category),
 reference_list (array of objects with section, sentence).
 For each recommendation, category names the score part its revision fixes: objectives (alignment with aims), methodology (fit of methods), claims (support for claims), or numeric (consistency of figures). Use exactly one of these four values.
-Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text.
+Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If the provided Overall Coherence score is less than 0.85, you MUST generate at least one recommendation. Even if there are no direct contradictions, recommend how the student can better align or transition the text between these two sections.
+If no issue is supported and the Overall Coherence score is 0.85 or higher, return empty arrays. Recommend only revisions justified by the supplied text.
 Return one recommendation for EACH culprit sentence supplied above and EACH highlighted finding quote that verifies in its named section. Do not combine passages. Use the exact culprit or quote as original_sentence. Return all of these in this same JSON call.
 A recommended revision must preserve the original sentence's meaning and repair only its logical link to the neighboring section; never adopt the neighboring section's topic."""
 SUMMARY_PROMPT = """Summarize correlation of these neighboring manuscript pairs in one concise paragraph.

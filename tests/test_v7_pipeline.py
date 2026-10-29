@@ -166,7 +166,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     for key in ("strongest_pair", "weakest_pair"):
         assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}
     assert set(payload["score_breakdown"]) == {"overall_score", "band", "cross_chapter_coherence_score",
-                                               "citation_integrity_score", "dimensions", "dimension_weights", "citation_detail"}
+                                               "citation_integrity_score", "dimensions", "dimension_weights", "critical_penalty", "citation_detail"}
     assert set(payload["score_breakdown"]["dimensions"]) == {"objectives_alignment", "methodology_fit",
                                                                "numeric_consistency", "claim_support"}
     assert set(payload["score_breakdown"]["dimension_weights"]) == set(payload["score_breakdown"]["dimensions"])
@@ -217,7 +217,7 @@ def test_analyze_v7_uses_same_four_part_contract(monkeypatch):
         {"name": "B", "text": "Results reached 78% among the participants."}])
     result = asyncio.run(main.analyze_v7(request, user_id="user"))
     assert result["result_version"] == "v7"
-    assert result["manuscript_score"] == 58.75
+    assert result["manuscript_score"] == 48.75 and result["critical_penalty"] == 10  # 58.75 minus the critical-flaw penalty
     assert result["dimensions"] == {"objectives_alignment": 1.0, "methodology_fit": 0.5,
                                     "numeric_consistency": 0.1, "claim_support": 0.75}
     assert set(result["dimension_weights"].values()) == {0.25}

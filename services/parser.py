@@ -333,6 +333,7 @@ class ManuscriptParserService:
         detected_headings: List[str] = []
         detected_roles_in_order: List[str] = []
         current_section_key: Optional[str] = None
+        references_key: Optional[str] = None
 
         # 1. Walk lines, classifying each as a heading (role-mapped) or body text
         table_neighbors = {"test case description", "expected result", "actual result", "pre-condition",
@@ -345,6 +346,13 @@ class ManuscriptParserService:
                         or (line.lower() == "recommendation" and
                             (re.match(r"table\s+\d", previous) or previous == "fk referenced table")))
             role = None if in_table else cls._detect_heading_role(line, prefix_re)
+            if role and references_key and role != "references":
+                # Appendix headings and tables after the reference list are not manuscript sections.
+                current_section_key = None
+                continue
+            if role == "references" and references_key and len(" ".join(sections_lines[references_key]).strip()) >= 150:
+                current_section_key = references_key  # extra reference lists stay one section
+                continue
             if role:
                 heading = re.sub(r" \(\d+\)$", "", prefix_re.sub("", line).strip().lower())
                 # If we already have this literal heading and its content so far is very
@@ -362,6 +370,8 @@ class ManuscriptParserService:
                     sections_lines[section_key] = []
                 section_roles[section_key] = role
                 current_section_key = section_key
+                if role == "references":
+                    references_key = section_key
                 detected_headings.append(line)
                 detected_roles_in_order.append(role)
             elif current_section_key is not None:
@@ -437,7 +447,8 @@ class ManuscriptParserService:
         """
         if (len(line) >= 80 or line.rstrip().endswith(".")
                 or re.match(r"^(?:[*•☐☑☒\-]\s*|\d+[.)]\s+)", line)
-                or re.search(r"\s{2,}\d{1,3}$", line)
+                or re.search(r"(?:	|\s{2,})\d{1,3}$", line)
+                or "|" in line or line.rstrip().endswith(",") or line.count("(") != line.count(")")
                 or re.match(r"(?i)^(?:figure|fig\.|table|chart)\s+\d+", line)):
             return None
 

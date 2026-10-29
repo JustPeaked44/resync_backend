@@ -1,6 +1,6 @@
 import asyncio
 from services import v7_explain
-from services.v7_scan import (assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
+from services.v7_scan import (final_score, DEFAULT_RECOMMENDATION, assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs)
 
 
@@ -91,5 +91,17 @@ def test_explanation_cap_and_single_summary(monkeypatch):
     assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 13))
     assert flow[12]["explanation"] is None
     assert state["peak"] <= 4 and state["summary_calls"] == 1
-    assert findings == recommendations == []
+    assert findings == []
+    assert recommendations and {r["recommendation_text"] for r in recommendations} == {DEFAULT_RECOMMENDATION}
     assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 13
+
+
+def test_final_score_penalizes_one_critical_pair_once():
+    def pair(overall):
+        return {"scores": {"overall_coherence": overall, "objectives_alignment": overall, "methodology_fit": overall,
+                           "numeric_consistency": overall, "claim_support": overall}, "numeric_applicable": True}
+    assert final_score([pair(0.8), pair(0.8)])[0::3] == (80.0, 0)       # average only, no critical pair
+    assert final_score([pair(0.8), pair(0.8), pair(0.3)])[0::3] == (53.33, 10)
+    assert final_score([pair(0.2), pair(0.1), pair(0.3)])[0::3] == (10.0, 10)  # penalty is flat, not per pair
+    assert final_score([pair(0.0)])[0] == 0.0                           # floored at zero
+    assert final_score([{"scores": {"overall_coherence": None}}])[0::3] == (0.0, 0)
