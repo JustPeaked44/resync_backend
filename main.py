@@ -296,6 +296,7 @@ class InconsistencyReport(BaseModel):
 
 class RecommendationReport(BaseModel):
     recommendation_id: str
+    id: str
     section_a: str
     section_b: str
     pair_order: int

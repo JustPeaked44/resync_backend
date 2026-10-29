@@ -33,6 +33,7 @@ highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, recommended_revision),
 reference_list (array of objects with section, sentence).
 Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text.
+Return one recommendation for EACH culprit sentence supplied above and EACH highlighted finding quote that verifies in its named section. Do not combine passages. Use the exact culprit or quote as original_sentence. Return all of these in this same JSON call.
 A recommended revision must preserve the original sentence's meaning and repair only its logical link to the neighboring section; never adopt the neighboring section's topic."""
 SUMMARY_PROMPT = """Summarize correlation of these neighboring manuscript pairs in one concise paragraph.
 {rules}
@@ -113,10 +114,26 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
                                 pair_score=scores.get("pair_score", scores["overall_coherence"]),
                                 culprits_a=json.dumps(culprits_a), culprits_b=json.dumps(culprits_b))
     try:
-        return normalize_explanation(await _generate(prompt), scores, role_a, text_a, role_b, text_b)
+        result = normalize_explanation(await _generate(prompt), scores, role_a, text_a, role_b, text_b)
     except Exception:
         logger.exception("v7 Gemini pair explanation failed for %s -> %s", role_a, role_b)
-        return normalize_explanation({}, scores, role_a, text_a, role_b, text_b)
+        result = normalize_explanation({}, scores, role_a, text_a, role_b, text_b)
+    sources = {role_a: text_a, role_b: text_b}
+    required = [(role_a, item.get("sentence")) for item in culprits_a if isinstance(item, dict)]
+    required += [(role_b, item.get("sentence")) for item in culprits_b if isinstance(item, dict)]
+    required += [(item["section"], item["quote"]) for item in result["highlighted_inconsistencies"]]
+    result["recommendations"] = [item for item in result["recommendations"]
+                                 if item["original_sentence"] in sources[item["section"]]]
+    seen = {(item["section"], item["original_sentence"]) for item in result["recommendations"]}
+    for section, sentence in required:
+        if not isinstance(sentence, str) or not sentence or "\n" in sentence or sentence not in sources[section]:
+            continue
+        if (section, sentence) not in seen:
+            # A missed Gemini item still gets a source-backed review action without inventing a revision.
+            result["recommendations"].append({"section": section, "original_sentence": sentence,
+                                              "recommended_revision": f"Review how this sentence connects to the neighboring section: {sentence}"})
+            seen.add((section, sentence))
+    return result
 
 
 async def explain_summary(flow, findings):

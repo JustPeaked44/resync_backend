@@ -180,3 +180,43 @@ def test_user_facing_gemini_strings_are_plain_text(monkeypatch):
     assert result["reference_list"][0]["sentence"] == "A says improvement."
     assert v7_explain.plain_text("# **`AI-text note`**") == "AI-text note"
     assert v7_explain.plain_text("● **A listed recommendation.**") == "A listed recommendation."
+
+
+def test_one_fake_gemini_call_covers_each_verified_passage(monkeypatch):
+    calls = []
+    raw = {"highlighted_inconsistencies": [
+        {"section": "B", "quote": "B says no effect.", "what": "Conflict", "why": "A reports improvement."},
+        {"section": "A", "quote": "not in A", "what": "Unsupported", "why": "No source."}],
+        "recommendations": [
+            {"section": "A", "original_sentence": "A says improvement.", "recommended_revision": "A reports improvement relative to B."},
+            {"section": "A", "original_sentence": "not in A", "recommended_revision": "Invented."}]}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(raw)}]}}]}
+
+    async def fake(payload):
+        calls.append(payload)
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    result = asyncio.run(v7_explain.explain_pair(
+        "A", "A says improvement. A has another culprit.", "B", "B says no effect.", SCORES,
+        [{"sentence": "A says improvement."}, {"sentence": "A has another culprit."}],
+        [{"sentence": "not in B"}]))
+    assert len(calls) == 1
+    assert "EACH culprit sentence" in calls[0]["contents"][0]["parts"][0]["text"]
+    assert [(r["section"], r["original_sentence"]) for r in result["recommendations"]] == [
+        ("A", "A says improvement."), ("A", "A has another culprit."), ("B", "B says no effect.")]
+    assert result["highlighted_inconsistencies"][1]["quote"] is None
+    sections = [{"name": "A", "text": "A says improvement. A has another culprit."},
+                {"name": "B", "text": "B says no effect."}]
+    flow = assemble_flow(sections, [{"scores": dict(SCORES, pair_weight=1)}])
+    flow[0]["explanation"] = result
+    _, recommendations = flatten_explanations(flow, sections)
+    assert [r["id"] for r in recommendations] == ["r-1-1", "r-1-2", "r-1-3"]
+    assert all(r["original_sentence"] in next(s["text"] for s in sections
+                                              if s["name"] == r["target_section_name"]) for r in recommendations)

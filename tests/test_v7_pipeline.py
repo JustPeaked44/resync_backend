@@ -157,10 +157,11 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                                   "evidence_verified", "finding_status"}
     assert payload["inconsistencies"][0]["inconsistency_id"]
     assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
-    assert set(payload["recommendations"][0]) == {"recommendation_id", "section_a", "section_b",
+    assert set(payload["recommendations"][0]) == {"id", "recommendation_id", "section_a", "section_b",
                                                 "pair_order", "original_sentence", "recommended_revision",
                                                 "recommendation_text", "recommendation_priority"}
     assert payload["recommendations"][0]["recommendation_id"]
+    assert payload["recommendations"][0]["id"] == "r-1-1"
     assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair"}
     for key in ("strongest_pair", "weakest_pair"):
         assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}

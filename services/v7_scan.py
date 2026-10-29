@@ -105,7 +105,7 @@ async def explain_flow(sections, flow):
                 scores, culprits["section_a"], culprits["section_b"])
 
     await asyncio.gather(*(explain(pair) for pair in select_worst_pairs(flow)))
-    findings, recommendations = flatten_explanations(flow)
+    findings, recommendations = flatten_explanations(flow, sections)
     scored = [p for p in flow if p["pair_score"] is not None]
     synthesis = {"summary": await explain_summary(flow, findings),
                  "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
@@ -113,7 +113,7 @@ async def explain_flow(sections, flow):
     return findings, recommendations, synthesis
 
 
-def flatten_explanations(flow):
+def flatten_explanations(flow, sections=None):
     findings, recommendations = [], []
     for pair in flow:
         explanation = pair["explanation"]
@@ -121,7 +121,10 @@ def flatten_explanations(flow):
             continue
         names = (pair["section_a"], pair["section_b"])
         score = round(pair["pair_score"] * 100, 2)
-        pair_recommendations = explanation["recommendations"]
+        pair_recommendations = sorted(explanation["recommendations"],
+                                      key=lambda r: (names.index(r["section"]),
+                                                     sections[pair["order"] - 1 + names.index(r["section"])]["text"].find(r["original_sentence"])
+                                                     if sections else r["original_sentence"]))
         for item in explanation["highlighted_inconsistencies"]:
             quotes = [{"section": item["section"], "text": item["quote"]}] if item["quote"] else []
             quotes.extend({"section": ref["section"], "text": ref["sentence"]}
@@ -137,9 +140,10 @@ def flatten_explanations(flow):
                              "evidence_b": next((q["text"] for q in quotes if q["section"] == names[1]), ""),
                              "evidence_quotes": quotes, "evidence_verified": bool(quotes),
                              "finding_status": "material_issue"})
-        for item in pair_recommendations:
+        for number, item in enumerate(pair_recommendations, 1):
             revision = item["recommended_revision"]
             recommendations.append({"recommendation_id": str(uuid.uuid4()),
+                                    "id": f"r-{pair['order']}-{number}",
                                     "section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
                                     "original_sentence": item["original_sentence"],
                                     "recommended_revision": revision, "recommendation_text": revision,
