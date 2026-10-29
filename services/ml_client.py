@@ -3,6 +3,8 @@
 import os
 
 MODAL_APP_NAME = "resync-ml-v7"
+# One scan runs at a time (SCAN_SLOT), so the model can use most cores; set ML_THREADS=1 to go back to the old limit.
+ML_THREADS = int(os.getenv("ML_THREADS", min(3, max(1, (os.cpu_count() or 2) - 1))))
 
 
 class MLClient:
@@ -14,7 +16,7 @@ class MLClient:
     def _call(self, method, *args):
         if self.backend == "local":
             import torch
-            torch.set_num_threads(1)
+            torch.set_num_threads(ML_THREADS)
             from services import ml_worker
             return getattr(ml_worker, method)(*args)
 
