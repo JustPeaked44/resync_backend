@@ -26,7 +26,7 @@ from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
 from services.notification import NotificationDeliveryService
-from services.credits import credits_service, InsufficientCreditsError
+from services.credits import credits_service
 from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
                               four_part_score, band)
@@ -114,10 +114,8 @@ def _assert_owner(authenticated_user_id: str, claimed_user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scan rate limiting — protects the Gemini free-tier RPM budget. The credit
-# ledger already bounds *cost*, but nothing previously bounded *burst rate*
-# (a user with credits, or with CREDITS_ENABLED=false, could loop
-# /api/scans/start and blow through Gemini's 15 RPM). Checked once in
+# Scan rate limiting protects the Gemini free-tier RPM budget for free scans.
+# Checked once in
 # _provision_analysis_run, the single gate shared by both scan endpoints.
 # ponytail: in-memory per-process counter -- resets on restart and doesn't
 # share state across multiple server instances. Move to Redis/DB-backed

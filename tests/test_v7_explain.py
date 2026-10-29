@@ -22,7 +22,17 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
     assert len(result["highlighted_inconsistencies"]) == 2
     assert result["highlighted_inconsistencies"][1]["quote"] is None
     assert result["recommendations"] == []
-    assert result["reference_list"] == [{"section": "A", "sentence": "A  curly 'quote'."}]
+    assert result["reference_list"] == [{"section": "A", "sentence": 'A curly ‘quote’.'}]
+
+
+def test_normalized_quote_returns_exact_source_span_for_highlight():
+    source = 'A curly ‘quote’ appears in this section.'
+    result = v7_explain.normalize_explanation(
+        {"recommendations": [{"section": "A", "original_sentence": "A  curly 'quote'",
+                              "recommended_revision": "Revise the connection."}]},
+        SCORES, "A", source, "B", "B text.")
+    assert result["recommendations"][0]["original_sentence"] == "A curly ‘quote’"
+    assert result["recommendations"][0]["original_sentence"] in source
 
 
 def test_fake_gemini_pair_and_summary(monkeypatch):

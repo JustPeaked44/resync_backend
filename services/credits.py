@@ -1,15 +1,9 @@
 """
-Pay-per-scan credits ledger service.
+Report-unlock credits ledger service.
 
-Wraps the Supabase RPCs defined in migrations/004_credits.sql
-(debit_scan_credit, refund_scan_credit, purchase_credits). All balance
-mutation goes through those RPCs -- they are SECURITY DEFINER functions
-with a conditional `WHERE balance >= 1` update, which is what makes two
-concurrent scans against a balance of 1 resolve to exactly one success.
-This service never mutates credit_wallet directly.
-
-InsufficientCreditsError is the seam _provision_analysis_run in main.py
-catches to return HTTP 402.
+Wallet changes use the Supabase RPCs in migrations/004_credits.sql and
+migrations/009_scan_unlock.sql. The unlock RPC charges and marks the
+stored report unlocked in one transaction.
 """
 
 import logging

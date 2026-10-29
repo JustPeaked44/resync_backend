@@ -63,8 +63,13 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
         if not isinstance(section, str) or section not in source or not isinstance(quote, str) or not quote.strip():
             return None
         cleaned = plain_text(quote)
-        match, ok = gemini.verify_quote(cleaned, source[section])
-        return match if ok else None
+        _, ok = gemini.verify_quote(cleaned, source[section])
+        if not ok:
+            return None
+        pattern = re.sub(r"(?:\\ )+", lambda _: r"\s+", re.escape(cleaned))
+        pattern = pattern.replace("'", "['‘’]").replace('"', '["“”]')
+        match = re.search(pattern, source[section], flags=re.I)
+        return match.group() if match else None
 
     issues = []
     for item in raw.get("highlighted_inconsistencies", []) if isinstance(raw.get("highlighted_inconsistencies"), list) else []:
