@@ -133,7 +133,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     payload, _, _ = assembled_scan
     assert set(payload) == {
             "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
-        "overall_coherence_score", "sections_analyzed", "manuscript_sections", "manuscript_flow", "inconsistencies_found",
+        "overall_coherence_score", "sections_analyzed", "manuscript_sections", "access", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
         "score_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
         "credits_remaining"}
@@ -157,7 +157,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                                   "evidence_verified", "finding_status"}
     assert payload["inconsistencies"][0]["inconsistency_id"]
     assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
-    assert set(payload["recommendations"][0]) == {"id", "recommendation_id", "section_a", "section_b",
+    assert set(payload["recommendations"][0]) == {"id", "section", "recommendation_id", "section_a", "section_b",
                                                 "pair_order", "original_sentence", "recommended_revision",
                                                 "recommendation_text", "recommendation_priority"}
     assert payload["recommendations"][0]["recommendation_id"]
@@ -180,6 +180,7 @@ def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
     legacy = dict(payload)
     legacy.pop("result_version")
     legacy.pop("manuscript_sections")
+    legacy.pop("access")
     legacy["manuscript_flow"] = [dict(pair) for pair in payload["manuscript_flow"]]
     for pair in legacy["manuscript_flow"]:
         pair.pop("pair_score")
@@ -189,6 +190,7 @@ def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
     loaded = main.ScanResponse.model_validate(legacy)
     assert loaded.result_version is None
     assert loaded.manuscript_sections is None
+    assert loaded.access is None
     assert loaded.score_breakdown.dimension_weights is None
     assert main.ScanResponse.model_validate(dict(legacy, result_version=None)).result_version is None
 

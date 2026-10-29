@@ -31,6 +31,7 @@ from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_fl
                               four_part_score, band)
 from services.reference_parser import extract_intext_citations
 from services.v7_explain import plain_text
+from services.scan_access import locked_scan_view
 
 logger = logging.getLogger("resync.main")
 
@@ -297,6 +298,7 @@ class InconsistencyReport(BaseModel):
 class RecommendationReport(BaseModel):
     recommendation_id: str
     id: str
+    section: str
     section_a: str
     section_b: str
     pair_order: int
@@ -353,6 +355,7 @@ class ScanResponse(BaseModel):
     overall_coherence_score: float
     sections_analyzed: List[str]
     manuscript_sections: Optional[List[Dict[str, Optional[str]]]] = None
+    access: Optional[Dict[str, Any]] = None
     manuscript_flow: List[Dict[str, Any]]
     inconsistencies_found: int
     inconsistencies: List[InconsistencyReport]
@@ -422,18 +425,10 @@ async def _resolve_manuscript_id(db_client: Any, req: ScanRequest, default_sourc
 
 async def _provision_analysis_run(req: ScanRequest, default_source_name: Optional[str] = None) -> tuple[str, str, int]:
     """
-    Validates the user, resolves/creates the manuscript, inserts the
-    `analysis_run` row in 'processing' state, and debits one scan credit.
-
-    Runs *before* a scan is accepted so that bad requests — and an empty
-    credit balance — fail fast with a real HTTP status, rather than
-    surfacing later inside a background task where the client can no
-    longer see them.
+    Validates the user, resolves/creates the manuscript, and inserts the
+    `analysis_run` row in 'processing' state. Scans are free.
 
     Returns (analysis_run_id, manuscript_id, credits_remaining).
-    Raises HTTPException(402) via InsufficientCreditsError if the user has
-    no credits left; the provisional analysis_run row is deleted first so
-    a declined scan never leaves a phantom "processing" row behind.
     """
     await _check_scan_rate_limit(req.user_id)
 
@@ -483,21 +478,7 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
             detail="Database setup failed before scan could start."
         )
 
-    try:
-        credits_remaining = await credits_service.debit_scan_credit(req.user_id, analysis_run_id)
-    except InsufficientCreditsError as exc:
-        try:
-            await asyncio.to_thread(
-                lambda: db_client.table("analysis_run").delete().eq("analysis_run_id", analysis_run_id).execute()
-            )
-        except Exception:
-            logger.exception("Failed to clean up declined analysis_run %s", analysis_run_id)
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={"message": "No scan credits remaining.", "balance": exc.balance},
-        )
-
-    return analysis_run_id, manuscript_id, credits_remaining
+    return analysis_run_id, manuscript_id, await credits_service.get_balance(req.user_id)
 
 
 async def _execute_scan_pipeline(
@@ -671,6 +652,10 @@ async def _execute_scan_pipeline(
         overall_coherence_score=overall_score,
         sections_analyzed=[section["name"] for section in sections],
         manuscript_sections=sections,
+        access={"unlocked": False, "unlock_cost": 1, "locked_counts": {
+            "sections": max(0, len(sections) - 1),
+            "recommendations": max(0, len(recommendations) - 2),
+            "citations": len(citations)}},
         manuscript_flow=manuscript_flow,
         inconsistencies_found=len(inconsistencies_data),
         inconsistencies=[InconsistencyReport(**item) for item in inconsistencies_data],
@@ -714,6 +699,15 @@ class ScanStatusResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 
+async def _save_completed_result(result: ScanResponse) -> None:
+    db_client = DatabasePersistenceService.get_client()
+    await asyncio.to_thread(
+        lambda: db_client.table("analysis_run").update({
+            "status": "completed", "result_json": result.model_dump(mode="json"),
+        }).eq("analysis_run_id", result.analysis_run_id).execute()
+    )
+
+
 async def _run_scan_job(
     req: ScanRequest,
     analysis_run_id: str,
@@ -729,8 +723,7 @@ async def _run_scan_job(
     endpoint can return it verbatim — identical to what the synchronous
     endpoint would have returned, with no field lost in reconstruction.
 
-    Any failure is recorded on the row and the debited credit is refunded —
-    a failed scan must never cost the student a credit. Without the status
+    Any failure is recorded on the row. Without the status
     update, an exception would be swallowed by the background-task runner
     and leave the job pinned at 'processing' forever, with the client
     polling indefinitely.
@@ -751,13 +744,7 @@ async def _run_scan_job(
                 file_bytes=file_bytes,
                 filename=filename,
             )
-            db_client = DatabasePersistenceService.get_client()
-            await asyncio.to_thread(
-                lambda: db_client.table("analysis_run").update({
-                    "status": "completed",
-                    "result_json": result.model_dump(mode="json"),
-                }).eq("analysis_run_id", analysis_run_id).execute()
-            )
+            await _save_completed_result(result)
             logger.info("Async scan job completed: %s", analysis_run_id)
         except Exception as exc:
             logger.exception("Async scan job failed: %s", analysis_run_id)
@@ -771,7 +758,6 @@ async def _run_scan_job(
                 )
             except Exception:
                 logger.exception("Could not mark scan job %s as failed", analysis_run_id)
-            await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
 
 
 @app.post(
@@ -791,8 +777,7 @@ async def run_scan(
     req: ScanRequest,
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> ScanResponse:
-    """Synchronous scan — provisions the run row, debits a credit, then
-    awaits the full pipeline. Refunds the credit if the pipeline throws.
+    """Synchronous free scan; returns the locked result after persistence.
 
     Only one scan runs at a time (see SCAN_SLOT). Rather than blocking here
     and risking Render's 100s proxy timeout while merely queued, this fails
@@ -803,16 +788,16 @@ async def run_scan(
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
-        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
         raise HTTPException(
             status_code=503,
             detail="Another scan is currently in progress. Please retry shortly.",
             headers={"Retry-After": "60"},
         )
     try:
-        return await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
+        result = await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
+        await _save_completed_result(result)
+        return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
     except Exception:
-        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
         raise
     finally:
         SCAN_SLOT.release()
@@ -840,10 +825,8 @@ async def start_scan(
     """
     Accepts a scan job and returns straight away.
 
-    FK validation and the credit debit both still happen inline, so an
-    invalid user_id/manuscript_id fails fast with 404, and an empty
-    balance fails fast with 402 — rather than being accepted and failing
-    in the background where the client can't see why.
+    FK validation happens inline so invalid user_id/manuscript_id fails
+    fast with 404 instead of failing in the background.
     """
     _assert_owner(authenticated_user_id, req.user_id)
     analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
@@ -987,14 +970,13 @@ async def upload_and_run_scan(
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
-        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
         raise HTTPException(
             status_code=503,
             detail="Another scan is currently in progress. Please retry shortly.",
             headers={"Retry-After": "60"},
         )
     try:
-        return await _execute_scan_pipeline(
+        result = await _execute_scan_pipeline(
             req,
             analysis_run_id,
             resolved_manuscript_id,
@@ -1002,8 +984,9 @@ async def upload_and_run_scan(
             file_bytes=file_bytes,
             filename=file.filename,
         )
+        await _save_completed_result(result)
+        return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
     except Exception:
-        await credits_service.refund_scan_credit(req.user_id, analysis_run_id)
         raise
     finally:
         SCAN_SLOT.release()
@@ -1075,7 +1058,7 @@ async def get_scan_status(
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result=result_json
+            result=locked_scan_view(result_json)
         )
 
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id)
@@ -1123,6 +1106,9 @@ async def get_manuscript_preview(
         return {"available": False, "reason": "unreachable"}
         
     result_json = row.get("result_json") or {}
+    if result_json.get("access") and (result_json["access"].get("unlocked") is False or result_json.get("manuscript_sections")):
+        sections = locked_scan_view(result_json).get("manuscript_sections") or []
+        return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
     doc_url = result_json.get("doc_url")
     
     if not doc_url or "docs.google.com" not in doc_url:

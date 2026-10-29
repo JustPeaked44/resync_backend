@@ -146,6 +146,7 @@ def flatten_explanations(flow, sections=None):
                                     "id": f"r-{pair['order']}-{number}",
                                     "section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
                                     "original_sentence": item["original_sentence"],
+                                    "section": item["section"],
                                     "recommended_revision": revision, "recommendation_text": revision,
                                     "recommendation_priority": "High" if score < 50 else "Medium" if score < 70 else "Low",
                                     "target_section_name": item["section"]})
