@@ -122,8 +122,11 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
     required = [(role_a, item.get("sentence")) for item in culprits_a if isinstance(item, dict)]
     required += [(role_b, item.get("sentence")) for item in culprits_b if isinstance(item, dict)]
     required += [(item["section"], item["quote"]) for item in result["highlighted_inconsistencies"]]
-    result["recommendations"] = [item for item in result["recommendations"]
-                                 if item["original_sentence"] in sources[item["section"]]]
+    unique = {}
+    for item in result["recommendations"]:
+        if item["original_sentence"] in sources[item["section"]]:
+            unique.setdefault((item["section"], item["original_sentence"]), item)
+    result["recommendations"] = list(unique.values())
     seen = {(item["section"], item["original_sentence"]) for item in result["recommendations"]}
     for section, sentence in required:
         if not isinstance(sentence, str) or not sentence or "\n" in sentence or sentence not in sources[section]:

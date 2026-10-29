@@ -13,3 +13,16 @@ The API computes this score for scans and `/analyze_v7`; the Modal worker still 
 | Raw `scores.overall_coherence`, `pair_weight`, pointer `overall_coherence` | Model values | Preserved | Existing clients can still read raw outputs. |
 
 Numeric applies when both adjacent section texts contain figures (`NUMERIC_RULE = "both"` in `services/v7_scan.py`). The alternative `"either"` uses at least one section. Citation years, heading labels, page/list numbers, and DOI/URL digits are excluded. Skipped pairs contribute no score. With no scored pairs the manuscript score is `0.0`. Older saved rows without the added fields remain valid.
+
+## P17 paywall and manuscript amendment
+
+| Field or behavior | Previous | Current | Reason |
+|---|---|---|---|
+| Scan credit | One credit deducted on creation and refunded on failure | Scans cost zero credits; the existing rate limit remains | Users can inspect a preview before paying. |
+| `manuscript_sections` | Absent from saved results | Ordered merged `{name, text}` entries for every new scan | Rebuild the Word or Google manuscript from the saved result. |
+| `recommendations[]` | A Gemini subset with pair order but no stable display ID | Every verified culprit and finding quote in each explained worst-12 pair has a recommendation; `id = r-<pair_order>-<n>`, `section`, and `pair_order` identify it | Each source-backed highlight links to one recommendation. Unverified originals are dropped. |
+| `access` | Absent | New results start `{unlocked:false, unlock_cost:1, locked_counts:{sections,recommendations,citations}}`; unlock sets true and counts to zero | The client can render the preview and paywall. Absence on older results means full access. |
+| Locked result routes | Full saved result on GET and synchronous responses; Google preview fetched full source | One projection returns first section text, first two recommendations in manuscript order, all section names, scores, weights, band and counts; it removes later text, citations, pair culprits, findings, pair explanations and summary. The manuscript route uses the same projection. | Prevent paid content from leaking through another result route. |
+| `POST /api/scans/{id}/unlock` | Absent | Authenticated owner can unlock once for one credit. A single database transaction locks the row, debits the wallet, appends the ledger entry, and updates `result_json`; repeat requests return `charged:false`. Insufficient credit returns 402. The credit kill switch unlocks without a charge. | Atomic and idempotent unlock, including concurrent requests. |
+
+Install `migrations/009_scan_unlock.sql` in the Supabase SQL editor before enabling the paywall. Existing results without `access` remain fully visible.

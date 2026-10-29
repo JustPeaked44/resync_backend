@@ -115,6 +115,7 @@ async def explain_flow(sections, flow):
 
 def flatten_explanations(flow, sections=None):
     findings, recommendations = [], []
+    highlighted = set()
     for pair in flow:
         explanation = pair["explanation"]
         if explanation is None:
@@ -140,8 +141,14 @@ def flatten_explanations(flow, sections=None):
                              "evidence_b": next((q["text"] for q in quotes if q["section"] == names[1]), ""),
                              "evidence_quotes": quotes, "evidence_verified": bool(quotes),
                              "finding_status": "material_issue"})
-        for number, item in enumerate(pair_recommendations, 1):
+        number = 0
+        for item in pair_recommendations:
+            key = (item["section"], item["original_sentence"])
+            if key in highlighted:
+                continue
+            highlighted.add(key)
             revision = item["recommended_revision"]
+            number += 1
             recommendations.append({"recommendation_id": str(uuid.uuid4()),
                                     "id": f"r-{pair['order']}-{number}",
                                     "section_a": names[0], "section_b": names[1], "pair_order": pair["order"],

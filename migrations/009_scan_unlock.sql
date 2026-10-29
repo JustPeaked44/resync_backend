@@ -54,6 +54,7 @@ BEGIN
            (v_result->'access') || jsonb_build_object(
                'unlocked', true, 'unlock_cost', 1,
                'locked_counts', jsonb_build_object('sections', 0, 'recommendations', 0, 'citations', 0)))
+           || jsonb_build_object('credits_remaining', v_balance)
      WHERE analysis_run_id = p_analysis_run_id;
 
     RETURN jsonb_build_object('unlocked', true, 'charged', p_charge, 'credits_remaining', v_balance);

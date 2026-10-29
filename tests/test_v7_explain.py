@@ -220,3 +220,17 @@ def test_one_fake_gemini_call_covers_each_verified_passage(monkeypatch):
     assert [r["id"] for r in recommendations] == ["r-1-1", "r-1-2", "r-1-3"]
     assert all(r["original_sentence"] in next(s["text"] for s in sections
                                               if s["name"] == r["target_section_name"]) for r in recommendations)
+
+
+def test_shared_section_passage_has_one_highlight_recommendation():
+    sections = [{"name": "A", "text": "A sentence."}, {"name": "B", "text": "Shared sentence."},
+                {"name": "C", "text": "C sentence."}]
+    flow = assemble_flow(sections, [{"scores": dict(SCORES, pair_weight=1)}] * 2)
+    explanation = {"highlighted_inconsistencies": [], "reference_list": [],
+                   "recommendations": [{"section": "B", "original_sentence": "Shared sentence.",
+                                        "recommended_revision": "Revised shared sentence."}]}
+    flow[0]["explanation"] = explanation
+    flow[1]["explanation"] = explanation
+    _, recommendations = flatten_explanations(flow, sections)
+    assert [(r["id"], r["section"], r["original_sentence"]) for r in recommendations] == [
+        ("r-1-1", "B", "Shared sentence.")]
