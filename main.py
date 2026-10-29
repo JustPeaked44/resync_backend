@@ -7,7 +7,7 @@ import re
 from html import unescape
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 import asyncio
@@ -301,6 +301,8 @@ class RecommendationReport(BaseModel):
     section_a: str
     section_b: str
     pair_order: int
+    category: Optional[Literal["objectives", "methodology", "claims", "numeric"]] = Field(
+        default=None, exclude_if=lambda value: value is None)
     original_sentence: Optional[str]
     recommended_revision: str
     recommendation_text: str

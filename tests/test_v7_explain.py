@@ -62,6 +62,8 @@ def test_fake_gemini_pair_and_summary(monkeypatch):
                                       "Never change model scores") for prompt in prompts)
     assert all("never mention the model, pytorch, or how scores are produced" in prompt.lower() and
                "whole-number percentage (e.g. 80%)" in prompt for prompt in prompts)
+    assert "recommended_revision, category" in prompts[0]
+    assert all(f"{index}." in prompts[0] for index in range(1, 6))
 
 
 def test_summary_failure_returns_null(monkeypatch):
@@ -70,6 +72,58 @@ def test_summary_failure_returns_null(monkeypatch):
 
     monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fail)
     assert asyncio.run(v7_explain.explain_summary([], [])) is None
+
+
+@pytest.mark.parametrize("gemini_category,numeric_applicable,expected", [
+    ("Methodology", False, "methodology"),
+    ("claim_support", False, "claims"),
+    ("claim", False, "claims"),
+    ("numbers", False, "numeric"),
+    ("numeric_consistency", False, "numeric"),
+    ("objectives_alignment", False, "objectives"),
+    ("methodology_fit", False, "methodology"),
+    (None, False, "claims"),
+    ("unrelated", False, "claims"),
+    ("unrelated", True, "numeric"),
+])
+def test_fake_gemini_recommendation_category(monkeypatch, gemini_category, numeric_applicable, expected):
+    scores = dict(SCORES, numeric_applicable=numeric_applicable, claim_support=0.2,
+                  numeric_consistency=0.1)
+    raw = {"recommendations": [{"section": "A", "original_sentence": "A text.",
+                                "recommended_revision": "A text, linked to B.",
+                                "category": gemini_category}]}
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(raw)}]}}]}
+
+    async def fake(_):
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    result = asyncio.run(v7_explain.explain_pair("A", "A text.", "B", "B text.", scores, [], []))
+    assert result["recommendations"][0]["category"] == expected
+
+
+def test_missing_gemini_revision_gets_weakest_applicable_category(monkeypatch):
+    async def fake(_):
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+        return Response()
+
+    monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
+    scores = dict(SCORES, numeric_applicable=False, numeric_consistency=0.01, methodology_fit=0.1)
+    result = asyncio.run(v7_explain.explain_pair("A", "A text.", "B", "B text.", scores,
+                                                 [{"sentence": "A text."}], []))
+    assert result["recommendations"][0]["category"] == "methodology"
+    assert result["recommendations"][0]["recommended_revision"].startswith("Review how")
 
 
 @pytest.mark.parametrize("raw,issues,recommendations,references", [

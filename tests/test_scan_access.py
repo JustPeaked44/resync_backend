@@ -21,9 +21,9 @@ def test_locked_view_withholds_report_content_everywhere():
             {"id": "r-1-3", "section": "Results", "original_sentence": "Third source.",
              "recommended_revision": "HIDDEN_THIRD_REVISION"},
             {"id": "r-1-2", "section": "Results", "original_sentence": "Second source.",
-             "recommended_revision": "Visible second revision."},
+             "recommended_revision": "Visible second revision.", "category": "claims"},
             {"id": "r-1-1", "section": "Results", "original_sentence": "First source.",
-             "recommended_revision": "Visible first revision."}],
+             "recommended_revision": "Visible first revision.", "category": "objectives"}],
         "citations": [{"raw": "HIDDEN_CITATION_ENTRY"}], "citations_audited": 1,
         "inconsistencies_found": 1,
         "inconsistencies": [{"evidence_a": "HIDDEN_FINDING_QUOTE", "explanation_why": "HIDDEN_FINDING_EXPLANATION"}],
@@ -45,6 +45,7 @@ def test_locked_view_withholds_report_content_everywhere():
         assert len(projected["placeholder"]["heading"]) == len(source["name"])
         assert projected["placeholder"]["paragraphs"]
     assert [r["id"] for r in locked["recommendations"]] == ["r-1-1", "r-1-2"]
+    assert [r["category"] for r in locked["recommendations"]] == ["objectives", "claims"]
     assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1}
     assert locked["citations"] == locked["inconsistencies"] == []
     assert locked["manuscript_flow"][0]["scores"]["overall_coherence"] == 0.4

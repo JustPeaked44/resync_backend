@@ -149,7 +149,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                         "recommendations", "reference_list"}
     assert set(pair["explanation"]["coherence_scores"]) == {"overall", "objectives", "methodology", "numeric", "claims"}
     assert set(pair["explanation"]["highlighted_inconsistencies"][0]) == {"section", "quote", "what", "why"}
-    assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "recommended_revision"}
+    assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "recommended_revision", "category"}
     assert pair["explanation"]["reference_list"] == [{"section": "Related Studies", "sentence": "A source sentence with several words."}]
     assert set(payload["inconsistencies"][0]) == {"section_a", "section_b", "pair_order", "coherence_score",
                                                   "explanation_what", "explanation_why", "suggested_fix",
@@ -158,7 +158,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     assert payload["inconsistencies"][0]["inconsistency_id"]
     assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
     assert set(payload["recommendations"][0]) == {"id", "section", "recommendation_id", "section_a", "section_b",
-                                                "pair_order", "original_sentence", "recommended_revision",
+                                                "pair_order", "category", "original_sentence", "recommended_revision",
                                                 "recommendation_text", "recommendation_priority"}
     assert payload["recommendations"][0]["recommendation_id"]
     assert payload["recommendations"][0]["id"] == "r-1-1"
@@ -187,11 +187,15 @@ def test_saved_legacy_row_without_new_fields_deserializes(assembled_scan):
         pair.pop("numeric_applicable")
     legacy["score_breakdown"] = dict(payload["score_breakdown"])
     legacy["score_breakdown"].pop("dimension_weights")
+    legacy["recommendations"] = [dict(item) for item in payload["recommendations"]]
+    for item in legacy["recommendations"]:
+        item.pop("category")
     loaded = main.ScanResponse.model_validate(legacy)
     assert loaded.result_version is None
     assert loaded.manuscript_sections is None
     assert loaded.access is None
     assert loaded.score_breakdown.dimension_weights is None
+    assert all("category" not in item for item in loaded.model_dump(mode="json")["recommendations"])
     assert main.ScanResponse.model_validate(dict(legacy, result_version=None)).result_version is None
 
 

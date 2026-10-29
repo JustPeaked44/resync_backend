@@ -30,8 +30,9 @@ Culprit sentences in A: {culprits_a}
 Culprit sentences in B: {culprits_b}
 Return JSON with exactly four top-level keys: coherence_scores (copy model scores),
 highlighted_inconsistencies (array of objects with section, quote, what, why),
-recommendations (array of objects with section, original_sentence, recommended_revision),
+recommendations (array of objects with section, original_sentence, recommended_revision, category),
 reference_list (array of objects with section, sentence).
+For each recommendation, category names the score part its revision fixes: objectives (alignment with aims), methodology (fit of methods), claims (support for claims), or numeric (consistency of figures). Use exactly one of these four values.
 Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section. If no issue is supported, return empty arrays. Recommend only revisions justified by the supplied text.
 Return one recommendation for EACH culprit sentence supplied above and EACH highlighted finding quote that verifies in its named section. Do not combine passages. Use the exact culprit or quote as original_sentence. Return all of these in this same JSON call.
 A recommended revision must preserve the original sentence's meaning and repair only its logical link to the neighboring section; never adopt the neighboring section's topic."""
@@ -46,6 +47,22 @@ def coherence_scores(scores):
     return {"overall": scores["overall_coherence"], "objectives": scores["objectives_alignment"],
             "methodology": scores["methodology_fit"], "numeric": scores["numeric_consistency"],
             "claims": scores["claim_support"]}
+
+
+CATEGORY_SCORES = {"objectives": "objectives_alignment", "methodology": "methodology_fit",
+                   "claims": "claim_support", "numeric": "numeric_consistency"}
+CATEGORY_ALIASES = {"claim": "claims", "claim_support": "claims", "numbers": "numeric",
+                    "numeric_consistency": "numeric", "objectives_alignment": "objectives",
+                    "methodology_fit": "methodology"}
+
+
+def recommendation_category(value, scores):
+    category = value.strip().lower() if isinstance(value, str) else ""
+    category = CATEGORY_ALIASES.get(category, category)
+    if category in CATEGORY_SCORES:
+        return category
+    applicable = (key for key in CATEGORY_SCORES if key != "numeric" or scores.get("numeric_applicable"))
+    return min(applicable, key=lambda key: scores[CATEGORY_SCORES[key]])
 
 
 def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
@@ -91,7 +108,8 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b):
                 and revision != "No major inconsistencies found."):
             recommendations.append({"section": section,
                                     "original_sentence": original,
-                                    "recommended_revision": plain_text(revision)})
+                                    "recommended_revision": plain_text(revision),
+                                    "category": recommendation_category(item.get("category"), scores)})
     references = []
     for item in raw.get("reference_list", []) if isinstance(raw.get("reference_list"), list) else []:
         if isinstance(item, dict):
@@ -139,6 +157,7 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
         if (section, sentence) not in seen:
             # A missed Gemini item still gets a source-backed review action without inventing a revision.
             result["recommendations"].append({"section": section, "original_sentence": sentence,
+                                              "category": recommendation_category(None, scores),
                                               "recommended_revision": f"Review how this sentence connects to the neighboring section: {sentence}"})
             seen.add((section, sentence))
     return result

@@ -98,7 +98,8 @@ async def explain_flow(sections, flow):
     async def explain(pair):
         async with semaphore:
             index = pair["order"] - 1
-            scores = dict(pair["scores"], pair_weight=pair["pair_weight"], pair_score=pair["pair_score"])
+            scores = dict(pair["scores"], pair_weight=pair["pair_weight"], pair_score=pair["pair_score"],
+                          numeric_applicable=pair["numeric_applicable"])
             culprits = pair["culprit_sentences"]
             pair["explanation"] = await explain_pair(
                 pair["section_a"], sections[index]["text"], pair["section_b"], sections[index + 1]["text"],
@@ -114,6 +115,8 @@ async def explain_flow(sections, flow):
 
 
 def flatten_explanations(flow, sections=None):
+    from services.v7_explain import recommendation_category
+
     findings, recommendations = [], []
     highlighted = set()
     for pair in flow:
@@ -122,6 +125,8 @@ def flatten_explanations(flow, sections=None):
             continue
         names = (pair["section_a"], pair["section_b"])
         score = round(pair["pair_score"] * 100, 2)
+        fallback_category = recommendation_category(
+            None, dict(pair["scores"], numeric_applicable=pair["numeric_applicable"]))
         pair_recommendations = sorted(explanation["recommendations"],
                                       key=lambda r: (names.index(r["section"]),
                                                      sections[pair["order"] - 1 + names.index(r["section"])]["text"].find(r["original_sentence"])
@@ -154,6 +159,7 @@ def flatten_explanations(flow, sections=None):
                                     "section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
                                     "original_sentence": item["original_sentence"],
                                     "section": item["section"],
+                                    "category": item.get("category", fallback_category),
                                     "recommended_revision": revision, "recommendation_text": revision,
                                     "recommendation_priority": "High" if score < 50 else "Medium" if score < 70 else "Low",
                                     "target_section_name": item["section"]})
