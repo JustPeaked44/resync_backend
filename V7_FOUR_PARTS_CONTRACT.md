@@ -34,3 +34,16 @@ Locked `manuscript_sections` still expose every `name`, the first section's `tex
 ## Recommendation category
 
 Each new `recommendations[]` item has `category`: `objectives`, `methodology`, `claims`, or `numeric`. It identifies which four-part score the recommended revision fixes, so the client can use the matching card colour for its highlight. Gemini supplies it in the existing per-pair call. Case-insensitive values and the aliases `objectives_alignment`, `methodology_fit`, `claim`/`claim_support`, and `numbers`/`numeric_consistency` are normalized. Missing or invalid values, including review recommendations added when Gemini omits a required passage, use the pair's weakest applicable dimension; numeric participates only when `numeric_applicable` is true. The locked projection preserves `category` on its two visible recommendations. Older stored results are not backfilled and may omit the field.
+
+## P36 Gemini rate limit and scan status
+
+Every Gemini request, per-pair, summary and retries included, takes a slot in a process-wide rolling 60 s window of `GEMINI_RPM` requests (default 15). Concurrency stays capped at 4 per scan. On HTTP 429, or 503 whose body says `overloaded`, the call waits for the server's `RetryInfo.retryDelay` or `Retry-After`, or for a window slot, then retries. One call waits at most about 180 s in total; past that it falls back exactly as before. Scores, prompts and normalization are unchanged.
+
+`GET /api/scans/{id}` while `status` is `processing` adds two nullable fields:
+
+| Field | Value |
+|---|---|
+| `status_message_level` | `"info"` when the window is at least 80% full (12 of 15 by default) or the scan needs more Gemini calls than the window allows; `"wait"` while a call waits for a reset or after a 429/503 |
+| `status_message` | `"The AI is busy right now, so your scan may take a little longer than usual."` for `info`; `"Waiting for the AI to be ready again (about N seconds)."` for `wait` |
+
+Both are `null` once the AI is back to normal and on `completed` or `failed` responses. The state is held in process memory keyed by `analysis_run_id`, so no migration is needed; a server restart clears it, and it is only visible to pollers on the instance running the scan.

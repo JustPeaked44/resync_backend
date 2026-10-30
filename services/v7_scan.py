@@ -131,6 +131,7 @@ def pair_pointer(pair):
 
 
 async def explain_flow(sections, flow):
+    from services import gemini
     from services.v7_explain import explain_pair, explain_summary
 
     semaphore = asyncio.Semaphore(4)
@@ -145,12 +146,17 @@ async def explain_flow(sections, flow):
                 pair["section_a"], sections[index]["text"], pair["section_b"], sections[index + 1]["text"],
                 scores, culprits["section_a"], culprits["section_b"])
 
-    await asyncio.gather(*(explain(pair) for pair in select_pairs_to_explain(flow)))
-    findings, recommendations = flatten_explanations(flow, sections)
-    scored = [p for p in flow if p["pair_score"] is not None]
-    synthesis = {"summary": await explain_summary(flow, findings),
-                 "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
-                 "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None}
+    pairs = select_pairs_to_explain(flow)
+    gemini.expect_calls(len(pairs) + 1)  # one call per explained pair, plus the summary
+    try:
+        await asyncio.gather(*(explain(pair) for pair in pairs))
+        findings, recommendations = flatten_explanations(flow, sections)
+        scored = [p for p in flow if p["pair_score"] is not None]
+        synthesis = {"summary": await explain_summary(flow, findings),
+                     "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
+                     "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None}
+    finally:
+        gemini.expect_calls(0)
     return findings, recommendations, synthesis
 
 

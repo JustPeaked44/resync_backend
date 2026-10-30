@@ -32,6 +32,7 @@ from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_fl
                               final_score, band)
 from services.reference_parser import extract_intext_citations
 from services.v7_explain import plain_text
+from services.gemini import scan_context, scan_status_message
 from services.scan_access import locked_scan_view
 
 logger = logging.getLogger("resync.main")
@@ -704,6 +705,8 @@ class ScanStatusResponse(BaseModel):
     analysis_run_id: str
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
+    status_message: Optional[str] = Field(default=None, description="Plain-language AI wait or busy notice while processing")
+    status_message_level: Optional[str] = Field(default=None, description="info | wait, matching status_message")
 
 
 async def _save_completed_result(result: ScanResponse) -> None:
@@ -742,6 +745,7 @@ async def _run_scan_job(
     to race against).
     """
     async with SCAN_SLOT:
+        scan_context.set(analysis_run_id)
         try:
             result = await _execute_scan_pipeline(
                 req,
@@ -1068,7 +1072,9 @@ async def get_scan_status(
             result=locked_scan_view(result_json)
         )
 
-    return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id)
+    level, message = scan_status_message(analysis_run_id)
+    return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id,
+                              status_message=message, status_message_level=level)
 
 
 @app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])
