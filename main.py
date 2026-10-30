@@ -31,8 +31,8 @@ from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
                               final_score, band)
 from services.reference_parser import extract_intext_citations
-from services.v7_explain import plain_text
 from services.gemini import scan_context, scan_status_message
+from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
 
 logger = logging.getLogger("resync.main")
@@ -523,8 +523,7 @@ async def _execute_scan_pipeline(
             detail="No valid manuscript provided. Please provide a public Google Docs link or upload a .docx/.pdf file."
         )
 
-    derived_title = (plain_text(next((line for line in raw_text.splitlines() if line.strip()), ""))[:120]
-                     if req.doc_url and not req.manuscript_title else None)
+    derived_title = derive_title(raw_text) if req.doc_url and not req.manuscript_title else None
 
     # ------------------------------------------------------------------
     # Step 2 – Parser
