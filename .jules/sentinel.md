@@ -1,0 +1,4 @@
+## 2025-02-23 - SSRF via HTTP Redirects
+**Vulnerability:** The application was vulnerable to Server-Side Request Forgery (SSRF) when handling user-provided URLs in `services/citation.py`. The initial URL's host was checked, but `httpx.AsyncClient` was configured with `follow_redirects=True`, allowing an attacker to bypass the protection by providing a URL that redirects to an internal or private address.
+**Learning:** Checking the host of the initial URL is insufficient if the HTTP client automatically follows redirects without checking the new target. The `httpx` library does not expose a simple per-hop redirect hook by default.
+**Prevention:** Use an `event_hooks` configuration on the `httpx.AsyncClient` that fires for *every* request (e.g., `event_hooks={"request": [_verify_request_host]}`). Ensure the hook throws an `httpx.ConnectError(request=request)` to fail securely if a non-public host is detected.
