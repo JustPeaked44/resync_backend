@@ -320,11 +320,17 @@ def test_bridges_are_validated_capped_and_listed_first():
     _, recommendations = flatten_explanations(flow)
     assert [r["kind"] for r in recommendations] == ["add", "add"]
     assert recommendations[0]["original_sentence"] is None and recommendations[0]["placement"] == "start"
-    # severity "None" (no real issue) clears bridges, findings and advice, whatever else the model returned
     far = v7_explain.normalize_explanation(raw, low, "A", "A text here.", "B", "B text here.", adjacent=False)
     assert far["severity"] == "Moderate" and far["bridges"] == []        # a linking sentence only fits neighboring sections
-    cleared = v7_explain.normalize_explanation(dict(raw, severity="None"), low, "A", "t", "B", "t")
-    assert cleared["severity"] == "None" and cleared["bridges"] == []
+    # severity "None" (no real issue) clears findings and advice, whatever else the model returned. A loosely linked
+    # neighbor pair still keeps its linking sentences as a soft suggestion; a well linked one keeps nothing.
+    loose = v7_explain.normalize_explanation(dict(raw, severity="None"), low, "A", "t", "B", "t")
+    assert loose["severity"] == "None" and loose["highlighted_inconsistencies"] == [] and loose["recommendations"] == []
+    assert [b["placement"] for b in loose["bridges"]] == ["start", "end"]
+    tight = v7_explain.normalize_explanation(dict(raw, severity="None"), dict(SCORES, overall_coherence=0.8), "A", "t", "B", "t")
+    assert tight["severity"] == "None" and tight["bridges"] == []
+    not_neighbors = v7_explain.normalize_explanation(dict(raw, severity="None"), low, "A", "t", "B", "t", adjacent=False)
+    assert not_neighbors["bridges"] == []
 
 
 def test_a_transient_gemini_failure_is_retried_and_exhausted_retries_leave_severity_unknown(monkeypatch):
