@@ -62,9 +62,9 @@ def truncate_text(text, max_chars=6000):
 def rpm():
     """Gemini requests allowed per rolling minute (free tier default)."""
     try:
-        return max(1, int(os.getenv("GEMINI_RPM", "15")))
+        return max(1, int(os.getenv("GEMINI_RPM", "14")))
     except ValueError:
-        return 15
+        return 14
 
 
 class CallLimiter:

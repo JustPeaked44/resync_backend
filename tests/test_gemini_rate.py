@@ -56,7 +56,7 @@ def script_sends(monkeypatch, clock, responses, sent_at=None):
     monkeypatch.setattr(gemini, "_send", fake_send)
 
 
-def test_twenty_five_calls_never_exceed_fifteen_per_rolling_minute(monkeypatch, clock):
+def test_twenty_five_calls_never_exceed_fourteen_per_rolling_minute(monkeypatch, clock):
     sent_at = []
     script_sends(monkeypatch, clock, [ok_response()], sent_at)
 
@@ -66,8 +66,15 @@ def test_twenty_five_calls_never_exceed_fifteen_per_rolling_minute(monkeypatch, 
     asyncio.run(run())
     assert len(sent_at) == 25
     for start in sent_at:
-        assert sum(start <= t < start + 60 for t in sent_at) <= 15
-    assert sum(clock.waits) > 0  # the 16th to 25th calls really waited
+        assert sum(start <= t < start + 60 for t in sent_at) <= 14
+    assert sum(clock.waits) > 0  # the 15th to 25th calls really waited
+
+
+def test_rpm_default_and_env_override(monkeypatch):
+    monkeypatch.delenv("GEMINI_RPM", raising=False)
+    assert gemini.rpm() == 14
+    monkeypatch.setenv("GEMINI_RPM", "9")
+    assert gemini.rpm() == 9
 
 
 def test_429_with_retry_delay_waits_seven_seconds_then_succeeds(monkeypatch, clock):
