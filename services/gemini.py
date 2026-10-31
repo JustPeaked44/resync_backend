@@ -15,6 +15,20 @@ RATE_WINDOW_SECONDS = 60.0
 # A single Gemini call never waits longer than this in total across limiter waits and retry delays.
 RETRY_CAP_SECONDS = 180.0
 BUSY_MESSAGE = "The AI is busy right now, so your scan may take a little longer than usual."
+QUOTA_RECHECK_SECONDS = 600
+TRANSPORT_ATTEMPTS = 3  # a dropped connection or timeout is retried this many times in all
+
+
+class GeminiQuotaExhausted(Exception):
+    """The project's daily free quota is used up. Waiting a few seconds cannot help, so callers stop at once."""
+
+
+_quota_blocked_until = 0.0
+
+
+def quota_blocked():
+    return time.monotonic() < _quota_blocked_until
+
 # Set per scan job (see main._run_scan_job) so the limiter can report status to that scan's poller.
 scan_context = contextvars.ContextVar("gemini_scan_id", default=None)
 
@@ -29,6 +43,15 @@ def verify_quote(quote, text):
         return "", False
     normalized = lambda value: _WHITESPACE.sub(" ", value.translate(_QUOTES)).strip().lower()
     return (quote, True) if normalized(quote) in normalized(text) else ("", False)
+
+
+def truncate_tail(text, max_chars=3500):
+    """The END of a section, starting on a whole word: the part that connects to whatever follows."""
+    cleaned = text.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cut = cleaned[-max_chars:]
+    return "[...] " + cut[cut.find(" ") + 1:]
 
 
 def truncate_text(text, max_chars=6000):
@@ -141,15 +164,31 @@ async def _send(payload, key):
 
 
 async def post_gemini_with_retry(payload):
+    global _quota_blocked_until
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     scan_id = scan_context.get()
+    if quota_blocked():  # already known to be out of quota: fail at once instead of sending more doomed requests
+        raise GeminiQuotaExhausted("Gemini daily quota is exhausted")
     spent = 0.0
     response = None
+    transport_failures = 0
     while True:
         spent = await LIMITER.acquire(scan_id, spent)
         if spent is None:
             break
-        response = await _send(payload, key)
+        try:
+            response = await _send(payload, key)
+        except httpx.TransportError:  # timeout or dropped connection
+            transport_failures += 1
+            if transport_failures >= TRANSPORT_ATTEMPTS:
+                raise
+            await LIMITER.pause(scan_id, 2.0 * transport_failures)
+            spent += 2.0 * transport_failures
+            continue
+        if response.status_code == 429 and "PerDay" in (getattr(response, "text", "") or ""):
+            _quota_blocked_until = time.monotonic() + QUOTA_RECHECK_SECONDS
+            logging.getLogger("resync.gemini").warning("Gemini daily quota exhausted; pausing AI reviews for %ss", QUOTA_RECHECK_SECONDS)
+            raise GeminiQuotaExhausted("Gemini daily quota is exhausted")
         if not _is_retryable(response):
             return response
         logging.getLogger("resync.gemini").warning("Gemini returned %s", response.status_code)

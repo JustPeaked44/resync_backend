@@ -29,7 +29,7 @@ from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
 from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
-                              final_score, band)
+                              four_part_score, manuscript_score, band, MIN_SECTION_WORDS)
 from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
 from services.manuscript_title import derive_title
@@ -182,8 +182,9 @@ async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authentic
 
         manuscript_flow = assemble_flow(sections, result["pairs"])
         findings, recommendations, synthesis = await explain_flow(sections, manuscript_flow)
-    score, dimensions, dimension_weights, critical_penalty = final_score(manuscript_flow)
-    return {"result_version": "v7", "manuscript_score": score, "critical_penalty": critical_penalty,
+    _, dimensions, dimension_weights = four_part_score(manuscript_flow)
+    score, breakdown = manuscript_score(manuscript_flow, result.get("transition_averages"))
+    return {"result_version": "v7", "manuscript_score": score, "dimension_breakdown": breakdown,
             "dimensions": dimensions, "dimension_weights": dimension_weights,
             "manuscript_flow": manuscript_flow, "inconsistencies": findings,
             "recommendations": recommendations, "ai_synthesis": synthesis}
@@ -307,6 +308,8 @@ class RecommendationReport(BaseModel):
         default=None, exclude_if=lambda value: value is None)
     original_sentence: Optional[str]
     issue: str = ""
+    kind: Literal["edit", "add"] = "edit"
+    placement: Optional[Literal["start", "end"]] = Field(default=None, exclude_if=lambda value: value is None)
     recommended_revision: str
     recommendation_text: str
     recommendation_priority: str
@@ -336,7 +339,7 @@ class ScoreBreakdown(BaseModel):
     citation_integrity_score: Optional[float] = None
     dimensions: Dict[str, Optional[float]]
     dimension_weights: Optional[Dict[str, float]] = None
-    critical_penalty: float = 0.0
+    dimension_breakdown: Optional[Dict[str, Dict[str, Any]]] = None
     citation_detail: Dict[str, Any]
 
 
@@ -369,6 +372,7 @@ class ScanResponse(BaseModel):
     citations_audited: int
     citations: List[CitationReport]
     score_breakdown: Optional[ScoreBreakdown] = None
+    dimension_breakdown: Optional[Dict[str, Dict[str, Any]]] = None
     ai_text_indicator: Optional[AITextIndicatorReport] = None
     db_save_status: str
     notification_dispatched: bool
@@ -541,25 +545,33 @@ async def _execute_scan_pipeline(
     # Score physical neighbors after merging repeated literal headings.
     # A reference list is not prose, so it has no meaningful link to the section before it.
     sections = [section for section in merge_repeated_sections(parsed_sections, section_order)
-                if section_roles.get(section["name"]) != "references"]
-    ml_result = await asyncio.to_thread(ml_client.analyze_v7, sections)
-    manuscript_flow = assemble_flow(sections, ml_result["pairs"])
-    inconsistencies_data, recommendations, ai_synthesis = await explain_flow(sections, manuscript_flow)
-    overall_score, dimensions, dimension_weights, critical_penalty = final_score(manuscript_flow)
-    ai_text_result = await asyncio.to_thread(
-        ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}
-    )
-
-    # ------------------------------------------------------------------
-    # Step 5 – Citation Audit
-    # ------------------------------------------------------------------
+                if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS]
+    # The citation audit is network-bound and independent of the model, so it starts now and runs while the local
+    # model rates the sections. The Gemini reviews and the AI-text check then run at the same time too; nothing is
+    # saved until all of them have finished (Step 6).
     # No 20,000-char slice here anymore — that cap silently truncated a
     # real 150-reference APA list mid-entry. CitationAuditService applies
     # its own much larger DoS-guard cap (150,000 chars) internally.
     references_text = _references_text(parsed_sections, section_roles)
-    citation_audit_result: Dict[str, Any] = await CitationAuditService.audit_citations(
-        references_text, body_text=raw_text
-    )
+    citation_task = asyncio.create_task(CitationAuditService.audit_citations(references_text, body_text=raw_text))
+    try:
+        # The model rates every pair of sections; section roles tell it which far-apart pairs should agree.
+        ml_result = await asyncio.to_thread(ml_client.analyze_v7, [{**section, "role": section_roles.get(section["name"])} for section in sections])
+        manuscript_flow = assemble_flow(sections, ml_result["pairs"])
+        (inconsistencies_data, recommendations, ai_synthesis), ai_text_result = await asyncio.gather(
+            explain_flow(sections, manuscript_flow),
+            asyncio.to_thread(ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}),
+        )
+        citation_audit_result: Dict[str, Any] = await citation_task
+    except BaseException:
+        citation_task.cancel()  # do not leave the audit running if the scan failed
+        raise
+    _, dimensions, dimension_weights = four_part_score(manuscript_flow)
+    overall_score, breakdown = manuscript_score(manuscript_flow, ml_result.get("transition_averages"))
+
+    # ------------------------------------------------------------------
+    # Step 5 – Citation Audit (result of the task started above)
+    # ------------------------------------------------------------------
     citations: List[Dict[str, Any]] = citation_audit_result["citations"]
     citation_crossmatch: Dict[str, Any] = citation_audit_result["crossmatch"]
 
@@ -583,7 +595,7 @@ async def _execute_scan_pipeline(
         "citation_integrity_score": citation_integrity_result.score,
         "dimensions": dimensions,
         "dimension_weights": dimension_weights,
-        "critical_penalty": critical_penalty,
+        "dimension_breakdown": breakdown,
         "citation_detail": {
             "well_formed_ratio": citation_integrity_result.well_formed_ratio,
             "link_resolution_rate": citation_integrity_result.link_resolution_rate,
@@ -681,6 +693,7 @@ async def _execute_scan_pipeline(
             citation_is_cited_in_text=c.get("citation_is_cited_in_text"),
         ) for c in citations],
         score_breakdown=ScoreBreakdown(**score_breakdown_dict),
+        dimension_breakdown=breakdown,
         ai_text_indicator=AITextIndicatorReport(**ai_text_result),
         credits_remaining=credits_remaining,
         db_save_status=db_save_status,

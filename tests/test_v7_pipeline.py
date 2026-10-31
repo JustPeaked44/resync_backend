@@ -100,12 +100,12 @@ def assembled_scan(monkeypatch):
 
 def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     payload, captured, sections = assembled_scan
-    assert captured["ml_sections"] == [
+    assert [{"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]] == [
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
-    assert payload["manuscript_sections"] == captured["ml_sections"]
-    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 66.67
-    assert payload["score_breakdown"]["band"] == "Needs Revision"
+    assert payload["manuscript_sections"] == [{"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]]
+    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 98.33  # one Moderate issue costs 5 on Logical Support; Numeric is N/A
+    assert payload["score_breakdown"]["band"] == "Strong"
     assert payload["score_breakdown"]["dimensions"] == {
         "objectives_alignment": 0.7, "methodology_fit": 0.8,
         "numeric_consistency": None, "claim_support": 0.5}
@@ -122,7 +122,7 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
     assert payload["ai_synthesis"]["strongest_pair"]["score"] == 66.67
     assert payload["ai_synthesis"]["strongest_pair"]["overall_coherence"] == 0.6
-    assert captured["save"]["coherence_score"] == 66.67
+    assert captured["save"]["coherence_score"] == 98.33
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
 
 
@@ -142,18 +142,19 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
             "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
         "overall_coherence_score", "sections_analyzed", "manuscript_sections", "access", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
-        "score_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
+        "score_breakdown", "dimension_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
         "credits_remaining"}
     assert payload["result_version"] == "v7"
     assert len(payload["manuscript_flow"]) == 1
     pair = payload["manuscript_flow"][0]
     assert set(pair) == {"order", "section_a", "section_b", "pair_weight", "pair_score", "numeric_applicable", "scores",
-                         "skipped_reason", "culprit_sentences", "explanation"}
+                         "skipped_reason", "culprit_sentences", "explanation", "severity", "failed_dimension",
+                         "index_a", "index_b", "adjacent"}
     assert set(pair["scores"]) == {"objectives_alignment", "methodology_fit", "numeric_consistency",
                                    "claim_support", "overall_coherence"}
     assert set(pair["culprit_sentences"]) == {"section_a", "section_b"}
-    assert set(pair["explanation"]) == {"coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies",
-                                        "recommendations", "reference_list"}
+    assert set(pair["explanation"]) == {"severity", "failed_dimension", "coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies",
+                                        "recommendations", "reference_list", "bridges"}
     assert set(pair["explanation"]["coherence_scores"]) == {"overall", "objectives", "methodology", "numeric", "claims"}
     assert set(pair["explanation"]["highlighted_inconsistencies"][0]) == {"section", "quote", "what", "why"}
     assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "issue", "recommended_revision", "category"}
@@ -166,14 +167,14 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
     assert set(payload["inconsistencies"][0]["evidence_quotes"][0]) == {"section", "text"}
     assert set(payload["recommendations"][0]) == {"id", "section", "recommendation_id", "section_a", "section_b",
                                                 "pair_order", "category", "original_sentence", "recommended_revision",
-                                                "recommendation_text", "recommendation_priority", "issue"}
+                                                "recommendation_text", "recommendation_priority", "issue", "kind"}
     assert payload["recommendations"][0]["recommendation_id"]
     assert payload["recommendations"][0]["id"] == "r-1-1"
-    assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair"}
+    assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair", "review_status"}
     for key in ("strongest_pair", "weakest_pair"):
         assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}
     assert set(payload["score_breakdown"]) == {"overall_score", "band", "cross_chapter_coherence_score",
-                                               "citation_integrity_score", "dimensions", "dimension_weights", "critical_penalty", "citation_detail"}
+                                               "citation_integrity_score", "dimensions", "dimension_weights", "dimension_breakdown", "citation_detail"}
     assert set(payload["score_breakdown"]["dimensions"]) == {"objectives_alignment", "methodology_fit",
                                                                "numeric_consistency", "claim_support"}
     assert set(payload["score_breakdown"]["dimension_weights"]) == set(payload["score_breakdown"]["dimensions"])
@@ -224,7 +225,8 @@ def test_analyze_v7_uses_same_four_part_contract(monkeypatch):
         {"name": "B", "text": "Results reached 78% among the participants."}])
     result = asyncio.run(main.analyze_v7(request, user_id="user"))
     assert result["result_version"] == "v7"
-    assert result["manuscript_score"] == 48.75 and result["critical_penalty"] == 10  # 58.75 minus the critical-flaw penalty
+    assert result["manuscript_score"] == 100.0   # explain_flow is faked, so no pair carries an issue
+    assert result["dimension_breakdown"]["evidence_consistency"]["score"] == 100
     assert result["dimensions"] == {"objectives_alignment": 1.0, "methodology_fit": 0.5,
                                     "numeric_consistency": 0.1, "claim_support": 0.75}
     assert set(result["dimension_weights"].values()) == {0.25}
