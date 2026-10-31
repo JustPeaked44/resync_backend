@@ -1,6 +1,7 @@
 """Daily-quota fail-fast and dropped-connection retries, layered on the rate limiter tested in test_gemini_rate.py."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -17,7 +18,10 @@ class Response:
 
 
 class QuotaResponse(Response):
-    text = '{"error": {"details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}'
+    text = '{"error": {"details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}'
+
+    def json(self):
+        return json.loads(self.text)
 
 
 def fake_client(outcomes, calls):
@@ -78,6 +82,15 @@ def test_a_daily_quota_stops_immediately_and_later_calls_do_not_even_try(monkeyp
     with pytest.raises(gemini.GeminiQuotaExhausted):
         asyncio.run(gemini.post_gemini_with_retry({}))
     assert len(calls) == 1                                     # the second call never reached the network
+
+
+def test_unstructured_daily_word_does_not_stop_minute_retry(monkeypatch):
+    response = httpx.Response(429, json={"error": {"message": "PerDay is mentioned here", "details": [
+        {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [
+            {"quotaId": "GenerateRequestsPerMinutePerProjectPerModel"}]}]}})
+    result, calls = run([response, Response(200)], monkeypatch)
+    assert result.status_code == 200 and len(calls) == 2
+    assert not gemini.quota_blocked()
 
 
 def test_truncate_tail_keeps_the_end_on_a_whole_word():

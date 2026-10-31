@@ -206,7 +206,7 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
             result = normalize_explanation(await _generate(prompt), scores, role_a, text_a, role_b, text_b, adjacent)
             break
         except gemini.GeminiQuotaExhausted:
-            logger.warning("v7 Gemini daily quota exhausted; %s -> %s left unreviewed", role_a, role_b)
+            logger.warning("v7 Gemini quota exhausted; %s -> %s left unreviewed", role_a, role_b)
             break  # no point retrying until the quota resets
         except Exception:
             logger.exception("v7 Gemini pair explanation failed for %s -> %s (attempt %s of %s)", role_a, role_b, attempt, EXPLAIN_ATTEMPTS)

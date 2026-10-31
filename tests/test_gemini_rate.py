@@ -117,7 +117,7 @@ def test_status_message_is_wait_during_retry_and_cleared_after(monkeypatch, cloc
         return await gemini.post_gemini_with_retry({})
 
     asyncio.run(run())
-    assert seen == [("wait", "Waiting for the AI to be ready again (about 7 seconds).")]
+    assert seen == [("wait", gemini.BUSY_MESSAGE)]
     assert gemini.scan_status_message("scan-1") == (None, None)
 
 

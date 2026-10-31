@@ -1,5 +1,5 @@
 import asyncio
-from services import v7_explain
+from services import v7_explain, gemini
 from services.v7_scan import (manuscript_score, assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs)
 import pytest
@@ -102,6 +102,25 @@ def test_explanation_cap_and_single_summary(monkeypatch):
     assert findings == []
     assert recommendations == []  # no generic advice is invented for pairs Gemini found nothing in
     assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 30
+
+
+def test_unfinished_rate_limited_review_is_partial(monkeypatch):
+    sections = [{"name": "A", "text": "enough words for a valid section"},
+                {"name": "B", "text": "enough words for a valid section"}]
+    flow = assemble_flow(sections, [{"scores": {"pair_weight": 1, "overall_coherence": 0.2,
+        "objectives_alignment": 0.2, "methodology_fit": 0.2,
+        "numeric_consistency": 0.2, "claim_support": 0.2}}])
+
+    async def unavailable(*_, **__):
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_pair", unavailable)
+    monkeypatch.setattr(v7_explain, "explain_summary", unavailable)
+    monkeypatch.setattr(gemini, "rate_limited", lambda: True)
+    _, _, synthesis = asyncio.run(explain_flow(sections, flow))
+    assert synthesis["review_status"] == {
+        "status": "partial", "unreviewed": 1, "reason": "rate_limited",
+        "message": "Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later."}
 
 
 def pair_for_score(severity=None, dimension=None, numeric=True, order=1, overall=0.5):
