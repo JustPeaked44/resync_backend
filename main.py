@@ -5,10 +5,11 @@ import uuid
 import logging
 import re
 from html import unescape
-from collections import defaultdict
+from collections import defaultdict, deque
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
+from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,6 +79,48 @@ def read_root():
 # pipeline (not just the CPU-bound steps) so concurrent scans do not
 # multiply the Gemini pair and summary request rate.
 SCAN_SLOT = asyncio.Semaphore(1)
+# shortcut: tickets live in one process; use durable storage if scans must survive restarts or multiple workers.
+_scan_queue = deque()
+_scan_durations = deque(maxlen=20)
+_scan_worker = None
+_running_scan_started = None
+
+
+def _queue_state(scan_id):
+    for position, job in enumerate(_scan_queue, 1):
+        if job[1] == scan_id:
+            average = sum(_scan_durations) / len(_scan_durations) if _scan_durations else 240
+            remaining = (max(0, average - (time.monotonic() - _running_scan_started))
+                         if _running_scan_started else average if SCAN_SLOT.locked() else 0)
+            seconds = math.ceil(remaining + (position - 1) * average)
+            minutes = max(1, math.ceil(seconds / 60))
+            if position == 1:
+                return position, seconds, "info", f"You're next in line. Another scan is running, so yours will take a little longer than usual (about {minutes} minutes)."
+            return position, seconds, "wait", f"You are #{position} in line. Your scan will start in about {minutes} minutes."
+    return None, None, None, None
+
+
+def _enqueue_scan(*job):
+    global _scan_worker
+    _scan_queue.append(job)
+    if _scan_worker is None or _scan_worker.done():
+        _scan_worker = asyncio.create_task(_drain_scan_queue())
+
+
+async def _drain_scan_queue():
+    global _scan_worker, _running_scan_started
+    try:
+        while _scan_queue:
+            async with SCAN_SLOT:
+                job = _scan_queue.popleft()
+                _running_scan_started = time.monotonic()
+                try:
+                    await _run_scan_job(*job)
+                finally:
+                    _scan_durations.append(time.monotonic() - _running_scan_started)
+                    _running_scan_started = None
+    finally:
+        _scan_worker = None
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +760,8 @@ class ScanStatusResponse(BaseModel):
     analysis_run_id: str
     error: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
+    queue_position: Optional[int] = None
+    estimated_wait_seconds: Optional[int] = None
     status_message: Optional[str] = Field(default=None, description="Plain-language AI wait or busy notice while processing")
     status_message_level: Optional[str] = Field(default=None, description="info | wait, matching status_message")
 
@@ -750,37 +795,27 @@ async def _run_scan_job(
     and leave the job pinned at 'processing' forever, with the client
     polling indefinitely.
 
-    Waits its turn on SCAN_SLOT if another scan is already running — the
-    client already polls GET /api/scans/{id}, so a longer wait here just
-    surfaces as 'processing' for a bit longer, which is the correct UX for
-    a background job (unlike the sync endpoint, this has no proxy timeout
-    to race against).
+    The FIFO worker owns SCAN_SLOT for this job.
     """
-    async with SCAN_SLOT:
-        scan_context.set(analysis_run_id)
+    scan_context.set(analysis_run_id)
+    try:
+        result = await _execute_scan_pipeline(
+            req, analysis_run_id, manuscript_id, credits_remaining,
+            file_bytes=file_bytes, filename=filename,
+        )
+        await _save_completed_result(result)
+        logger.info("Async scan job completed: %s", analysis_run_id)
+    except Exception as exc:
+        logger.exception("Async scan job failed: %s", analysis_run_id)
         try:
-            result = await _execute_scan_pipeline(
-                req,
-                analysis_run_id,
-                manuscript_id,
-                credits_remaining,
-                file_bytes=file_bytes,
-                filename=filename,
+            db_client = DatabasePersistenceService.get_client()
+            await asyncio.to_thread(
+                lambda: db_client.table("analysis_run").update({
+                    "status": "failed", "error_message": str(exc)[:1000],
+                }).eq("analysis_run_id", analysis_run_id).execute()
             )
-            await _save_completed_result(result)
-            logger.info("Async scan job completed: %s", analysis_run_id)
-        except Exception as exc:
-            logger.exception("Async scan job failed: %s", analysis_run_id)
-            try:
-                db_client = DatabasePersistenceService.get_client()
-                await asyncio.to_thread(
-                    lambda: db_client.table("analysis_run").update({
-                        "status": "failed",
-                        "error_message": str(exc)[:1000],
-                    }).eq("analysis_run_id", analysis_run_id).execute()
-                )
-            except Exception:
-                logger.exception("Could not mark scan job %s as failed", analysis_run_id)
+        except Exception:
+            logger.exception("Could not mark scan job %s as failed", analysis_run_id)
 
 
 @app.post(
@@ -842,7 +877,6 @@ async def run_scan(
 )
 async def start_scan(
     req: ScanRequest,
-    background_tasks: BackgroundTasks,
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> ScanJobResponse:
     """
@@ -853,7 +887,7 @@ async def start_scan(
     """
     _assert_owner(authenticated_user_id, req.user_id)
     analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
-    background_tasks.add_task(_run_scan_job, req, analysis_run_id, manuscript_id, credits_remaining)
+    _enqueue_scan(req, analysis_run_id, manuscript_id, credits_remaining)
     logger.info("Accepted async scan job: %s", analysis_run_id)
     return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
 
@@ -871,7 +905,6 @@ async def start_scan(
     tags=["Scans"]
 )
 async def upload_and_start_scan(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Manuscript document (.docx or .pdf)"),
     user_id: str = Form(..., description="Supabase auth user UUID"),
     manuscript_id: Optional[str] = Form(None, description="Optional existing manuscript UUID"),
@@ -921,15 +954,8 @@ async def upload_and_start_scan(
     analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
         req, default_source_name=file.filename
     )
-    background_tasks.add_task(
-        _run_scan_job,
-        req,
-        analysis_run_id,
-        resolved_manuscript_id,
-        credits_remaining,
-        file_bytes=file_bytes,
-        filename=file.filename,
-    )
+    _enqueue_scan(req, analysis_run_id, resolved_manuscript_id, credits_remaining,
+                  file_bytes, file.filename)
     logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
     return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
 
@@ -1084,8 +1110,11 @@ async def get_scan_status(
             result=locked_scan_view(result_json)
         )
 
-    level, message = scan_status_message(analysis_run_id)
+    position, estimate, level, message = _queue_state(analysis_run_id)
+    if position is None:
+        level, message = scan_status_message(analysis_run_id)
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id,
+                              queue_position=position, estimated_wait_seconds=estimate,
                               status_message=message, status_message_level=level)
 
 
