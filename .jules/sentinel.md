@@ -1,0 +1,4 @@
+## 2025-02-14 - SSRF via HTTP Redirects
+**Vulnerability:** Initial SSRF validation `_is_safe_public_host` only checked the original URL before sending the request. The `httpx.AsyncClient` was configured with `follow_redirects=True`, allowing an attacker to bypass the check by providing a safe URL that redirects to an internal network address (e.g., `169.254.169.254`).
+**Learning:** Checking URLs before making a request is insufficient when the HTTP client automatically follows redirects, as malicious servers can redirect the client to protected internal resources after passing the initial check.
+**Prevention:** Use `event_hooks={'request': [_verify_request_host]}` in the `httpx.AsyncClient` configuration. This hook executes before every individual request, including each hop of a redirect chain, ensuring no internal host is ever contacted.
