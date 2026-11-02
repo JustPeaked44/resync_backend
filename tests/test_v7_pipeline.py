@@ -104,8 +104,8 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
     assert payload["manuscript_sections"] == [{"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]]
-    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 98.33  # one Moderate issue costs 5 on Logical Support; Numeric is N/A
-    assert payload["score_breakdown"]["band"] == "Strong"
+    assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 67.0  # the one pair fails its Logical Support check; Numeric is N/A: (100 + 100 + 0) / 3, rounded up
+    assert payload["score_breakdown"]["band"] == "Needs Revision"   # 67 is under the Solid line (70)
     assert payload["score_breakdown"]["dimensions"] == {
         "objectives_alignment": 0.7, "methodology_fit": 0.8,
         "numeric_consistency": None, "claim_support": 0.5}
@@ -122,7 +122,7 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert payload["ai_synthesis"]["summary"] == "The texts correlate partly."
     assert payload["ai_synthesis"]["strongest_pair"]["score"] == 66.67
     assert payload["ai_synthesis"]["strongest_pair"]["overall_coherence"] == 0.6
-    assert captured["save"]["coherence_score"] == 98.33
+    assert captured["save"]["coherence_score"] == 67.0
     assert captured["save"]["inconsistencies"][0]["inconsistency_id"] == payload["inconsistencies"][0]["inconsistency_id"]
 
 
@@ -142,7 +142,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
             "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
         "overall_coherence_score", "sections_analyzed", "manuscript_sections", "access", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
-        "score_breakdown", "dimension_breakdown", "ai_text_indicator", "db_save_status", "notification_dispatched",
+        "score_breakdown", "dimension_breakdown", "structure_note", "ai_text_indicator", "db_save_status", "notification_dispatched",
         "credits_remaining"}
     assert payload["result_version"] == "v7"
     assert len(payload["manuscript_flow"]) == 1
@@ -225,8 +225,8 @@ def test_analyze_v7_uses_same_four_part_contract(monkeypatch):
         {"name": "B", "text": "Results reached 78% among the participants."}])
     result = asyncio.run(main.analyze_v7(request, user_id="user"))
     assert result["result_version"] == "v7"
-    assert result["manuscript_score"] == 100.0   # explain_flow is faked, so no pair carries an issue
-    assert result["dimension_breakdown"]["evidence_consistency"]["score"] == 100
+    assert result["manuscript_score"] == 75.0   # explain_flow is faked, so the pair is unreviewed and the model rating decides: only numeric (0.1) fails
+    assert result["dimension_breakdown"]["evidence_consistency"]["score"] == 0.0
     assert result["dimensions"] == {"objectives_alignment": 1.0, "methodology_fit": 0.5,
                                     "numeric_consistency": 0.1, "claim_support": 0.75}
     assert set(result["dimension_weights"].values()) == {0.25}

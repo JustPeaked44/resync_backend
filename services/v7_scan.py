@@ -1,6 +1,7 @@
 """Pure assembly helpers for the v7 manuscript flow."""
 
 import logging
+import math
 import os
 import re
 import asyncio
@@ -18,6 +19,7 @@ CALIBRATION = ((0.15, 0.0), (0.45, 0.60), (0.65, 0.86), (0.82, 1.0))
 # for display: below 0.40 Critical, 0.40 to 0.65 Moderate, 0.65 to 0.85 Minor. Grades do not change the score.
 SEVERITY_PENALTY = {"Critical": 10, "Moderate": 5, "Minor": 1, "None": 0}
 START_SCORE = 100
+CHECK_PASS_AT = 0.5  # a neighboring pair rated below this for a category fails that check (a loose link)
 # Internal score keys (as the model and Gemini name them) -> the names the API and UI show.
 DIMENSION_NAMES = {"objectives_alignment": "context_alignment", "methodology_fit": "operational_alignment",
                    "numeric_consistency": "evidence_consistency", "claim_support": "logical_support"}
@@ -65,32 +67,46 @@ def four_part_score(pairs):
 
 
 def manuscript_score(pairs, transitions=None):
-    """(overall score, dimension breakdown).
+    """(overall score, dimension breakdown), counted as checks passed.
 
-    Every dimension starts from its `baseline`: how well the paper's neighboring sections lead into each other, from the
-    model's calibrated ratings of every transition (100 when `transitions` is not given). It then loses points for each
-    real issue the AI review charged to it (Critical 10, Moderate 5, Minor 1), so a paper never scores a perfect 100
-    just because nothing was quotable, or because the AI review could not run. A dimension with nothing to measure, such
-    as Evidence Consistency in a paper with no figures, is "N/A". The overall score is the plain average of the
-    applicable ones. `deductions` lists exactly which pairs cost which points, so every score can be traced.
+    A check is one pair of sections judged for one of the four categories (Evidence Consistency only for pairs where both
+    sections hold figures). A check fails when the AI review quoted a real contradiction in that category, or when two
+    neighboring sections are rated below CHECK_PASS_AT for it (a loose link, which gets linking-sentence suggestions).
+    Far-apart pairs fail only on a quoted contradiction, since unrelated chapters are meant to differ; a pair the AI
+    review could not judge falls back to the model's rating. A category's score is the percentage of its checks that
+    passed, "N/A" when it has none. The overall score is the average of the applicable categories' percentages, rounded
+    up, so every category carries equal weight. `failures` lists exactly which checks failed and why, so every score can
+    be traced. `transitions` is accepted for older callers and no longer used.
     """
     scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
     breakdown = {}
     for key, name in DIMENSION_NAMES.items():
-        used = [p for p in scored if key != "numeric_consistency" or p.get("numeric_applicable", True)]
-        average = (transitions or {}).get(key)
-        if not used and average is None:
-            breakdown[name] = {"score": "N/A", "baseline": None, "penalty": 0, "issues": 0, "pairs": 0, "deductions": []}
+        failures, total = [], 0
+        for p in scored:
+            rating = p["scores"].get(key)
+            if rating is None or (key == "numeric_consistency" and not p.get("numeric_applicable", True)):
+                continue
+            total += 1
+            severity, neighbors = p.get("severity"), p.get("adjacent", True) is not False
+            if severity in ("Critical", "Moderate", "Minor") and p.get("failed_dimension") == key:
+                reason = "contradiction"
+            elif rating < CHECK_PASS_AT and (neighbors or severity is None):
+                reason = "loose_link"
+            else:
+                continue
+            failures.append({"order": p.get("order"), "section_a": p.get("section_a", ""), "section_b": p.get("section_b", ""),
+                             "reason": reason, "severity": severity if reason == "contradiction" else None,
+                             "rating": round(rating, 4)})
+        if not total:
+            breakdown[name] = {"score": "N/A", "items": 0, "passed": 0, "issues": 0, "pairs": 0, "failures": [],
+                               "baseline": None, "penalty": 0, "deductions": []}
             continue
-        baseline = START_SCORE if not transitions else (round(calibrate(average) * 100) if average is not None else START_SCORE)
-        hits = [p for p in used if p.get("failed_dimension") == key and p.get("severity") in ("Critical", "Moderate", "Minor")]
-        deductions = [{"order": p.get("order"), "section_a": p.get("section_a", ""), "section_b": p.get("section_b", ""),
-                       "severity": p["severity"], "points": SEVERITY_PENALTY[p["severity"]]} for p in hits]
-        penalty = sum(item["points"] for item in deductions)
-        breakdown[name] = {"score": max(0, baseline - penalty), "baseline": baseline, "penalty": penalty, "issues": len(hits),
-                           "pairs": len(used), "deductions": deductions}
+        passed = total - len(failures)
+        breakdown[name] = {"score": round(passed / total * 100, 2), "items": total, "passed": passed,
+                           "issues": sum(f["reason"] == "contradiction" for f in failures), "pairs": total,
+                           "failures": failures, "baseline": None, "penalty": 0, "deductions": []}
     values = [entry["score"] for entry in breakdown.values() if entry["score"] != "N/A"]
-    return (round(sum(values) / len(values), 2) if values else 0.0), breakdown
+    return (float(math.ceil(round(sum(values) / len(values), 6))) if values else 0.0), breakdown
 
 
 def merge_repeated_sections(parsed_sections, section_order):
@@ -165,7 +181,7 @@ def pair_pointer(pair):
 
 async def explain_flow(sections, flow):
     from services import gemini
-    from services.v7_explain import explain_pair, explain_summary
+    from services.v7_explain import FLOW_SUGGESTION_BELOW, explain_pair, explain_summary, suggest_bridges
 
     semaphore = asyncio.Semaphore(EXPLAIN_CONCURRENCY)
 
@@ -190,6 +206,22 @@ async def explain_flow(sections, flow):
         for pair in to_explain:
             if pair["explanation"] and pair["explanation"]["severity"] is None:
                 await explain(pair)
+        # A loosely linked neighbor pair always gets linking sentences to add: when the main review wrote none, ask for
+        # just those, so a score that lost points to weak links never comes with an empty Recommendations list.
+        loose = [p for p in flow if p.get("adjacent", True) and p["explanation"] and p["explanation"].get("severity") == "None"
+                 and not p["explanation"].get("bridges") and (p["scores"]["overall_coherence"] or 1) < FLOW_SUGGESTION_BELOW]
+        if loose:
+            gemini.expect_calls(len(loose))
+
+            async def add_bridges(pair):
+                async with semaphore:
+                    try:
+                        pair["explanation"]["bridges"] = await asyncio.wait_for(suggest_bridges(
+                            pair["section_a"], sections[pair["index_a"]]["text"], pair["section_b"], sections[pair["index_b"]]["text"]), EXPLAIN_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logging.getLogger("resync.v7_scan").warning("Bridges for pair %s took over %ss; skipped", pair["order"], EXPLAIN_TIMEOUT)
+
+            await asyncio.gather(*(add_bridges(pair) for pair in loose), return_exceptions=True)
         for pair in flow:
             overall = pair["scores"]["overall_coherence"]
             if overall is None:

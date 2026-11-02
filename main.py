@@ -417,6 +417,7 @@ class ScanResponse(BaseModel):
     citations: List[CitationReport]
     score_breakdown: Optional[ScoreBreakdown] = None
     dimension_breakdown: Optional[Dict[str, Dict[str, Any]]] = None
+    structure_note: Optional[str] = None  # set when the paper had no usual headings, so the report can say how it was split
     ai_text_indicator: Optional[AITextIndicatorReport] = None
     db_save_status: str
     notification_dispatched: bool
@@ -590,6 +591,7 @@ async def _execute_scan_pipeline(
     # A reference list is not prose, so it has no meaningful link to the section before it.
     sections = [section for section in merge_repeated_sections(parsed_sections, section_order)
                 if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS]
+    structure_note = _structure_note(parse_result.get("structure"), len(sections))
     # The citation audit is network-bound and independent of the model, so it starts now and runs while the local
     # model rates the sections. The Gemini reviews and the AI-text check then run at the same time too; nothing is
     # saved until all of them have finished (Step 6).
@@ -738,6 +740,7 @@ async def _execute_scan_pipeline(
         ) for c in citations],
         score_breakdown=ScoreBreakdown(**score_breakdown_dict),
         dimension_breakdown=breakdown,
+        structure_note=structure_note,
         ai_text_indicator=AITextIndicatorReport(**ai_text_result),
         credits_remaining=credits_remaining,
         db_save_status=db_save_status,
@@ -1138,6 +1141,16 @@ async def unlock_scan(scan_id: str, authenticated_user_id: str = Depends(get_aut
 
 import httpx
 import re
+
+
+def _structure_note(structure: Optional[str], parts: int) -> Optional[str]:
+    """A plain sentence for papers whose sections were not found from the usual headings."""
+    if structure == "split":
+        return (f"We could not find section headings in your paper, so it was split into {parts} equal parts and each part was "
+                "compared with the next. Clear headings such as Introduction, Methods and Results give more exact results.")
+    if structure == "structure":
+        return "Your headings are not the usual ones, so they were found from the layout of your paper. Check that the sections look right."
+    return None
 
 # In-process cache for manuscript previews: { scan_id: { "text": "...", "expires_at": float } }
 # TTL is 10 minutes. Max keys = 100 to prevent OOM.

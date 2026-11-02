@@ -93,8 +93,12 @@ def test_explanation_cap_and_single_summary(monkeypatch):
         state["summary_calls"] += 1
         return None
 
+    async def no_bridges(*_, **__):
+        return []
+
     monkeypatch.setattr(v7_explain, "explain_pair", fake_pair)
     monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
+    monkeypatch.setattr(v7_explain, "suggest_bridges", no_bridges)
     findings, recommendations, synthesis = asyncio.run(explain_flow(sections, flow))
     assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 16))
     assert flow[15]["explanation"] is None  # 30 weak pairs: the hard cap is 15
@@ -128,32 +132,47 @@ def pair_for_score(severity=None, dimension=None, numeric=True, order=1, overall
             "numeric_applicable": numeric, "scores": {key: overall for key in ("objectives_alignment", "methodology_fit", "numeric_consistency", "claim_support", "overall_coherence")}}
 
 
-def test_each_dimension_starts_at_100_and_loses_points_per_real_issue_then_the_overall_is_the_plain_average():
+def test_checks_are_counted_per_pair_and_category_and_each_category_is_a_percentage_of_checks_passed():
     pairs = [pair_for_score("Critical", "methodology_fit", order=1), pair_for_score("Moderate", "methodology_fit", order=2),
              pair_for_score("Minor", "claim_support", order=3), pair_for_score("None", "none", order=4), pair_for_score(None, None, order=5)]
     score, breakdown = manuscript_score(pairs)
     assert {name: entry["score"] for name, entry in breakdown.items()} == {
-        "context_alignment": 100, "operational_alignment": 85, "evidence_consistency": 100, "logical_support": 99}
-    assert score == 96.0   # (100 + 85 + 100 + 99) / 4
+        "context_alignment": 100.0, "operational_alignment": 60.0, "evidence_consistency": 100.0, "logical_support": 80.0}
+    assert score == 85.0   # (100 + 60 + 100 + 80) / 4
     operational = breakdown["operational_alignment"]
-    assert (operational["penalty"], operational["issues"], operational["pairs"]) == (15, 2, 5)
-    assert [(d["severity"], d["points"]) for d in operational["deductions"]] == [("Critical", 10), ("Moderate", 5)]   # traceable
-    assert manuscript_score([pair_for_score("Critical", "objectives_alignment", overall=0.1)] * 11)[1]["context_alignment"]["score"] == 0   # never below 0
+    assert (operational["items"], operational["passed"], operational["issues"]) == (5, 3, 2)
+    assert [(f["reason"], f["severity"]) for f in operational["failures"]] == [("contradiction", "Critical"), ("contradiction", "Moderate")]   # traceable
     assert manuscript_score([])[0] == 0.0
 
 
-def test_a_dimension_with_no_applicable_pair_is_na_and_left_out_of_the_average():
+def test_the_overall_is_the_average_of_the_category_percentages_rounded_up():
+    pairs = [pair_for_score("Critical", "objectives_alignment", order=1), pair_for_score("None", "none", order=2), pair_for_score("None", "none", order=3)]
+    score, breakdown = manuscript_score(pairs)
+    assert breakdown["context_alignment"]["score"] == 66.67 and breakdown["context_alignment"]["passed"] == 2
+    assert score == 92.0   # (66.67 + 100 + 100 + 100) / 4 = 91.67, rounded up
+    assert manuscript_score([pair_for_score("None", "none", order=1)])[0] == 100.0   # exactly 100 stays 100
+
+
+def test_a_category_with_no_applicable_pair_is_na_and_left_out_of_the_average():
     pairs = [pair_for_score("Moderate", "claim_support", numeric=False, order=1), pair_for_score("None", "none", numeric=False, order=2)]
     score, breakdown = manuscript_score(pairs)
-    assert breakdown["evidence_consistency"]["score"] == "N/A" and breakdown["evidence_consistency"]["deductions"] == []
-    assert breakdown["logical_support"]["score"] == 95
-    assert score == 98.33   # (100 + 100 + 95) / 3: numeric is left out
-    mixed = [pair_for_score("Critical", "objectives_alignment", numeric=False, order=1),
-             pair_for_score("Critical", "methodology_fit", numeric=False, order=2), pair_for_score("Critical", "methodology_fit", numeric=False, order=3)]
-    assert manuscript_score(mixed)[0] == 90.0   # Context 90, Operational 80, Logical 100, Evidence N/A: (90 + 80 + 100) / 3
+    assert breakdown["evidence_consistency"]["score"] == "N/A" and breakdown["evidence_consistency"]["failures"] == []
+    assert breakdown["logical_support"]["score"] == 50.0
+    assert score == 84.0   # (100 + 100 + 50) / 3 = 83.33, rounded up: figures are left out
 
 
-def test_a_false_alarm_is_free_and_the_ai_reviews_own_grade_is_the_penalty(monkeypatch):
+def test_neighbors_fail_on_a_loose_link_but_far_apart_pairs_need_a_quoted_contradiction():
+    neighbor = pair_for_score("None", "none", order=1, overall=0.4)
+    far = dict(pair_for_score("None", "none", order=2, overall=0.4), adjacent=False)
+    far_unreviewed = dict(pair_for_score(None, None, order=3, overall=0.4), adjacent=False)
+    _, breakdown = manuscript_score([neighbor, far, far_unreviewed])
+    context = breakdown["context_alignment"]
+    assert (context["items"], context["passed"]) == (3, 1)   # only the AI-cleared far-apart pair passes
+    assert [(f["order"], f["reason"]) for f in context["failures"]] == [(1, "loose_link"), (3, "loose_link")]
+    assert context["failures"][0]["rating"] == 0.4 and context["issues"] == 0
+
+
+def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
     sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABCDE"]
     overall = [0.2, 0.5, 0.8, 0.3]
     raw = [{"scores": {"pair_weight": 1, "overall_coherence": o, "objectives_alignment": o, "methodology_fit": o,
@@ -173,8 +192,10 @@ def test_a_false_alarm_is_free_and_the_ai_reviews_own_grade_is_the_penalty(monke
     asyncio.run(explain_flow(sections, flow))
     assert [p["severity"] for p in flow] == ["Moderate", "Critical", "Minor", "None"]   # the review's grade stands
     score, breakdown = manuscript_score(flow)
-    assert breakdown["logical_support"]["score"] == 84 and breakdown["logical_support"]["issues"] == 3   # 100 - 5 - 10 - 1; false alarm free
-    assert score == 94.67   # numeric is N/A for these texts: (100 + 100 + 84) / 3
+    logical = breakdown["logical_support"]
+    assert (logical["items"], logical["passed"], logical["issues"]) == (4, 0, 3)   # three contradictions and one loose link (rated 0.3)
+    assert breakdown["context_alignment"]["score"] == 50.0   # the two low-rated neighbors (0.2 and 0.3) are loose links
+    assert score == 34.0   # (50 + 50 + 0) / 3 = 33.33, rounded up: numeric is N/A for these texts
 
 
 def test_failed_reviews_get_a_second_one_at_a_time_pass(monkeypatch):
@@ -222,20 +243,30 @@ def test_a_pair_that_takes_too_long_is_left_unreviewed_without_holding_the_other
     assert [p["severity"] for p in flow] == [None, "None"]   # A unreviewed, B reviewed
 
 
-def test_a_part_starts_from_how_well_transitions_connect_and_never_from_a_free_100():
-    # identity calibration in this file, so a raw 0.65 is a 65
-    transitions = {"objectives_alignment": 0.65, "methodology_fit": 0.65, "numeric_consistency": None, "claim_support": 0.82}
-    issue = pair_for_score("Moderate", "methodology_fit", order=1)
-    score, breakdown = manuscript_score([issue], transitions)
-    assert {n: e["baseline"] for n, e in breakdown.items()} == {"context_alignment": 65, "operational_alignment": 65,
-                                                                 "evidence_consistency": 100, "logical_support": 82}
-    assert breakdown["operational_alignment"]["score"] == 60 and breakdown["operational_alignment"]["penalty"] == 5
-    assert score == 76.75    # (65 + 60 + 100 + 82) / 4
-    # the AI review could not run (nothing reviewed): the score is the transition baseline, not 100
-    unreviewed = [pair_for_score(None, None, order=1)]
-    assert manuscript_score(unreviewed, transitions)[0] == 78.0    # (65 + 65 + 100 + 82) / 4
-    assert manuscript_score(unreviewed)[0] == 100.0                # without a baseline it is the plain penalty system
-    # nothing to measure for figures: N/A and left out of the average
-    no_figures = [pair_for_score(None, None, numeric=False, order=1)]
-    score, breakdown = manuscript_score(no_figures, transitions)
-    assert breakdown["evidence_consistency"]["score"] == "N/A"   # no figures in any pair or transition: nothing to measure
+def test_a_loosely_linked_neighbor_pair_gets_linking_sentences_even_when_the_main_review_wrote_none(monkeypatch):
+    sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABCD"]
+    ratings = [0.4, 0.8, 0.5]   # A-B loose, B-C well linked (never reviewed), C-D loose
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": o, "objectives_alignment": o, "methodology_fit": o,
+                       "numeric_consistency": o, "claim_support": o}} for o in ratings]
+    flow = assemble_flow(sections, raw)
+    asked = []
+
+    async def cleared_without_bridges(role_a, *_, **__):
+        return {"severity": "None", "failed_dimension": "none", "coherence_scores": {}, "highlighted_inconsistencies": [],
+                "recommendations": [], "reference_list": [], "bridges": []}
+
+    async def fake_bridges(role_a, text_a, role_b, text_b):
+        asked.append((role_a, role_b))
+        return [{"section": role_a, "placement": "end", "sentence": f"{role_a} sets up what {role_b} applies."},
+                {"section": role_b, "placement": "start", "sentence": f"{role_b} applies what {role_a} sets up."}]
+
+    async def fake_summary(*_):
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_pair", cleared_without_bridges)
+    monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
+    monkeypatch.setattr(v7_explain, "suggest_bridges", fake_bridges)
+    _, recommendations, _ = asyncio.run(explain_flow(sections, flow))
+    assert asked == [("A", "B"), ("C", "D")]                       # only the loose neighbor pairs, nothing for B-C
+    assert [(r["pair_order"], r["kind"]) for r in recommendations] == [(1, "add"), (1, "add"), (3, "add"), (3, "add")]
+    assert [p["severity"] for p in flow] == ["None", "None", "None"]   # a suggestion is never a penalty

@@ -50,8 +50,13 @@ For each recommendation, category names the score part its revision fixes: objec
 Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section.
 Recommend only revisions justified by the supplied text.
 Give one recommendation for each exact quote in highlighted_inconsistencies that you can fix, and do not combine passages.
-bridges are NEW linking sentences the student can ADD, the fastest way to connect two sections. Return exactly TWO bridges when severity is not "None", and ALSO when the sections are neighbors and the model's overall score is below 0.65 even though severity is "None" (a missing transition is not an inconsistency, so it carries no penalty). Otherwise return an empty array. The two bridges are one on each side: first section is exactly {a} with placement "end" (added after its last sentence), then section is exactly {b} with placement "start" (added before its first sentence). Each sentence is ONE plain sentence of at most 30 words written as natural thesis prose that states the concrete content link between the two sections: name the specific things in one section that the other section depends on, builds on, or applies (for example: the tables defined here store the data entered through the screens for batches and listings). NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence. If severity is "None", return an empty array. {bridges_note}
+bridges are NEW linking sentences the student can ADD, the fastest way to connect two sections. Return exactly TWO bridges when severity is not "None", and ALSO when the sections are neighbors and the model's overall score is below 0.65 even though severity is "None" (a missing transition is not an inconsistency, so it carries no penalty). Otherwise return an empty array. The two bridges are one on each side: first section is exactly {a} with placement "end" (added after its last sentence), then section is exactly {b} with placement "start" (added before its first sentence). Each sentence is ONE plain sentence of at most 30 words written as natural thesis prose that states the concrete content link between the two sections: name the specific things in one section that the other section depends on, builds on, or applies (for example: the tables defined here store the data entered through the screens for batches and listings). NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence. {bridges_note}
 A recommended revision must preserve the original sentence's meaning and repair only the inconsistency you quoted; never adopt the other section's topic."""
+BRIDGE_PROMPT = """You help a student connect two neighboring sections of their thesis. You see the END of the "{a}" section and the START of the "{b}" section.
+The end of "{a}": {text_a}
+The start of "{b}": {text_b}
+Write exactly TWO new sentences the student can ADD: first one for the end of "{a}", then one for the start of "{b}". Each is ONE plain sentence of at most 30 words, written as natural thesis prose that states a concrete link between the two sections: name the specific things in one section that the other depends on, builds on, or applies. NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence.
+Return JSON with one key, bridges: an array of exactly two strings, in that order."""
 SUMMARY_PROMPT = """Summarize how consistent these pairs of manuscript sections are in one concise paragraph.
 {rules}
 Never mention the model, PyTorch, or how scores are produced. Express any score as a whole-number percentage (e.g. 80%), never a raw decimal.
@@ -188,6 +193,26 @@ async def _generate(prompt):
     response = await gemini.post_gemini_with_retry(payload)
     response.raise_for_status()
     return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+
+async def suggest_bridges(role_a, text_a, role_b, text_b):
+    """Two linking sentences (end of A, start of B) for neighbors the main review did not write any for; [] if Gemini cannot."""
+    prompt = (BRIDGE_PROMPT.replace("{a}", role_a).replace("{b}", role_b)
+              .replace("{text_a}", gemini.truncate_tail(text_a)).replace("{text_b}", gemini.truncate_text(text_b, 3500)))
+    for attempt in range(1, EXPLAIN_ATTEMPTS + 1):
+        try:
+            raw = (await _generate(prompt)).get("bridges")
+            sentences = [" ".join(item.split()) for item in raw if isinstance(item, str) and item.strip()] if isinstance(raw, list) else []
+            if len(sentences) == 2 and not any(META_PHRASE.search(sentence) or len(sentence.split()) > 45 for sentence in sentences):
+                return [{"section": role_a, "placement": "end", "sentence": sentences[0]},
+                        {"section": role_b, "placement": "start", "sentence": sentences[1]}]
+        except gemini.GeminiQuotaExhausted:
+            return []
+        except Exception:
+            logger.exception("v7 Gemini bridge suggestion failed for %s -> %s (attempt %s of %s)", role_a, role_b, attempt, EXPLAIN_ATTEMPTS)
+        if attempt < EXPLAIN_ATTEMPTS:
+            await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
+    return []
 
 
 async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culprits_b, adjacent=True):

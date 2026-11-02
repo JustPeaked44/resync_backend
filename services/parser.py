@@ -193,7 +193,7 @@ class ManuscriptParserService:
 
         if toc_was_omitted:
             # --- "Scan and go" auto-detection path (no template supplied) ---
-            detection = cls.auto_detect_sections(text)
+            detection = cls.detect_structure(text)
             parsed_sections = detection["sections"]
             # Keep each detected occurrence in source order. Downstream scoring
             # still groups these keys through section_roles when it needs roles.
@@ -207,6 +207,7 @@ class ManuscriptParserService:
                 "total_sections_count": len(parsed_sections),
                 "section_roles": section_roles,
                 "auto_detected": True,
+                "structure": detection.get("structure", "headings"),
                 "detection_confidence": detection["confidence"],
                 "section_order": detection.get("section_order", list(parsed_sections)),
             }
@@ -277,6 +278,7 @@ class ManuscriptParserService:
             "total_sections_count": len(parsed_sections),
             "section_roles": section_roles,  # heading → standardized role
             "auto_detected": False,
+            "structure": "template",
             "detection_confidence": 1.0,
             "section_order": list(parsed_sections),
         }
@@ -420,6 +422,178 @@ class ManuscriptParserService:
             "section_roles": section_roles,
             "section_order": list(sections),
         }
+
+    # ------------------------------------------------------------------
+    # Papers that do not use the usual capstone headings
+    # ------------------------------------------------------------------
+    MIN_USABLE_SECTIONS = 3        # fewer than this and the usual-heading result is not enough to compare anything
+    MIN_COVERAGE = 0.25            # share of the paper's words the sections must hold
+    MIN_SECTION_WORDS = 5
+    MIN_WORDS_TO_SPLIT = 150
+
+    @classmethod
+    def _usable_words(cls, sections: Dict[str, str], roles: Dict[str, str]) -> tuple:
+        usable = [len(body.split()) for name, body in sections.items()
+                  if roles.get(name) != "references" and len(body.split()) >= cls.MIN_SECTION_WORDS]
+        return len(usable), sum(usable)
+
+    @classmethod
+    def _enough(cls, detection: Dict[str, Any], total_words: int) -> bool:
+        count, words = cls._usable_words(detection["sections"], detection.get("section_roles", {}))
+        return count >= cls.MIN_USABLE_SECTIONS and words >= cls.MIN_COVERAGE * max(total_words, 1)
+
+    @classmethod
+    def detect_structure(cls, text: str) -> Dict[str, Any]:
+        """
+        Splits a paper into sections whatever its layout. Three layers, each used only when the one before it did not
+        find enough to compare (see _enough): 1) the usual academic headings (auto_detect_sections), 2) headings found
+        by their shape (numbered, Roman numeral, "Chapter N", ALL CAPS, short title lines), 3) equal parts in reading
+        order. The result says which layer was used in "structure": "headings", "structure" or "split".
+        """
+        total_words = len(text.split())
+        usual = cls.auto_detect_sections(text)
+        if cls._enough(usual, total_words):
+            return {**usual, "structure": "headings"}
+        shaped = cls._detect_shaped_headings(text)
+        if cls._enough(shaped, total_words):
+            return {**shaped, "structure": "structure"}
+        split = cls._split_into_parts(text)
+        if split["sections"]:
+            return {**split, "structure": "split"}
+        # nothing better: keep whichever layer found the most, even if it is little
+        best = max((usual, shaped), key=lambda found: cls._usable_words(found["sections"], found.get("section_roles", {}))[1])
+        return {**best, "structure": "headings" if best is usual else "structure"}
+
+    _CHAPTER_RE = re.compile(r"(?i)^(chapter|part|section|unit)\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b[\s:.\-–—]*(.*)$")
+    _NUMBERED_RE = re.compile(r"^(?:\d+(?:\.\d+)*[.)]?|[IVXLC]+[.)]|[A-Z][.)])\s+(?=[A-Za-z])(.+)$")
+    _NOT_HEADING_RE = re.compile(r"\.{3,}|\s\d{1,3}$|[|@]|https?://|^(?:figure|fig\.|table|chart|source|note)\b|^[*•☐☑☒\-]\s", re.I)
+
+    @classmethod
+    def _heading_text(cls, line: str, next_line: str) -> Optional[str]:
+        """The cleaned heading name when `line` looks like a heading by its shape, else None."""
+        if not 3 <= len(line) <= 90 or cls._NOT_HEADING_RE.search(line):
+            return None
+        if line.endswith((".", ",", ";", ":", "?", "!")) or line.count("(") != line.count(")"):
+            return None
+        words = line.split()
+        next_words = len(next_line.split())
+        chapter = cls._CHAPTER_RE.match(line)
+        if chapter:
+            return None if len(words) > 14 else (chapter.group(2).strip() or line)
+        if len(words) > 12 or next_words < 6:
+            return None
+        numbered = cls._NUMBERED_RE.match(line)
+        if numbered:
+            title = numbered.group(1).strip()
+            return title if title[:1].isupper() and len(title.split()) <= 10 else None
+        letters = [c for c in line if c.isalpha()]
+        if len(letters) >= 4 and all(c.isupper() for c in letters):
+            return line
+        capitalized = sum(word[:1].isupper() for word in words)
+        if 1 <= len(words) <= 9 and line[:1].isupper() and next_words >= 12 and (len(words) <= 3 or capitalized >= len(words) / 2
+                                                                                 or not any(word.islower() and len(word) > 3 for word in words[1:])):
+            return line
+        # a short plain phrase before a long paragraph ("Why we did this")
+        if 2 <= len(words) <= 7 and line[:1].isupper() and next_words >= 20 and not re.search(r"\b(?:is|are|was|were|has|have|will|can)\b", line, re.I):
+            return line
+        return None
+
+    @classmethod
+    def _role_for(cls, name: str) -> str:
+        cleaned = re.sub(r"^[^a-z]+", "", name.lower()).strip()
+        if cleaned in ROLE_MAPPING:
+            return ROLE_MAPPING[cleaned]
+        matches = [(keyword, role) for keyword, role in ROLE_MAPPING.items()
+                   if re.search(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", cleaned)]
+        return max(matches, key=lambda match: len(match[0]))[1] if matches else "body"
+
+    @classmethod
+    def _detect_shaped_headings(cls, text: str) -> Dict[str, Any]:
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        found: List[tuple] = []          # (first line, last line, name) of each heading
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            following = lines[index + 1] if index + 1 < len(lines) else ""
+            name = cls._heading_text(line, following)
+            end = index
+            if name and cls._CHAPTER_RE.match(line) and not cls._CHAPTER_RE.match(line).group(2).strip() and following \
+                    and len(following.split()) <= 12 and not following.endswith((".", ",", ";")) and not cls._NOT_HEADING_RE.search(following):
+                name, end = following.strip(), index + 1     # "CHAPTER 1" then its title on the next line
+            if name:
+                found.append((index, end, name))
+            index = end + 1
+        # a line repeated many times is a running page header, not a heading
+        repeats: Dict[str, int] = {}
+        for _, _, name in found:
+            repeats[name.lower()] = repeats.get(name.lower(), 0) + 1
+        found = [item for item in found if repeats[item[2].lower()] < 4]
+
+        sections_lines: Dict[str, List[str]] = {}
+        roles: Dict[str, str] = {}
+        seen: Dict[str, int] = {}
+        for position, (_, end, name) in enumerate(found):
+            body_end = found[position + 1][0] if position + 1 < len(found) else len(lines)   # up to the next heading's first line
+            key = re.sub(r"^[^A-Za-z]+", "", name).strip().lower() or name.lower()
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > 1:
+                key = f"{key} ({seen[key]})"
+            sections_lines[key] = lines[end + 1:body_end]
+            roles[key] = cls._role_for(key)
+            if roles[key] == "references":
+                sections_lines[key] = lines[end + 1:]        # everything after the reference list stays with it
+                break
+        sections = {key: "\n".join(body).strip() for key, body in sections_lines.items()}
+        return {"sections": sections, "confidence": 0.5, "detected_headings": [item[2] for item in found],
+                "section_roles": roles, "section_order": list(sections)}
+
+    @classmethod
+    def _split_into_parts(cls, text: str) -> Dict[str, Any]:
+        """No headings at all: equal parts in reading order, the first as the introduction and the last as the conclusion."""
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        references: List[str] = []
+        for position in range(len(lines) - 1, -1, -1):
+            if re.fullmatch(r"(?i)(?:references|bibliography|works cited|literature cited)", lines[position]) \
+                    and position >= len(lines) * 0.5:
+                references = lines[position + 1:]
+                lines = lines[:position]
+                break
+        pieces: List[str] = []
+        for line in lines:
+            if len(line.split()) > 400:                      # one giant paragraph: cut it at sentence ends
+                sentences = re.split(r"(?<=[.!?])\s+", line)
+                chunk: List[str] = []
+                for sentence in sentences:
+                    chunk.append(sentence)
+                    if len(" ".join(chunk).split()) >= 150:
+                        pieces.append(" ".join(chunk))
+                        chunk = []
+                if chunk:
+                    pieces.append(" ".join(chunk))
+            else:
+                pieces.append(line)
+        total = sum(len(piece.split()) for piece in pieces)
+        if total < cls.MIN_WORDS_TO_SPLIT:
+            return {"sections": {}, "confidence": 0.0, "detected_headings": [], "section_roles": {}, "section_order": []}
+        count = max(4, min(8, round(total / 1200)))
+        target = total / count
+        groups: List[List[str]] = [[]]
+        used = 0
+        for piece in pieces:
+            if len(groups) < count and used >= target * len(groups) and groups[-1]:
+                groups.append([])
+            groups[-1].append(piece)
+            used += len(piece.split())
+        sections: Dict[str, str] = {}
+        roles: Dict[str, str] = {}
+        for number, group in enumerate(groups, 1):
+            name = f"part {number} of {len(groups)}"
+            sections[name] = "\n".join(group)
+            roles[name] = "introduction" if number == 1 else "conclusion" if number == len(groups) else "body"
+        if references:
+            sections["references"] = "\n".join(references)
+            roles["references"] = "references"
+        return {"sections": sections, "confidence": 0.2, "detected_headings": [], "section_roles": roles, "section_order": list(sections)}
 
     @classmethod
     def _detect_heading_role(cls, line: str, prefix_re: "re.Pattern") -> Optional[str]:
