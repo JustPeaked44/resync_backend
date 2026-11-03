@@ -26,10 +26,12 @@ MIN_WORDS = 5
 # The model reads about 256 tokens, which is a fraction of a real section. A link between two sections lives at their
 # boundary, so each pair is rated on the END of the first section against the START of the next (not start vs start).
 WINDOW_WORDS = 170
-HOLISTIC_PAIR_LIMIT = 15  # how many of the lowest-rated pairs are kept for the AI review
-NEIGHBOR_SLOTS = 8        # of those, up to this many go to the weakest transitions between neighboring sections
-# "lowest" keeps the 15 lowest-rated pairs overall; on real theses those are all pairs of sections about different
-# topics (nothing to contradict), so the default "balanced" splits the slots between transitions and cross-chapter checks.
+# Every pair worth judging goes on to the AI review: all neighboring sections, and all far-apart sections that are supposed
+# to agree. Set HOLISTIC_PAIR_LIMIT to a number to keep only that many of the lowest-rated pairs (0 or unset: no limit).
+HOLISTIC_PAIR_LIMIT = int(os.getenv("HOLISTIC_PAIR_LIMIT", "0")) or None
+NEIGHBOR_SLOTS = int(os.getenv("NEIGHBOR_SLOTS", "8"))   # only used with a limit: slots kept for the weakest neighbor transitions
+# "lowest" keeps the lowest-rated pairs overall; on real theses those are all pairs of sections about different topics
+# (nothing to contradict), so the default "balanced" keeps every transition and the cross-chapter pairs that should agree.
 HOLISTIC_SELECTION = os.getenv("HOLISTIC_SELECTION", "balanced")
 # Section roles that are supposed to agree with each other even when they are far apart in the paper.
 CROSS_ROLE_PAIRS = {frozenset(pair) for pair in (
@@ -173,16 +175,19 @@ def _score_embeddings(model: MultiHeadMiniLM_v7, embed_a: "torch.Tensor", embed_
 
 
 def _select_pairs(items: List[tuple], sections: List[dict]) -> List[tuple]:
-    """Keeps at most HOLISTIC_PAIR_LIMIT (pair, scores) items, lowest-rated first within each group."""
+    """The (pair, scores) items to review: every neighbor pair and every far-apart pair that should agree, lowest-rated first
+    within each group; cut to HOLISTIC_PAIR_LIMIT only when that limit is set."""
     lowest_first = lambda item: (item[1]["overall_coherence"], item[0])
     if HOLISTIC_SELECTION == "lowest":
-        return sorted(items, key=lowest_first)[:HOLISTIC_PAIR_LIMIT]
+        return sorted(items, key=lowest_first)[:HOLISTIC_PAIR_LIMIT]   # no limit: all of them
     near = sorted((item for item in items if item[0][1] == item[0][0] + 1), key=lowest_first)
     far = [item for item in items if item[0][1] != item[0][0] + 1]
     role = lambda index: sections[index].get("role")
     if any(role(index) for index in range(len(sections))):   # keep only the cross-chapter pairs that should agree
         far = [item for item in far if frozenset((role(item[0][0]), role(item[0][1]))) in CROSS_ROLE_PAIRS]
     far.sort(key=lowest_first)
+    if HOLISTIC_PAIR_LIMIT is None:
+        return near + far
     near_target = min(len(near), NEIGHBOR_SLOTS, HOLISTIC_PAIR_LIMIT)
     far_take = max(0, min(len(far), HOLISTIC_PAIR_LIMIT - near_target))
     near_take = max(0, min(len(near), HOLISTIC_PAIR_LIMIT - far_take))
@@ -205,11 +210,11 @@ def _transition_averages(sections: List[dict], combos: List[tuple], rated: List[
 
 
 def analyze_manuscript(sections: List[dict]) -> dict:
-    """Holistic analysis: rates EVERY pair of sections (itertools.combinations), then keeps the lowest-rated few.
+    """Holistic analysis: rates EVERY pair of sections (itertools.combinations), then keeps every pair worth judging.
 
     A pair of neighbors is rated on the end of the first against the start of the next (the transition); any other pair
-    on the starts of both, which carry each section's topic. The lowest HOLISTIC_PAIR_LIMIT pairs go on to the AI review,
-    which keeps cost and rate limits down. sections: [{"name", "text"}]; kept pairs come back in manuscript order.
+    on the starts of both, which carry each section's topic. The pairs worth judging go on to the AI review (see
+    _select_pairs), in batches. sections: [{"name", "text"}]; kept pairs come back in manuscript order.
     """
     model = get_model()
     usable = [index for index, section in enumerate(sections) if len((section["text"] or "").split()) >= MIN_WORDS]

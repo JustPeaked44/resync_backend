@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_validator
 from dotenv import load_dotenv
 
 # Load .env FIRST — must happen before service imports
@@ -29,7 +29,8 @@ from services.db_service import DatabasePersistenceService
 from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
-from services.v7_scan import (merge_repeated_sections, assemble_flow, explain_flow,
+from services.section_cache import SectionCache
+from services.v7_scan import (comparable_sections, merge_repeated_sections, assemble_flow, explain_flow,
                               four_part_score, manuscript_score, band, MIN_SECTION_WORDS)
 from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
@@ -209,14 +210,43 @@ class V7Section(BaseModel):
 
 class V7AnalyzeRequest(BaseModel):
     # Order matters: sections are compared chronologically, each against the next.
-    sections: List[V7Section] = Field(..., min_length=2, max_length=30)
+    sections: Optional[List[V7Section]] = Field(default=None, max_length=30)
+    manuscript_id: Optional[str] = Field(
+        default=None,
+        description="A manuscript this user already scanned. Its saved sections are used instead of the ones in `sections`.")
+
+    @model_validator(mode="after")
+    def _needs_sections_or_a_saved_manuscript(self):
+        if self.sections is not None and len(self.sections) < 2:
+            raise ValueError("sections needs at least 2 items")
+        if self.sections is None and not self.manuscript_id:
+            raise ValueError("Send `sections`, or the `manuscript_id` of a manuscript you already scanned.")
+        return self
 
 
 @app.post("/analyze_v7")
 async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authenticated_user_id)):
     """v7 correlation of consecutive manuscript sections, returned as a nested manuscript_flow."""
     await _check_scan_rate_limit(user_id)
-    sections = [s.model_dump() for s in req.sections]
+    if req.sections is not None:
+        sections = [s.model_dump() for s in req.sections]
+    else:
+        # The manuscript was parsed when it was scanned: read its saved sections instead of parsing the file again.
+        try:
+            uuid.UUID(req.manuscript_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="manuscript_id must be a UUID.")
+        saved = await SectionCache.load_for_manuscript(req.manuscript_id, user_id)
+        if not saved:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail="No saved sections were found for this manuscript. Scan it once first, or send `sections`.")
+        parsed = saved["parse_result"]
+        roles = parsed.get("section_roles", {})
+        sections = [{**section, "role": roles.get(section["name"])} for section in comparable_sections(
+            parsed["parsed_sections"], parsed.get("section_order", list(parsed["parsed_sections"])), roles)]
+        if len(sections) < 2:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                detail="This manuscript has fewer than 2 sections to compare.")
     async with SCAN_SLOT:
         try:
             result = await asyncio.to_thread(ml_client.analyze_v7, sections)
@@ -550,22 +580,34 @@ async def _execute_scan_pipeline(
     # Step 1 – Ingestion
     # ------------------------------------------------------------------
     source_identifier = req.doc_url or req.filename or filename or "Uploaded Manuscript"
-    if file_bytes:
-        fname = filename or req.filename or req.doc_url or "document.docx"
-        raw_text: str = await DocumentIngestionService.extract_plaintext_from_upload(file_bytes, fname)
-    elif req.file_content_base64:
+    from services.parser import ManuscriptParserService
+
+    # A file this user already scanned is not read or parsed again: its sections were saved the first time (SectionCache).
+    payload = file_bytes
+    if payload is None and req.file_content_base64:
         import base64
         try:
-            decoded_bytes = base64.b64decode(req.file_content_base64)
+            payload = base64.b64decode(req.file_content_base64)
         except Exception:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid base64 encoding in file_content_base64."
             )
-        fname = req.filename or req.doc_url or "document.docx"
-        raw_text = await DocumentIngestionService.extract_plaintext_from_upload(decoded_bytes, fname)
+    content_hash = SectionCache.content_hash(payload, req.template_toc) if payload else None
+    cached = await SectionCache.find(req.user_id, content_hash) if content_hash else None
+    parse_result: Optional[Dict[str, Any]] = None
+    if cached:
+        raw_text, parse_result = cached["raw_text"], cached["parse_result"]
+        logger.info("Scan %s reused the saved sections of manuscript %s", analysis_run_id, cached["manuscript_id"])
+    elif payload:
+        fname = filename or req.filename or req.doc_url or "document.docx"
+        raw_text: str = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname)
     elif req.doc_url and ("docs.google.com" in req.doc_url or req.doc_url.startswith("http")):
         raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(req.doc_url)
+        # The link had to be fetched, but if its text is unchanged it can still skip the parser.
+        content_hash = SectionCache.content_hash(raw_text, req.template_toc)
+        found = await SectionCache.find(req.user_id, content_hash)
+        parse_result = found["parse_result"] if found else None
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -579,18 +621,19 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Offloaded to a worker thread: these are CPU-bound and would otherwise
     # block the event loop, stalling concurrent status-poll requests.
-    from services.parser import ManuscriptParserService
-    parse_result: Dict[str, Any] = await asyncio.to_thread(
-        ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
-    )
+    if parse_result is None:
+        parse_result = await asyncio.to_thread(
+            ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
+        )
+    # Saved for this manuscript either way, so /analyze_v7 can find it by manuscript_id (the save does not hold up the scan).
+    SectionCache.save_in_background(manuscript_id, req.user_id, content_hash, parse_result, raw_text)
     parsed_sections: Dict[str, str] = parse_result["parsed_sections"]
     section_order: List[str] = parse_result.get("section_order", list(parsed_sections))
     section_roles: Dict[str, str] = parse_result.get("section_roles", {})
 
     # Score physical neighbors after merging repeated literal headings.
     # A reference list is not prose, so it has no meaningful link to the section before it.
-    sections = [section for section in merge_repeated_sections(parsed_sections, section_order)
-                if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS]
+    sections = comparable_sections(parsed_sections, section_order, section_roles)
     structure_note = _structure_note(parse_result.get("structure"), len(sections))
     # The citation audit is network-bound and independent of the model, so it starts now and runs while the local
     # model rates the sections. The Gemini reviews and the AI-text check then run at the same time too; nothing is

@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from services import gemini
-from services.v7_scan import EXPLAIN_LIMIT
+EXPLAIN_LIMIT = 15  # any number of expected calls works here
 
 
 class FakeClock:

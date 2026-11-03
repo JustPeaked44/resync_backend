@@ -408,3 +408,110 @@ def test_truncate_tail_keeps_the_end_on_a_whole_word():
     cut = truncate_tail(text, 100)
     assert cut.startswith("[...] word") and cut.endswith("word1999") and len(cut) <= 110
     assert truncate_tail("short text", 100) == "short text"
+
+
+def batch_item(order, role_a, text_a, role_b, text_b, overall=0.3):
+    scores = dict(SCORES, overall_coherence=overall)
+    return {"id": order, "role_a": role_a, "text_a": text_a, "role_b": role_b, "text_b": text_b, "scores": scores,
+            "culprits_a": [], "culprits_b": [], "adjacent": True}
+
+
+def test_a_batch_is_one_request_and_each_answer_is_read_by_its_pair_number(monkeypatch):
+    prompts = []
+
+    async def fake_generate(prompt, max_tokens=None):
+        prompts.append((prompt, max_tokens))
+        return {"pairs": [
+            {"pair_id": 7, "severity": "None", "link_summary": "They connect.", "highlighted_inconsistencies": [], "recommendations": []},
+            {"pair_id": "9", "severity": "Moderate", "link_summary": "Goal and method differ.",
+             "highlighted_inconsistencies": [{"section": "C", "quote": "C text here.", "what": "The goal changes.", "why": "The reader cannot follow."}],
+             "recommendations": []},
+            {"pair_id": 99, "severity": "Critical"},                   # not one of the pairs asked about: ignored
+        ]}
+
+    monkeypatch.setattr(v7_explain, "_generate", fake_generate)
+    items = [batch_item(7, "A", "A text here.", "B", "B text here."), batch_item(9, "C", "C text here.", "D", "D text here.")]
+    answers = asyncio.run(v7_explain.explain_batch(items))
+    assert len(prompts) == 1 and prompts[0][1] == v7_explain.BATCH_MAX_OUTPUT_TOKENS      # ONE call for both pairs
+    prompt = prompts[0][0]
+    assert "=== PAIR 7 ===" in prompt and "=== PAIR 9 ===" in prompt and "A text here." in prompt and "D text here." in prompt
+    assert "{count}" not in prompt and "{pairs}" not in prompt and "{rules}" not in prompt   # every placeholder was filled
+    assert set(answers) == {7, 9}
+    assert answers[7]["severity"] == "None" and answers[9]["severity"] == "Moderate"
+    assert answers[9]["highlighted_inconsistencies"][0]["quote"] == "C text here."       # still verified against the section text
+
+
+def test_a_batch_leaves_out_pairs_the_answer_does_not_cover_and_returns_nothing_for_a_broken_answer(monkeypatch):
+    async def partial(prompt, max_tokens=None):
+        return {"pairs": [{"pair_id": 1, "severity": "None"}]}
+
+    async def broken(prompt, max_tokens=None):
+        return {"summary": "no pairs here"}
+
+    async def instant(_):
+        return None
+
+    items = [batch_item(1, "A", "A text.", "B", "B text."), batch_item(2, "C", "C text.", "D", "D text.")]
+    monkeypatch.setattr(v7_explain.asyncio, "sleep", instant)
+    monkeypatch.setattr(v7_explain, "_generate", partial)
+    assert set(asyncio.run(v7_explain.explain_batch(items))) == {1}                     # pair 2 is left for the caller
+    monkeypatch.setattr(v7_explain, "_generate", broken)
+    assert asyncio.run(v7_explain.explain_batch(items)) == {}                            # every attempt failed: the caller reviews each pair
+    assert asyncio.run(v7_explain.explain_batch([])) == {}
+
+
+def test_a_bridge_batch_returns_two_sentences_per_pair_and_drops_bad_ones(monkeypatch):
+    prompts = []
+
+    async def fake_generate(prompt, max_tokens=None):
+        prompts.append(prompt)
+        return {"pairs": [{"pair_id": 1, "bridges": ["The tables hold the data entered on the screens.", "The screens fill the tables described before."]},
+                          {"pair_id": 2, "bridges": ["Building on this, X holds.", "Fine sentence."]},        # meta phrase: dropped
+                          {"pair_id": 3, "bridges": ["Only one sentence."]}]}                               # not two: dropped
+
+    monkeypatch.setattr(v7_explain, "_generate", fake_generate)
+    items = [{"id": n, "role_a": f"A{n}", "text_a": "a text", "role_b": f"B{n}", "text_b": "b text"} for n in (1, 2, 3)]
+    found = asyncio.run(v7_explain.suggest_bridges_batch(items))
+    assert len(prompts) == 1 and set(found) == {1}
+    assert [(b["section"], b["placement"]) for b in found[1]] == [("A1", "end"), ("B1", "start")]
+
+
+ADDED = "These pedagogical principles and localized writing challenges establish the theoretical foundation for evaluating academic writing software."
+
+
+def test_a_suggested_sentence_the_student_already_added_is_never_suggested_again():
+    scores = dict(SCORES, overall_coherence=0.4)
+    related_literature = "Writing challenges are common among local student researchers. " + ADDED
+    related_studies = "Existing software platforms address various aspects of writing quality. Turnitin checks similarity."
+    raw = {"severity": "None", "bridges": [
+        {"section": "A", "placement": "end", "sentence": ADDED},                                   # exactly what is already the last sentence
+        {"section": "B", "placement": "start", "sentence": "Existing software platforms address several aspects of writing quality."}]}   # nearly the first sentence
+    result = v7_explain.normalize_explanation(raw, scores, "A", related_literature, "B", related_studies)
+    assert result["bridges"] == []                                                                   # both are already in the paper
+    fresh = dict(raw, bridges=[{"section": "A", "placement": "end", "sentence": "Localized challenges shape how software must judge structure."},
+                               {"section": "B", "placement": "start", "sentence": "Each platform below is read against those challenges."}])
+    assert len(v7_explain.normalize_explanation(fresh, scores, "A", related_literature, "B", related_studies)["bridges"]) == 2   # new sentences are kept
+
+
+def test_already_there_compares_the_edge_of_the_section_and_ignores_case_and_spacing():
+    text = "First sentence of the section here.\n\nA middle sentence about other things entirely. The last   SENTENCE of the section here."
+    assert v7_explain.already_there("the last sentence of the section here", text, "end")
+    assert v7_explain.already_there("First sentence of the section here!", text, "start")           # nearly the same
+    assert v7_explain.already_there("A middle sentence about other things entirely.", text, "end")  # anywhere in the section counts
+    assert not v7_explain.already_there("An unrelated new sentence links the two parts together.", text, "end")
+    assert v7_explain.already_there("", text, "end")                                                  # an empty suggestion is never useful
+
+
+def test_a_bridge_batch_drops_sentences_that_are_already_in_the_paper(monkeypatch):
+    async def fake_generate(prompt, max_tokens=None):
+        return {"pairs": [{"pair_id": 1, "bridges": [ADDED, "Existing platforms are compared against these foundations."]},
+                          {"pair_id": 2, "bridges": ["A brand new linking sentence about the method.", "Another brand new linking sentence about results."]}]}
+
+    async def instant(_):
+        return None
+
+    monkeypatch.setattr(v7_explain, "_generate", fake_generate)
+    monkeypatch.setattr(v7_explain.asyncio, "sleep", instant)
+    items = [{"id": 1, "role_a": "A", "text_a": f"Intro here. {ADDED}", "role_b": "B", "text_b": "Start of B."},
+             {"id": 2, "role_a": "C", "text_a": "Text of C here.", "role_b": "D", "text_b": "Text of D here."}]
+    assert set(asyncio.run(v7_explain.suggest_bridges_batch(items))) == {2}                          # pair 1 repeated the sentence the student added

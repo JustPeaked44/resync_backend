@@ -1,10 +1,12 @@
 """Strict, torch-free Gemini explanations of v7-scored neighbor pairs."""
 
 import asyncio
+import difflib
 import json
 import logging
 import re
 from services import gemini
+from services.verdict_cache import VerdictCache
 
 logger = logging.getLogger("resync.v7_explain")
 
@@ -50,13 +52,39 @@ For each recommendation, category names the score part its revision fixes: objec
 Use exactly {a} or {b} as each section value. Quotes and original sentences must be copied verbatim from the named section.
 Recommend only revisions justified by the supplied text.
 Give one recommendation for each exact quote in highlighted_inconsistencies that you can fix, and do not combine passages.
-bridges are NEW linking sentences the student can ADD, the fastest way to connect two sections. Return exactly TWO bridges when severity is not "None", and ALSO when the sections are neighbors and the model's overall score is below 0.65 even though severity is "None" (a missing transition is not an inconsistency, so it carries no penalty). Otherwise return an empty array. The two bridges are one on each side: first section is exactly {a} with placement "end" (added after its last sentence), then section is exactly {b} with placement "start" (added before its first sentence). Each sentence is ONE plain sentence of at most 30 words written as natural thesis prose that states the concrete content link between the two sections: name the specific things in one section that the other section depends on, builds on, or applies (for example: the tables defined here store the data entered through the screens for batches and listings). NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence. {bridges_note}
+bridges are NEW linking sentences the student can ADD, the fastest way to connect two sections. Return exactly TWO bridges when severity is not "None", and ALSO when the sections are neighbors and the model's overall score is below 0.65 even though severity is "None" (a missing transition is not an inconsistency, so it carries no penalty). Otherwise return an empty array. The two bridges are one on each side: first section is exactly {a} with placement "end" (added after its last sentence), then section is exactly {b} with placement "start" (added before its first sentence). Each sentence is ONE plain sentence of at most 30 words written as natural thesis prose that states the concrete content link between the two sections: name the specific things in one section that the other section depends on, builds on, or applies (for example: the tables defined here store the data entered through the screens for batches and listings). NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence. The student may already have added linking sentences from an earlier suggestion: if the text already ends or starts with a sentence that links the two sections, do NOT repeat or reword it; write a NEW sentence that links a different idea from each section. {bridges_note}
 A recommended revision must preserve the original sentence's meaning and repair only the inconsistency you quoted; never adopt the other section's topic."""
-BRIDGE_PROMPT = """You help a student connect two neighboring sections of their thesis. You see the END of the "{a}" section and the START of the "{b}" section.
-The end of "{a}": {text_a}
-The start of "{b}": {text_b}
-Write exactly TWO new sentences the student can ADD: first one for the end of "{a}", then one for the start of "{b}". Each is ONE plain sentence of at most 30 words, written as natural thesis prose that states a concrete link between the two sections: name the specific things in one section that the other depends on, builds on, or applies. NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence.
-Return JSON with one key, bridges: an array of exactly two strings, in that order."""
+FAR_VIEW_NOTE = "These two sections are NOT neighbors in the manuscript, and you see the START of each. Judge whether they are consistent with each other, and whether the later section carries through the goals, methods, and claims the earlier one sets up (for example: whether the methodology, results, and conclusions match the stated objectives)."
+BATCH_MAX_OUTPUT_TOKENS = 32768   # room for the answers of a whole batch
+
+
+def _batch_words(text):
+    """The single-pair rules name sections {a} and {b}; in a batch each pair has its own names, given at its top."""
+    return (text.replace('"{a}"', '"<first section name>"').replace('"{b}"', '"<second section name>"')
+            .replace("{a}", "<first section name>").replace("{b}", "<second section name>"))
+
+
+_RULES_AT = PAIR_PROMPT.index("Return JSON with exactly nine top-level keys")
+_STYLE_AT = PAIR_PROMPT.index("Write every user-facing")
+# One request for several pairs: the same rules as a single pair, with an answer per pair keyed by its number.
+BATCH_PROMPT = (
+    "You are an objective logic auditor. Below are {count} numbered pairs of sections from the same manuscript. For EACH pair, "
+    "analyze its two sections and decide, independently of the other pairs, whether there is a REAL logical inconsistency between "
+    "them. A low score alone is not an inconsistency. The pairs were grouped only to save time; they do not affect each other.\n"
+    "{rules}\n"
+    + _batch_words(PAIR_PROMPT[_STYLE_AT:PAIR_PROMPT.index("{view_note}")])
+    + "Where the rules below name a section, use the real names given at the top of the pair you are answering; the first section "
+      "is Section A and the second is Section B.\n{pairs}\n"
+    + _batch_words(PAIR_PROMPT[_RULES_AT:])
+    .replace("Return JSON with exactly nine top-level keys:",
+             "Return JSON with ONE top-level key, pairs: an array with one object per pair, in the same order. Each object has "
+             "exactly ten keys: pair_id (the pair's number, copied exactly), ")
+    .replace("{bridges_note}", "A pair whose block says its sections are not neighbors must have an empty bridges array.")
+)
+BRIDGE_BATCH_PROMPT = """You help a student connect neighboring sections of their thesis. Below are numbered pairs. For each pair you see the END of the first section and the START of the second section.
+{pairs}
+For EACH pair write exactly TWO new sentences the student can ADD: first one for the end of the first section, then one for the start of the second section. Each is ONE plain sentence of at most 30 words, written as natural thesis prose that states a concrete link between the two sections: name the specific things in one section that the other depends on, builds on, or applies. NEVER mention section names or write meta phrases such as "this section", "the next section", "the previous section", "as discussed above", or "building on". Use only topics, terms, and numbers that appear in the supplied text; never invent facts, results, or numbers, and never copy an existing sentence. The student may already have added linking sentences from an earlier suggestion: if the text already ends or starts with a sentence that links the two sections, do NOT repeat or reword it; write a NEW sentence that links a different idea from each section.
+Return JSON with one key, pairs: an array with one object per pair, in the same order, each with pair_id (the pair's number, copied exactly) and bridges (an array of exactly two strings)."""
 SUMMARY_PROMPT = """Summarize how consistent these pairs of manuscript sections are in one concise paragraph.
 {rules}
 Never mention the model, PyTorch, or how scores are produced. Express any score as a whole-number percentage (e.g. 80%), never a raw decimal.
@@ -81,6 +109,25 @@ CATEGORY_SCORES = {"objectives": "objectives_alignment", "methodology": "methodo
 CATEGORY_ALIASES = {"claim": "claims", "claim_support": "claims", "numbers": "numeric",
                     "numeric_consistency": "numeric", "objectives_alignment": "objectives",
                     "methodology_fit": "methodology"}
+
+
+def _squash(text):
+    return re.sub(r"[^a-z0-9 ]", "", re.sub(r"\s+", " ", (text or "").lower())).strip()
+
+
+def already_there(sentence, text, placement):
+    """True when the student's section already holds this sentence, or one nearly the same, where it would be added.
+
+    The AI is told never to repeat an existing sentence, but it does when a student has just added its earlier suggestion,
+    so the check is made here: a suggestion that is already in the paper is never shown."""
+    wanted = _squash(sentence)
+    if not wanted:
+        return True
+    if wanted in _squash(text):
+        return True
+    edge = [piece for piece in re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip()) if piece.strip()]
+    edge = edge[:4] if placement == "start" else edge[-4:]
+    return any(difflib.SequenceMatcher(None, wanted, _squash(piece)).ratio() >= 0.85 for piece in edge)
 
 
 def recommendation_category(value, scores):
@@ -160,7 +207,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             continue
         section, sentence = section_name(item.get("section")), item.get("sentence")
         if (section and item.get("placement") in ("start", "end") and isinstance(sentence, str) and sentence.strip()
-                and not META_PHRASE.search(sentence)):
+                and not META_PHRASE.search(sentence) and not already_there(sentence, source.get(section), item["placement"])):
             bridges.append({"section": section, "placement": item["placement"], "sentence": friendly(sentence)})
     severity = raw.get("severity").strip().capitalize() if isinstance(raw.get("severity"), str) else None
     quoted = any(item["quote"] for item in issues) or bool(recommendations)   # verified lines from the paper
@@ -187,44 +234,48 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             "recommendations": recommendations, "reference_list": references, "bridges": bridges}
 
 
-async def _generate(prompt):
+async def _generate(prompt, max_tokens=None):
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-               "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}}
+               "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
+                                    **({"maxOutputTokens": max_tokens} if max_tokens else {})}}
     response = await gemini.post_gemini_with_retry(payload)
     response.raise_for_status()
     return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
 
 
-async def suggest_bridges(role_a, text_a, role_b, text_b):
-    """Two linking sentences (end of A, start of B) for neighbors the main review did not write any for; [] if Gemini cannot."""
-    prompt = (BRIDGE_PROMPT.replace("{a}", role_a).replace("{b}", role_b)
-              .replace("{text_a}", gemini.truncate_tail(text_a)).replace("{text_b}", gemini.truncate_text(text_b, 3500)))
-    for attempt in range(1, EXPLAIN_ATTEMPTS + 1):
-        try:
-            raw = (await _generate(prompt)).get("bridges")
-            sentences = [" ".join(item.split()) for item in raw if isinstance(item, str) and item.strip()] if isinstance(raw, list) else []
-            if len(sentences) == 2 and not any(META_PHRASE.search(sentence) or len(sentence.split()) > 45 for sentence in sentences):
-                return [{"section": role_a, "placement": "end", "sentence": sentences[0]},
-                        {"section": role_b, "placement": "start", "sentence": sentences[1]}]
-        except gemini.GeminiQuotaExhausted:
-            return []
-        except Exception:
-            logger.exception("v7 Gemini bridge suggestion failed for %s -> %s (attempt %s of %s)", role_a, role_b, attempt, EXPLAIN_ATTEMPTS)
-        if attempt < EXPLAIN_ATTEMPTS:
-            await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
-    return []
+def _pair_view(role_a, text_a, role_b, text_b, adjacent):
+    """What Gemini is shown of one pair: neighbors meet at the end of A and the start of B; far-apart sections show both starts."""
+    if adjacent:   # neighbors connect at their boundary: the end of the first section and the start of the next
+        return {"view_note": "You only see the END of Section A and the START of Section B, because that is where the two sections connect. Judge whether Section B follows from what Section A ends with.",
+                "label_a": "the end of that section", "label_b": "the start of that section", "bridges_note": "",
+                "text_a": gemini.truncate_tail(text_a), "text_b": gemini.truncate_text(text_b, 3500)}
+    # far-apart sections: the start of each carries its goals and topic
+    return {"view_note": FAR_VIEW_NOTE,
+            "label_a": "the start of that section", "label_b": "the start of that section",
+            "bridges_note": "These two sections are not neighbors, so bridges MUST be an empty array.",
+            "text_a": gemini.truncate_text(text_a, 3500), "text_b": gemini.truncate_text(text_b, 3500)}
+
+
+def pair_cache_key(role_a, text_a, role_b, text_b, scores, adjacent):
+    """The fingerprint of everything the AI is shown for a pair: same text and ratings, same key, so the same saved verdict."""
+    view = _pair_view(role_a, text_a, role_b, text_b, adjacent)
+    ratings = {key: round(value, 4) if isinstance(value, (int, float)) else value for key, value in coherence_scores(scores).items()}
+    return VerdictCache.fingerprint(role_a, role_b, bool(adjacent), view["text_a"], view["text_b"], ratings, bool(scores.get("numeric_applicable")))
+
+
+def _finish_explanation(result, role_a, text_a, role_b, text_b):
+    """Keeps only recommendations whose sentence really is in the section they name, one per sentence."""
+    sources = {role_a: text_a, role_b: text_b}
+    unique = {}
+    for item in result["recommendations"]:
+        if item["original_sentence"] in sources[item["section"]]:
+            unique.setdefault((item["section"], item["original_sentence"]), item)
+    result["recommendations"] = list(unique.values())
+    return result
 
 
 async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culprits_b, adjacent=True):
-    if adjacent:   # neighbors connect at their boundary: the end of the first section and the start of the next
-        view = {"view_note": "You only see the END of Section A and the START of Section B, because that is where the two sections connect. Judge whether Section B follows from what Section A ends with.",
-                "label_a": "the end of that section", "label_b": "the start of that section", "bridges_note": "",
-                "text_a": gemini.truncate_tail(text_a), "text_b": gemini.truncate_text(text_b, 3500)}
-    else:          # far-apart sections: the start of each carries its goals and topic
-        view = {"view_note": "These two sections are NOT neighbors in the manuscript, and you see the START of each. Judge whether they are consistent with each other, and whether the later section carries through the goals, methods, and claims the earlier one sets up (for example: whether the methodology, results, and conclusions match the stated objectives).",
-                "label_a": "the start of that section", "label_b": "the start of that section",
-                "bridges_note": "These two sections are not neighbors, so bridges MUST be an empty array.",
-                "text_a": gemini.truncate_text(text_a, 3500), "text_b": gemini.truncate_text(text_b, 3500)}
+    view = _pair_view(role_a, text_a, role_b, text_b, adjacent)
     prompt = PAIR_PROMPT.format(rules=STRICT_RULES, a=role_a, b=role_b, **view,
                                 scores=json.dumps(coherence_scores(scores)),
                                 pair_score=scores.get("pair_score", scores["overall_coherence"]),
@@ -245,13 +296,98 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
         result = normalize_explanation({}, scores, role_a, text_a, role_b, text_b)
         result["severity"] = None  # unknown, so the pair is neither cleared nor penalized
         result["failed_dimension"] = None
-    sources = {role_a: text_a, role_b: text_b}
-    unique = {}
-    for item in result["recommendations"]:
-        if item["original_sentence"] in sources[item["section"]]:
-            unique.setdefault((item["section"], item["original_sentence"]), item)
-    result["recommendations"] = list(unique.values())
-    return result
+    return _finish_explanation(result, role_a, text_a, role_b, text_b)
+
+
+def _pair_block(item):
+    """One numbered pair inside a batch prompt."""
+    view = _pair_view(item["role_a"], item["text_a"], item["role_b"], item["text_b"], item["adjacent"])
+    scores = item["scores"]
+    return (f"=== PAIR {item['id']} ===\n"
+            f"First section name: {item['role_a']}\nSecond section name: {item['role_b']}\n"
+            f"{view['view_note']}\n"
+            f"First section ({item['role_a']}), {view['label_a']}: {view['text_a']}\n"
+            f"Second section ({item['role_b']}), {view['label_b']}: {view['text_b']}\n"
+            f"Model scores (0 to 1): {json.dumps(coherence_scores(scores))}\n"
+            f"Pair score for the Strong/Fair/Weak assessment (0 to 1): {scores.get('pair_score', scores['overall_coherence'])}\n"
+            f"Culprit sentences in the first section: {json.dumps(item['culprits_a'])}\n"
+            f"Culprit sentences in the second section: {json.dumps(item['culprits_b'])}\n"
+            + (f"{view['bridges_note']}\n" if view["bridges_note"] else ""))
+
+
+async def explain_batch(items):
+    """One Gemini call for several pairs at once. Returns {pair id: explanation} for every pair the answer covers; pairs
+    it leaves out (or everything, if the call fails) are for the caller to review on their own.
+
+    Each item: id, role_a, text_a, role_b, text_b, scores, culprits_a, culprits_b, adjacent."""
+    if not items:
+        return {}
+    prompt = BATCH_PROMPT.replace("{count}", str(len(items))).replace("{rules}", STRICT_RULES) \
+        .replace("{pairs}", "\n".join(_pair_block(item) for item in items))
+    by_id = {str(item["id"]): item for item in items}
+    for attempt in range(1, EXPLAIN_ATTEMPTS + 1):
+        try:
+            raw = await _generate(prompt, max_tokens=BATCH_MAX_OUTPUT_TOKENS)
+            answered = raw.get("pairs") if isinstance(raw, dict) else None
+            if not isinstance(answered, list):
+                raise ValueError("the answer has no pairs array")
+            found = {}
+            for entry in answered:
+                item = by_id.get(str(entry.get("pair_id"))) if isinstance(entry, dict) else None
+                if item is None or item["id"] in found:
+                    continue
+                try:
+                    explanation = normalize_explanation(entry, item["scores"], item["role_a"], item["text_a"], item["role_b"], item["text_b"], item["adjacent"])
+                    found[item["id"]] = _finish_explanation(explanation, item["role_a"], item["text_a"], item["role_b"], item["text_b"])
+                except Exception:
+                    logger.exception("v7 batch answer for pair %s could not be read", item["id"])
+            if found:
+                return found
+            raise ValueError("the answer covers none of the pairs")
+        except gemini.GeminiQuotaExhausted:
+            logger.warning("v7 Gemini quota exhausted; a batch of %s pairs is left for single reviews", len(items))
+            return {}
+        except Exception:
+            logger.exception("v7 Gemini batch of %s pairs failed (attempt %s of %s)", len(items), attempt, EXPLAIN_ATTEMPTS)
+            if attempt < EXPLAIN_ATTEMPTS:
+                await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
+    return {}
+
+
+async def suggest_bridges_batch(items):
+    """Linking sentences (end of A, start of B) for neighbors the main review wrote none for, in ONE call.
+    Returns {pair id: two bridges}; pairs Gemini cannot do are left out. Each item: id, role_a, text_a, role_b, text_b."""
+    if not items:
+        return {}
+    blocks = "\n".join(f'=== PAIR {item["id"]} ===\nFirst section name: {item["role_a"]}\nSecond section name: {item["role_b"]}\n'
+                       f'The end of "{item["role_a"]}": {gemini.truncate_tail(item["text_a"])}\n'
+                       f'The start of "{item["role_b"]}": {gemini.truncate_text(item["text_b"], 3500)}\n' for item in items)
+    prompt = BRIDGE_BATCH_PROMPT.replace("{pairs}", blocks)
+    by_id = {str(item["id"]): item for item in items}
+    for attempt in range(1, EXPLAIN_ATTEMPTS + 1):
+        try:
+            raw = await _generate(prompt, max_tokens=BATCH_MAX_OUTPUT_TOKENS)
+            answered = raw.get("pairs") if isinstance(raw, dict) else None
+            found = {}
+            for entry in answered if isinstance(answered, list) else []:
+                item = by_id.get(str(entry.get("pair_id"))) if isinstance(entry, dict) else None
+                sentences = entry.get("bridges") if item is not None else None
+                if item is None or not isinstance(sentences, list):
+                    continue
+                sentences = [" ".join(s.split()) for s in sentences if isinstance(s, str) and s.strip()]
+                if (len(sentences) == 2 and not any(META_PHRASE.search(s) or len(s.split()) > 45 for s in sentences)
+                        and not already_there(sentences[0], item["text_a"], "end") and not already_there(sentences[1], item["text_b"], "start")):
+                    found[item["id"]] = [{"section": item["role_a"], "placement": "end", "sentence": sentences[0]},
+                                         {"section": item["role_b"], "placement": "start", "sentence": sentences[1]}]
+            if found:
+                return found
+        except gemini.GeminiQuotaExhausted:
+            return {}
+        except Exception:
+            logger.exception("v7 Gemini bridge batch of %s pairs failed (attempt %s of %s)", len(items), attempt, EXPLAIN_ATTEMPTS)
+        if attempt < EXPLAIN_ATTEMPTS:
+            await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
+    return {}
 
 
 async def explain_summary(flow, findings):

@@ -54,3 +54,23 @@ def test_numeric_text_rule_and_non_figures():
     assert has_figures("The value was 20.1.")
     assert not numeric_applicable("n = 120", "No measured values.", "both")
     assert numeric_applicable("n = 120", "No measured values.", "either")
+
+
+def test_citation_years_and_lone_digits_are_not_figures_but_real_numbers_are():
+    citations = "Olitres (2023) found this. Turnitin, 2024 reports it too. Studies in 2025 and 2023 agree [12] [3, 4]. Step 6 follows."
+    assert not has_figures(citations)
+    assert has_figures(citations + " The sample had 120 students.")
+    assert has_figures("Accuracy reached 78%.") and has_figures("The mean was 3.42.") and has_figures("n = 5")
+    assert not has_figures("There were 5 groups.")                       # a lone digit is usually a list number, not data
+
+
+def test_figures_are_looked_for_in_the_text_the_model_compares_not_the_whole_sections():
+    from services.v7_scan import figure_windows
+    middle = "plain words only. " * 300
+    sections = [{"text": "The survey had 120 respondents. " + middle + "Nothing numeric here at the end."},
+                {"text": "No numbers at the start. " + middle + "Later the result was 45%."}]
+    assert has_figures(sections[0]["text"]) and has_figures(sections[1]["text"])    # the whole sections both hold figures...
+    window_a, window_b = figure_windows(sections, 0, 1)
+    assert not numeric_applicable(window_a, window_b)                                # ...but the end of A and the start of B do not
+    start_a, _ = figure_windows(sections + [{"text": "x"}], 0, 2)
+    assert has_figures(start_a)                                                      # a far-apart pair compares the starts

@@ -104,3 +104,17 @@ def test_transition_averages_cover_every_neighbor_pair_and_count_figures_only_wh
     assert abs(averages["numeric_consistency"] - 0.9) < 1e-6      # only S2->S3 has figures on both sides (the stub rates it 0.9)
     only_plain = v7_logic.analyze_manuscript([plain(0), plain(1), plain(2)])["transition_averages"]
     assert only_plain["numeric_consistency"] is None              # no figures anywhere: nothing to measure
+
+
+def test_with_no_limit_every_neighbor_pair_and_every_pair_that_should_agree_is_kept(monkeypatch):
+    stub_model(monkeypatch)
+    monkeypatch.setattr(v7_logic, "HOLISTIC_PAIR_LIMIT", None)
+    monkeypatch.setattr(v7_logic, "HOLISTIC_SELECTION", "balanced")
+    paper = sections(["objectives", "methodology", "methodology", "results", "conclusion"])
+    kept = v7_logic.analyze_manuscript(paper)
+    pairs = [(p["index_a"], p["index_b"]) for p in kept["pairs"]]
+    assert kept["pairs_considered"] == 10
+    assert [pair for pair in pairs if pair[1] == pair[0] + 1] == [(0, 1), (1, 2), (2, 3), (3, 4)]      # all four neighbor pairs
+    # far-apart pairs whose roles should agree: objectives with methodology/results/conclusion, methodology with results/conclusion
+    assert [pair for pair in pairs if pair[1] != pair[0] + 1] == [(0, 2), (0, 3), (0, 4), (1, 3), (1, 4), (2, 4)]
+    assert len(pairs) == len(set(pairs)) and pairs == sorted(pairs)                                    # in manuscript order, none twice

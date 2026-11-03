@@ -13,9 +13,8 @@ def identity_calibration(monkeypatch):
 
 
 
-@pytest.fixture
-def assembled_scan(monkeypatch):
-    captured = {}
+def build_scan(monkeypatch, reuse_saved_sections=False):
+    captured = {"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []}
     sections = {"Related Studies": "A source sentence with several words.",
                 "Related Studies (2)": "A second source sentence with several words.",
                 "Results": "The resulting text also contains several words."}
@@ -37,9 +36,11 @@ def assembled_scan(monkeypatch):
             return SimpleNamespace(data={})
 
     async def ingest(*_):
+        captured["ingested"] += 1
         return "raw manuscript"
 
     def parse(*_):
+        captured["parsed"] += 1
         return {"parsed_sections": sections, "section_order": list(sections),
                 "section_roles": {"Results": "results"}}
 
@@ -92,10 +93,49 @@ def assembled_scan(monkeypatch):
     monkeypatch.setattr(main.CitationAuditService, "audit_citations", citation)
     monkeypatch.setattr(main.NotificationDeliveryService, "send_scan_completion_alert", notify)
 
+    async def find_saved(user_id, content_hash):
+        captured["cache_find"].append((user_id, content_hash))
+        if not reuse_saved_sections:
+            return None
+        return {"manuscript_id": "earlier-scan", "raw_text": "raw manuscript",
+                "parse_result": {"parsed_sections": sections, "section_order": list(sections),
+                                 "section_roles": {"Results": "results"}, "structure": "headings"}}
+
+    async def no_batch(*_, **__):
+        return {}   # this fake Gemini answers one pair at a time, so every pair falls back to its own review
+
+    monkeypatch.setattr(v7_explain, "explain_batch", no_batch)
+    monkeypatch.setattr(v7_explain, "suggest_bridges_batch", no_batch)
+    monkeypatch.setattr(main.SectionCache, "find", find_saved)
+    monkeypatch.setattr(main.SectionCache, "save_in_background", lambda *args: captured["cache_save"].append(args))
     req = main.ScanRequest(user_id="user", manuscript_title="Test", filename="test.docx")
     result = asyncio.run(main._execute_scan_pipeline(req, "run", "ms", 4, b"doc", "test.docx"))
     payload = result.model_dump(mode="json")
     return payload, captured, sections
+
+
+@pytest.fixture
+def assembled_scan(monkeypatch):
+    return build_scan(monkeypatch)
+
+
+def test_a_first_scan_reads_and_parses_the_file_then_saves_its_sections(monkeypatch):
+    payload, captured, sections = build_scan(monkeypatch)
+    assert captured["ingested"] == 1 and captured["parsed"] == 1
+    [(user_id, digest)] = captured["cache_find"]
+    assert user_id == "user" and len(digest) == 64
+    [(manuscript_id, saved_user, saved_hash, parse_result, raw_text)] = captured["cache_save"]
+    assert (manuscript_id, saved_user, saved_hash, raw_text) == ("ms", "user", digest, "raw manuscript")
+    assert parse_result["parsed_sections"] == sections
+
+
+def test_scanning_a_saved_file_again_skips_reading_and_parsing_it(monkeypatch):
+    first, _, _ = build_scan(monkeypatch)
+    again, captured, _ = build_scan(monkeypatch, reuse_saved_sections=True)
+    assert captured["ingested"] == 0 and captured["parsed"] == 0                  # neither step ran
+    assert again["overall_coherence_score"] == first["overall_coherence_score"]    # and the report is the same
+    assert again["manuscript_flow"] == first["manuscript_flow"] or len(again["manuscript_flow"]) == len(first["manuscript_flow"])
+    assert [args[0] for args in captured["cache_save"]] == ["ms"]                  # this scan's manuscript can now be found by its id
 
 
 def test_scan_contract_and_persistence_with_fakes(assembled_scan):

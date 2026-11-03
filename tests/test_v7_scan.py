@@ -11,6 +11,16 @@ def identity_calibration(monkeypatch):
     monkeypatch.setattr(v7_scan, "CALIBRATION", ((0.0, 0.0), (1.0, 1.0)))
 
 
+@pytest.fixture(autouse=True)
+def reviews_fall_back_to_single_pairs(monkeypatch):
+    """Most tests fake the one-pair review. The batch calls answer nothing here, so every pair falls back to that fake;
+    the batching tests at the end of this file set their own."""
+    async def nothing(*_, **__):
+        return {}
+    monkeypatch.setattr(v7_explain, "explain_batch", nothing)
+    monkeypatch.setattr(v7_explain, "suggest_bridges_batch", nothing)
+
+
 
 def test_merge_literal_repeats_in_first_occurrence_order():
     sections = {"Related Studies": "first", "Limitations": "one", "Related Studies (2)": "second",
@@ -93,16 +103,12 @@ def test_explanation_cap_and_single_summary(monkeypatch):
         state["summary_calls"] += 1
         return None
 
-    async def no_bridges(*_, **__):
-        return []
-
     monkeypatch.setattr(v7_explain, "explain_pair", fake_pair)
     monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
-    monkeypatch.setattr(v7_explain, "suggest_bridges", no_bridges)
     findings, recommendations, synthesis = asyncio.run(explain_flow(sections, flow))
-    assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 16))
-    assert flow[15]["explanation"] is None  # 30 weak pairs: the hard cap is 15
-    assert 4 < state["peak"] <= 15 and state["summary_calls"] == 1  # all reviewed pairs run at the same time
+    # 30 weak pairs and no cap: every one is reviewed
+    assert [p["order"] for p in flow if p["explanation"] is not None] == list(range(1, 31))
+    assert 4 < state["peak"] <= v7_scan.EXPLAIN_CONCURRENCY and state["summary_calls"] == 1   # single reviews run side by side, within the limit
     assert findings == []
     assert recommendations == []  # no generic advice is invented for pairs Gemini found nothing in
     assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 30
@@ -255,18 +261,124 @@ def test_a_loosely_linked_neighbor_pair_gets_linking_sentences_even_when_the_mai
         return {"severity": "None", "failed_dimension": "none", "coherence_scores": {}, "highlighted_inconsistencies": [],
                 "recommendations": [], "reference_list": [], "bridges": []}
 
-    async def fake_bridges(role_a, text_a, role_b, text_b):
-        asked.append((role_a, role_b))
-        return [{"section": role_a, "placement": "end", "sentence": f"{role_a} sets up what {role_b} applies."},
-                {"section": role_b, "placement": "start", "sentence": f"{role_b} applies what {role_a} sets up."}]
+    async def fake_bridges(items):
+        asked.append([(item["role_a"], item["role_b"]) for item in items])
+        return {item["id"]: [{"section": item["role_a"], "placement": "end", "sentence": f"{item['role_a']} sets up what {item['role_b']} applies."},
+                             {"section": item["role_b"], "placement": "start", "sentence": f"{item['role_b']} applies what {item['role_a']} sets up."}]
+                for item in items}
 
     async def fake_summary(*_):
         return None
 
     monkeypatch.setattr(v7_explain, "explain_pair", cleared_without_bridges)
     monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
-    monkeypatch.setattr(v7_explain, "suggest_bridges", fake_bridges)
+    monkeypatch.setattr(v7_explain, "suggest_bridges_batch", fake_bridges)
     _, recommendations, _ = asyncio.run(explain_flow(sections, flow))
-    assert asked == [("A", "B"), ("C", "D")]                       # only the loose neighbor pairs, nothing for B-C
+    assert asked == [[("A", "B"), ("C", "D")]]                      # ONE call for both loose neighbor pairs, nothing for B-C
     assert [(r["pair_order"], r["kind"]) for r in recommendations] == [(1, "add"), (1, "add"), (3, "add"), (3, "add")]
     assert [p["severity"] for p in flow] == ["None", "None", "None"]   # a suggestion is never a penalty
+
+
+def pair_with(overall, order=1):
+    return {"order": order, "scores": {"overall_coherence": overall}}
+
+
+def test_weak_pairs_are_grouped_by_severity_weakest_first():
+    pairs = [pair_with(0.7, 1), pair_with(0.2, 2), pair_with(0.5, 3), pair_with(0.39, 4), pair_with(0.84, 5), pair_with(0.65, 6), pair_with(0.4, 7)]
+    batches = v7_scan.severity_batches(pairs)
+    assert [(tier, [p["order"] for p in group]) for tier, group in batches] == [
+        ("Critical", [2, 4]), ("Moderate", [7, 3]), ("Minor", [6, 1, 5])]     # 0.40 is Moderate, 0.65 is Minor
+    assert v7_scan.severity_batches([]) == []
+
+
+def test_a_large_group_is_split_so_one_answer_never_grows_too_long(monkeypatch):
+    monkeypatch.setattr(v7_scan, "BATCH_MAX", 3)
+    batches = v7_scan.severity_batches([pair_with(0.1 + i / 100, i) for i in range(7)])
+    assert [(tier, len(group)) for tier, group in batches] == [("Critical", 3), ("Critical", 3), ("Critical", 1)]
+
+
+def test_one_gemini_call_per_severity_group_and_pairs_a_batch_skips_are_reviewed_alone(monkeypatch):
+    sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABCDEFG"]
+    ratings = [0.2, 0.3, 0.5, 0.55, 0.7, 0.75]   # two Critical, two Moderate, two Minor
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": o, "objectives_alignment": o, "methodology_fit": o,
+                       "numeric_consistency": o, "claim_support": o}} for o in ratings]
+    flow = assemble_flow(sections, raw)
+    batch_calls, single_calls = [], []
+
+    def explanation(severity):
+        return {"severity": severity, "failed_dimension": "none", "coherence_scores": {}, "highlighted_inconsistencies": [],
+                "recommendations": [], "reference_list": [], "bridges": [{"section": "x", "placement": "end", "sentence": "x"}] * 2}
+
+    async def fake_batch(items):
+        batch_calls.append([item["id"] for item in items])
+        answered = [item for item in items if item["id"] != 4]     # the Gemini answer leaves pair 4 out
+        return {item["id"]: explanation("None") for item in answered}
+
+    async def fake_single(role_a, *_, **__):
+        single_calls.append(role_a)
+        return explanation("None")
+
+    async def fake_summary(*_):
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_batch", fake_batch)
+    monkeypatch.setattr(v7_explain, "explain_pair", fake_single)
+    monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
+    asyncio.run(explain_flow(sections, flow))
+    assert batch_calls == [[1, 2], [3, 4], [5, 6]]       # three calls for six pairs: one per severity group
+    assert single_calls == ["D"]                          # only pair 4 (D -> E) needed a call of its own
+    assert all(p["explanation"] is not None and p["severity"] == "None" for p in flow)
+
+
+def test_a_failed_batch_falls_back_to_reviewing_each_pair(monkeypatch):
+    sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABC"]
+    raw = [{"scores": {"pair_weight": 1, "overall_coherence": 0.5, "objectives_alignment": 0.5, "methodology_fit": 0.5,
+                       "numeric_consistency": 0.5, "claim_support": 0.5}}] * 2
+    flow = assemble_flow(sections, raw)
+    calls = []
+
+    async def failing_batch(items):
+        raise RuntimeError("Gemini is down")
+
+    async def fake_single(role_a, *_, **__):
+        calls.append(role_a)
+        return {"severity": "None", "failed_dimension": "none", "coherence_scores": {}, "highlighted_inconsistencies": [],
+                "recommendations": [], "reference_list": [], "bridges": [{"section": "x", "placement": "end", "sentence": "x"}] * 2}
+
+    async def fake_summary(*_):
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_batch", failing_batch)
+    monkeypatch.setattr(v7_explain, "explain_pair", fake_single)
+    monkeypatch.setattr(v7_explain, "explain_summary", fake_summary)
+    asyncio.run(explain_flow(sections, flow))
+    assert sorted(calls) == ["A", "B"] and [p["severity"] for p in flow] == ["None", "None"]
+
+
+def test_a_cap_applies_only_when_one_is_set(monkeypatch):
+    pairs = [{"order": n, "pair_score": n / 30, "scores": {"overall_coherence": n / 40}} for n in range(1, 31)]
+    assert [p["order"] for p in v7_scan.select_pairs_to_explain(pairs)] == list(range(1, 31))   # all weak pairs, weakest first
+    monkeypatch.setattr(v7_scan, "EXPLAIN_LIMIT", 5)
+    assert [p["order"] for p in v7_scan.select_pairs_to_explain(pairs)] == [1, 2, 3, 4, 5]
+    strong = [{"order": 99, "pair_score": 0.99, "scores": {"overall_coherence": 0.95}}]
+    assert v7_scan.select_pairs_to_explain(strong) == []                                         # strong pairs are still never sent
+
+
+def test_many_easy_far_apart_pairs_cannot_hide_weak_flow_between_neighbors():
+    weak_flow = [pair_for_score("None", "none", order=n, overall=0.4) for n in (1, 2, 3)]                    # three loose neighbor links
+    easy_far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in range(4, 14)]   # ten far pairs that pass
+    score, breakdown = manuscript_score(weak_flow + easy_far)
+    context = breakdown["context_alignment"]
+    assert (context["flow"], context["cross"]) == ({"items": 3, "passed": 0}, {"items": 10, "passed": 10})
+    assert context["halves"] is True and (context["items"], context["passed"]) == (13, 10)
+    assert context["score"] == 50.0 and score == 50.0      # flow 0% and cross 100% average to 50; pooled it would read 77
+    only_cross = [dict(pair_for_score("None", "none", order=1, overall=0.6), adjacent=False)]
+    assert manuscript_score(only_cross)[1]["context_alignment"]["score"] == 100.0                    # a single kind of check stands alone
+
+
+def test_a_kind_with_too_few_checks_is_pooled_instead_of_swinging_the_category():
+    one_miss_of_two = [pair_for_score("None", "none", order=1, overall=0.4), pair_for_score("None", "none", order=2, overall=0.6)]
+    far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in (3, 4, 5)]
+    category = manuscript_score(one_miss_of_two + far)[1]["context_alignment"]
+    assert (category["flow"]["items"], category["cross"]["items"]) == (2, 3) and category["halves"] is False
+    assert category["score"] == 80.0      # 4 of 5 checks passed; split in halves, one miss in two flow checks would have read 75
