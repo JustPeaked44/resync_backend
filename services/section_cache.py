@@ -17,7 +17,7 @@ from services.db_service import DatabasePersistenceService
 
 logger = logging.getLogger("resync.section_cache")
 
-TABLE = "manuscript_section_cache"
+TABLE = "manuscript"
 # Bump this when the parser changes what it finds, so rows saved by the old parser stop matching.
 CACHE_VERSION = "1"
 # Only these parts of a parse result are kept; they are everything a scan reads from it.
@@ -42,11 +42,11 @@ class SectionCache:
 
     @staticmethod
     def _row_to_cached(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        parsed = row.get("parsed")
+        parsed = row.get("manuscript_parsed_sections")
         if not isinstance(parsed, dict) or not isinstance(parsed.get("parsed_sections"), dict):
             return None
-        return {"manuscript_id": row.get("manuscript_id"), "raw_text": row.get("raw_text") or "",
-                "parse_result": {**parsed, "structure": parsed.get("structure") or row.get("structure") or "headings",
+        return {"manuscript_id": row.get("manuscript_id"), "raw_text": row.get("manuscript_raw_text") or "",
+                "parse_result": {**parsed, "structure": parsed.get("structure") or row.get("manuscript_structure") or "headings",
                                  "section_order": parsed.get("section_order") or list(parsed["parsed_sections"]),
                                  "section_roles": parsed.get("section_roles") or {}}}
 
@@ -58,9 +58,9 @@ class SectionCache:
         try:
             client = DatabasePersistenceService.get_client()
             response = await asyncio.to_thread(lambda: client.table(TABLE)
-                                               .select("manuscript_id,structure,parsed,raw_text")
-                                               .eq("user_id", user_id).eq("content_hash", content_hash)
-                                               .order("created_at", desc=True).limit(1).execute())
+                                               .select("manuscript_id,manuscript_structure,manuscript_parsed_sections,manuscript_raw_text")
+                                               .eq("user_id", user_id).eq("manuscript_content_hash", content_hash)
+                                               .order("manuscript_created_at", desc=True).limit(1).execute())
             rows = response.data if isinstance(response.data, list) else []
             return cls._row_to_cached(rows[0]) if rows else None
         except Exception as error:   # a missing table or a slow database never stops a scan
@@ -75,7 +75,7 @@ class SectionCache:
         try:
             client = DatabasePersistenceService.get_client()
             response = await asyncio.to_thread(lambda: client.table(TABLE)
-                                               .select("manuscript_id,structure,parsed,raw_text")
+                                               .select("manuscript_id,manuscript_structure,manuscript_parsed_sections,manuscript_raw_text")
                                                .eq("manuscript_id", manuscript_id).eq("user_id", user_id).limit(1).execute())
             rows = response.data if isinstance(response.data, list) else []
             return cls._row_to_cached(rows[0]) if rows else None
@@ -89,11 +89,12 @@ class SectionCache:
             return False
         try:
             client = DatabasePersistenceService.get_client()
-            row = {"manuscript_id": manuscript_id, "user_id": user_id, "content_hash": content_hash,
-                   "structure": parse_result.get("structure"), "raw_text": raw_text,
-                   "parsed": {key: parse_result.get(key) for key in PARSE_KEYS}}
-            await asyncio.to_thread(lambda: client.table(TABLE).upsert(row, on_conflict="manuscript_id").execute())
-            return True
+            row = {"manuscript_content_hash": content_hash, "manuscript_structure": parse_result.get("structure"),
+                   "manuscript_raw_text": raw_text,
+                   "manuscript_parsed_sections": {key: parse_result.get(key) for key in PARSE_KEYS}}
+            response = await asyncio.to_thread(lambda: client.table(TABLE).update(row)
+                                               .eq("manuscript_id", manuscript_id).eq("user_id", user_id).execute())
+            return bool(response.data)
         except Exception as error:
             logger.warning("Section cache save skipped: %s", error)
             return False

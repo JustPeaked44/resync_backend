@@ -19,7 +19,7 @@ USER, STRANGER = "user-1", "user-2"
 
 
 class FakeTable:
-    """Just enough of the Supabase query builder for the cache: select/eq/order/limit/upsert, on a list of rows."""
+    """Just enough of the Supabase query builder for the cache: select/eq/order/limit/update, on a list of rows."""
 
     def __init__(self, rows):
         self.rows, self.filters, self.limit_to, self.pending = rows, {}, None, None
@@ -39,15 +39,16 @@ class FakeTable:
         self.limit_to = count
         return self
 
-    def upsert(self, row, on_conflict=None):
-        self.pending = (row, on_conflict)
+    def update(self, row):
+        self.pending = row
         return self
 
     def execute(self):
         if self.pending:
-            row, key = self.pending
-            self.rows[:] = [existing for existing in self.rows if existing.get(key) != row.get(key)] + [dict(row, created_at=str(len(self.rows)))]
-            return SimpleNamespace(data=[row])
+            found = [existing for existing in self.rows if all(existing.get(column) == value for column, value in self.filters.items())]
+            for existing in found:
+                existing.update(self.pending)
+            return SimpleNamespace(data=found)
         found = [row for row in self.rows if all(row.get(column) == value for column, value in self.filters.items())]
         return SimpleNamespace(data=found[:self.limit_to] if self.limit_to else found)
 
@@ -64,6 +65,8 @@ class FakeClient:
 @pytest.fixture
 def database(monkeypatch):
     client = FakeClient()
+    client.rows.extend([{"manuscript_id": MS_ID, "user_id": USER, "manuscript_created_at": "1"},
+                        {"manuscript_id": OTHER_MS, "user_id": USER, "manuscript_created_at": "2"}])
     monkeypatch.setattr(section_cache.DatabasePersistenceService, "get_client", lambda: client)
     monkeypatch.delenv("SECTION_CACHE", raising=False)
     return client
@@ -93,7 +96,7 @@ def test_saving_the_same_manuscript_twice_keeps_one_row_and_a_rescan_gets_its_ow
     asyncio.run(SectionCache.save(MS_ID, USER, digest, PARSE, "text"))
     asyncio.run(SectionCache.save(MS_ID, USER, digest, PARSE, "text"))
     asyncio.run(SectionCache.save(OTHER_MS, USER, digest, PARSE, "text"))                 # the same file scanned again
-    assert sorted(row["manuscript_id"] for row in database.rows) == [MS_ID, OTHER_MS]
+    assert sorted(row["manuscript_id"] for row in database.rows if row.get("manuscript_content_hash")) == [MS_ID, OTHER_MS]
 
 
 def test_a_manuscript_can_be_loaded_by_its_id_only_by_its_owner(database):
@@ -112,11 +115,11 @@ def test_a_cache_failure_never_raises_and_the_switch_turns_it_off(monkeypatch, d
     assert asyncio.run(SectionCache.save(MS_ID, USER, "hash", PARSE, "text")) is False
     monkeypatch.setattr(section_cache.DatabasePersistenceService, "get_client", lambda: database)
     monkeypatch.setenv("SECTION_CACHE", "off")
-    assert asyncio.run(SectionCache.save(MS_ID, USER, "hash", PARSE, "text")) is False and database.rows == []
+    assert asyncio.run(SectionCache.save(MS_ID, USER, "hash", PARSE, "text")) is False and all("manuscript_content_hash" not in row for row in database.rows)
 
 
 def test_a_row_without_the_parsed_sections_is_ignored(database):
-    database.rows.append({"manuscript_id": MS_ID, "user_id": USER, "content_hash": "hash", "parsed": {"nothing": True}, "raw_text": "x"})
+    database.rows.append({"manuscript_id": MS_ID, "user_id": USER, "manuscript_content_hash": "hash", "manuscript_parsed_sections": {"nothing": True}, "manuscript_raw_text": "x"})
     assert asyncio.run(SectionCache.find(USER, "hash")) is None
 
 

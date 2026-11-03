@@ -47,13 +47,7 @@ class CreditsService:
         client = cls._client()
 
         def _fetch():
-            resp = (
-                client.table("credit_wallet")
-                .select("balance")
-                .eq("user_id", user_id)
-                .execute()
-            )
-            return resp.data[0]["balance"] if resp.data else 0
+            return client.rpc("get_credit_balance", {"p_user_id": user_id}).execute().data
 
         return await asyncio.to_thread(_fetch)
 
@@ -205,13 +199,16 @@ class CreditsService:
         def _fetch():
             resp = (
                 client.table("credit_ledger")
-                .select("ledger_id, kind, delta, balance_after, analysis_run_id, note, created_at")
+                .select("credit_ledger_id, credit_ledger_kind, credit_ledger_delta, credit_ledger_balance_after, analysis_run_id, credit_ledger_note, credit_ledger_created_at")
                 .eq("user_id", user_id)
-                .order("created_at", desc=True)
+                .order("credit_ledger_created_at", desc=True)
                 .limit(limit)
                 .execute()
             )
-            return resp.data or []
+            return [{"ledger_id": row["credit_ledger_id"], "kind": row["credit_ledger_kind"],
+                     "delta": row["credit_ledger_delta"], "balance_after": row["credit_ledger_balance_after"],
+                     "analysis_run_id": row.get("analysis_run_id"), "note": row.get("credit_ledger_note"),
+                     "created_at": row["credit_ledger_created_at"]} for row in (resp.data or [])]
 
         return await asyncio.to_thread(_fetch)
 

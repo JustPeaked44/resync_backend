@@ -53,12 +53,12 @@ class VerdictCache:
                 client = DatabasePersistenceService.get_client()
                 for start in range(0, len(missing), CHUNK):
                     chunk = missing[start:start + CHUNK]
-                    response = await asyncio.to_thread(lambda: client.table(TABLE).select("cache_key,explanation")
-                                                       .in_("cache_key", chunk).execute())
+                    response = await asyncio.to_thread(lambda: client.table(TABLE).select("pair_verdict_cache_key,pair_verdict_cache_explanation")
+                                                       .in_("pair_verdict_cache_key", chunk).execute())
                     for row in response.data if isinstance(response.data, list) else []:
-                        if isinstance(row.get("explanation"), dict) and "severity" in row["explanation"]:
-                            found[row["cache_key"]] = row["explanation"]
-                            cls._remember(row["cache_key"], row["explanation"])
+                        if isinstance(row.get("pair_verdict_cache_explanation"), dict) and "severity" in row["pair_verdict_cache_explanation"]:
+                            found[row["pair_verdict_cache_key"]] = row["pair_verdict_cache_explanation"]
+                            cls._remember(row["pair_verdict_cache_key"], row["pair_verdict_cache_explanation"])
             except Exception as error:   # a missing table or a slow database only means the AI is asked again
                 logger.warning("Verdict cache lookup skipped: %s", error)
         return found
@@ -73,8 +73,9 @@ class VerdictCache:
             cls._remember(key, value)
         try:
             client = DatabasePersistenceService.get_client()
-            rows = [{"cache_key": key, "prompt_version": PROMPT_VERSION, "explanation": value} for key, value in keep.items()]
-            await asyncio.to_thread(lambda: client.table(TABLE).upsert(rows, on_conflict="cache_key").execute())
+            rows = [{"pair_verdict_cache_key": key, "pair_verdict_cache_prompt_version": PROMPT_VERSION,
+                     "pair_verdict_cache_explanation": value} for key, value in keep.items()]
+            await asyncio.to_thread(lambda: client.table(TABLE).upsert(rows, on_conflict="pair_verdict_cache_key").execute())
         except Exception as error:
             logger.warning("Verdict cache save skipped: %s", error)
 

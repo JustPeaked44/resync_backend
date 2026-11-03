@@ -6,7 +6,7 @@ import main
 
 
 def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
-    rows = {name: {"analysis_run_id": name, "user_id": "owner", "status": "processing"}
+    rows = {name: {"analysis_run_id": name, "user_id": "owner", "analysis_run_status": "processing", "analysis_run_is_unlocked": False}
             for name in ("first", "second", "third")}
     started = []
     gates = {name: asyncio.Event() for name in rows}
@@ -40,8 +40,8 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
         return SimpleNamespace(model_dump=lambda **_: {"analysis_run_id": name})
 
     async def save(result):
-        rows[result.model_dump()["analysis_run_id"]]["status"] = "completed"
-        rows[result.model_dump()["analysis_run_id"]]["result_json"] = result.model_dump()
+        rows[result.model_dump()["analysis_run_id"]]["analysis_run_status"] = "completed"
+        rows[result.model_dump()["analysis_run_id"]]["analysis_run_result_json"] = result.model_dump()
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
     monkeypatch.setattr(main, "_execute_scan_pipeline", pipeline)
@@ -62,7 +62,7 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
             if "second" in started:
                 break
             await asyncio.sleep(0.01)
-        assert rows["first"]["status"] == "failed"
+        assert rows["first"]["analysis_run_status"] == "failed"
         third = await main.get_scan_status("third", "owner")
         assert third.queue_position == 1 and third.status_message_level == "info"
         assert "You're next in line" in third.status_message

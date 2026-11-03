@@ -298,6 +298,6 @@ def test_persistence_rounds_only_legacy_integer_mirror(monkeypatch):
         user_id="u", manuscript_id="m", analysis_run_id="r", coherence_score=77.1,
         inconsistencies=[], recommendations=[], citations=[],
         score_breakdown={"overall_score": 77.1, "band": "Solid", "cross_chapter_coherence_score": 77.1}))
-    assert updates[0]["analysis_run_coherence_score"] == 77
-    assert updates[0]["functional_metric_score"] == 77.1
+    assert updates[0]["analysis_run_score"] == 77
+    assert updates[0]["analysis_run_band"] == "Solid"
     assert "structural_completeness_score" not in updates[0]

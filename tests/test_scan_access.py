@@ -132,6 +132,7 @@ def test_scan_provision_keeps_zero_balance_and_rate_limit(monkeypatch):
 
 
 def test_get_and_manuscript_routes_use_locked_view(monkeypatch):
+    unlocked = {"value": False}
     result = {"access": {"unlocked": False, "unlock_cost": 1},
               "manuscript_sections": [{"name": "First", "text": "Visible first."},
                                       {"name": "Second", "text": "SECRET SECOND."}],
@@ -151,7 +152,8 @@ def test_get_and_manuscript_routes_use_locked_view(monkeypatch):
 
         def execute(self):
             return SimpleNamespace(data=[{"analysis_run_id": "run", "user_id": "owner",
-                                          "status": "completed", "result_json": result}])
+                                          "analysis_run_status": "completed", "analysis_run_result_json": result,
+                                          "analysis_run_is_unlocked": unlocked["value"]}])
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
     response = asyncio.run(main.get_scan_status("run", "owner"))
@@ -159,8 +161,10 @@ def test_get_and_manuscript_routes_use_locked_view(monkeypatch):
     assert response.result["manuscript_sections"][1]["text"] is None
     assert "SECRET" not in json.dumps(response.model_dump(mode="json"))
     assert preview == {"available": True, "text": "Visible first."}
-    result["access"]["unlocked"] = True
+    unlocked["value"] = True
     assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first.\n\nSECRET SECOND."
     result.pop("access")
     result["doc_url"] = "legacy.docx"
     assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first.\n\nSECRET SECOND."
+    unlocked["value"] = False
+    assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first."
