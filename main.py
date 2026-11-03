@@ -1536,6 +1536,189 @@ async def confirm_credit_checkout(
         )
 
 
+OUTLINE_CACHE_SECONDS = 300
+OUTLINE_FETCH_SECONDS = 25
+_outline_cache: Dict[str, Any] = {}
+
+
+class OutlineSection(BaseModel):
+    name: str
+    words: int
+    role: Optional[str] = None
+
+
+class OutlineResponse(BaseModel):
+    title: str
+    words: int
+    pages: int
+    structure: str
+    sections: List[OutlineSection]
+    excerpt: List[str]
+
+
+@app.post(
+    "/api/manuscripts/outline",
+    response_model=OutlineResponse,
+    summary="Show the sections the scan will compare, before running it",
+    description=(
+        "Reads an uploaded Word file or a public Google Doc and returns its title, length and the sections the parser "
+        "finds, without spending a credit or starting a scan."
+    ),
+    tags=["Manuscripts"],
+)
+async def manuscript_outline(
+    file: Optional[UploadFile] = File(None, description="Word document"),
+    doc_url: Optional[str] = Form(None),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+) -> OutlineResponse:
+    if file is not None:
+        data = await file.read()
+        if len(data) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This file is larger than 25 MB.")
+        raw_text = await DocumentIngestionService.extract_plaintext_from_upload(data, file.filename or "uploaded.docx")
+    elif doc_url and doc_url.startswith("http"):
+        # The same link is often asked about twice (when it is pasted and again on the confirm step): remember it briefly.
+        cached = _outline_cache.get(doc_url)
+        if cached and time.time() - cached[0] < OUTLINE_CACHE_SECONDS:
+            return cached[1]
+        try:
+            raw_text = await asyncio.wait_for(DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url), timeout=OUTLINE_FETCH_SECONDS)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                                detail="Google Docs is taking too long to answer. Try again, or run the scan without a preview.")
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Send a Word file or a Google Docs link.")
+    from services.parser import ManuscriptParserService
+    parsed = await asyncio.to_thread(ManuscriptParserService.parse_manuscript_sections, raw_text, None)
+    roles = parsed.get("section_roles", {})
+    sections = parsed["parsed_sections"]
+    order = parsed.get("section_order", list(sections))
+    paragraphs = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    title = paragraphs[0] if paragraphs and len(paragraphs[0]) <= 160 else ""
+    words = len(raw_text.split())
+    response = OutlineResponse(
+        title=title,
+        words=words,
+        pages=max(1, math.ceil(words / 275)),
+        structure=parsed.get("structure", "headings"),
+        sections=[OutlineSection(name=name, words=len(sections[name].split()), role=roles.get(name)) for name in order if name in sections],
+        excerpt=[line[:420] for line in paragraphs[1:7]],
+    )
+    if file is None and doc_url:
+        _outline_cache[doc_url] = (time.time(), response)
+        for key in [key for key, (saved, _) in _outline_cache.items() if time.time() - saved > OUTLINE_CACHE_SECONDS]:
+            _outline_cache.pop(key, None)
+    return response
+
+
+GDOC_DOCX_CACHE_SECONDS = 300
+_gdoc_docx_cache: Dict[str, Any] = {}
+DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+@app.post(
+    "/api/manuscripts/google-docx",
+    summary="Download a public Google Doc as a Word file",
+    description=(
+        "Fetches the Google Doc behind a link as .docx so it can be previewed, scanned and highlighted exactly like a "
+        "Word file the student uploaded."
+    ),
+    tags=["Manuscripts"],
+)
+async def google_doc_as_docx(
+    doc_url: str = Form(...),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+):
+    import httpx
+    from fastapi.responses import Response
+    from urllib.parse import unquote
+    doc_id = DocumentIngestionService.extract_google_doc_id(doc_url)
+    cached = _gdoc_docx_cache.get(doc_id)
+    if cached and time.time() - cached[0] < GDOC_DOCX_CACHE_SECONDS:
+        data, filename = cached[1], cached[2]
+    else:
+        export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=40.0, headers=headers) as client:
+                response = await client.get(export_url)
+        except httpx.HTTPError as exc:
+            logger.error("Google Doc download failed for %s: %s", doc_id, exc)
+            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
+        if response.status_code == 404:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google Doc not found. Please verify the document URL exists.")
+        content_type = response.headers.get("content-type", "")
+        if response.status_code != 200 or "html" in content_type or not response.content.startswith(b"PK"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
+        if len(response.content) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB.")
+        data = response.content
+        match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", response.headers.get("content-disposition", ""))
+        filename = unquote(match.group(1) or match.group(2)) if match else "Google Doc.docx"
+        if not filename.lower().endswith(".docx"):
+            filename += ".docx"
+        _gdoc_docx_cache[doc_id] = (time.time(), data, filename)
+        for key in [key for key, entry in _gdoc_docx_cache.items() if time.time() - entry[0] > GDOC_DOCX_CACHE_SECONDS][:20]:
+            _gdoc_docx_cache.pop(key, None)
+        while len(_gdoc_docx_cache) > 8:
+            _gdoc_docx_cache.pop(next(iter(_gdoc_docx_cache)), None)
+    from urllib.parse import quote
+    return Response(content=data, media_type=DOCX_MEDIA_TYPE,
+                    headers={"X-Doc-Filename": quote(filename), "Access-Control-Expose-Headers": "X-Doc-Filename"})
+
+
+PROOF_MAX_BYTES = 2 * 1024 * 1024
+PROOF_TYPES = ("image/png", "image/jpeg", "image/webp", "application/pdf")
+
+
+class PaymentProofRequest(BaseModel):
+    pymt_txn_id: str
+    method: str = Field(..., pattern="^(gcash|bank_transfer)$")
+    reference_number: str = Field(..., min_length=4, max_length=40, pattern=r"^[A-Za-z0-9 \-]+$")
+    payer_name: Optional[str] = Field(default=None, max_length=120)
+    file_name: Optional[str] = Field(default=None, max_length=200)
+    content_type: str
+    proof_data: str = Field(..., description="The receipt picture or PDF, base64 encoded")
+
+
+class PaymentProofResponse(BaseModel):
+    status: str
+    proof_id: str
+
+
+@app.post(
+    "/api/credits/proof",
+    response_model=PaymentProofResponse,
+    summary="Upload proof of payment for a pending credit purchase",
+    description=(
+        "Keeps the receipt picture and reference number for a pending transaction. In this simulated sandbox the "
+        "purchase is then confirmed with POST /api/credits/confirm."
+    ),
+    tags=["Credits"]
+)
+async def upload_payment_proof(
+    body: PaymentProofRequest,
+    x_user_id: str = Header(..., alias="X-User-Id", description="Supabase auth user UUID"),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+) -> PaymentProofResponse:
+    _assert_owner(authenticated_user_id, x_user_id)
+    if body.content_type not in PROOF_TYPES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Upload a PNG, JPEG, WebP or PDF file.")
+    if len(body.proof_data) * 3 // 4 > PROOF_MAX_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="The proof of payment is larger than 2 MB.")
+    try:
+        proof_id = await credits_service.save_payment_proof(
+            x_user_id, body.pymt_txn_id, body.method, body.reference_number.strip(), body.payer_name,
+            body.file_name, body.content_type, f"data:{body.content_type};base64,{body.proof_data}")
+        return PaymentProofResponse(status="received", proof_id=proof_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except Exception as exc:
+        logger.error("Failed to save payment proof for %s, user %s: %s", body.pymt_txn_id, x_user_id, exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Failed to save the proof of payment.")
+
+
 @app.get(
     "/api/credits/history",
     response_model=CreditHistoryResponse,

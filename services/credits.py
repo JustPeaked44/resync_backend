@@ -154,6 +154,30 @@ class CreditsService:
         }
 
     @classmethod
+    async def save_payment_proof(cls, user_id: str, pymt_txn_id: str, method: str, reference_number: str,
+                                 payer_name: Optional[str], file_name: Optional[str], content_type: str,
+                                 proof_data: str) -> str:
+        """Keeps the uploaded proof of payment for a pending transaction that belongs to this user."""
+        import asyncio
+        client = cls._client()
+
+        def _save():
+            txn = (client.table("pymt_txn").select("pymt_txn_id")
+                   .eq("pymt_txn_id", pymt_txn_id).eq("user_id", user_id).execute())
+            if not txn.data:
+                raise ValueError(f"Payment transaction {pymt_txn_id} not found for user {user_id}.")
+            proof_id = str(uuid.uuid4())
+            client.table("payment_proof").insert({
+                "proof_id": proof_id, "pymt_txn_id": pymt_txn_id, "user_id": user_id, "method": method,
+                "reference_number": reference_number, "payer_name": payer_name, "file_name": file_name,
+                "content_type": content_type, "proof_data": proof_data,
+            }).execute()
+            client.table("pymt_txn").update({"pymt_txn_provider": method}).eq("pymt_txn_id", pymt_txn_id).execute()
+            return proof_id
+
+        return await asyncio.to_thread(_save)
+
+    @classmethod
     async def confirm_checkout(cls, user_id: str, pymt_txn_id: str) -> int:
         """Marks the transaction paid and credits the wallet via the
         purchase_credits RPC. This handler -- and only this handler -- is
