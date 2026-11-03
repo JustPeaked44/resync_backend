@@ -4,6 +4,7 @@ import time
 import uuid
 import logging
 import re
+from copy import deepcopy
 from html import unescape
 from collections import defaultdict, deque
 import math
@@ -36,6 +37,14 @@ from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
+
+
+def _saved_scan_view(result: Dict[str, Any], unlocked: bool) -> Dict[str, Any]:
+    saved = deepcopy(result)
+    if not isinstance(saved.get("access"), dict):
+        saved["access"] = {"unlock_cost": 1}
+    saved["access"]["unlocked"] = unlocked
+    return locked_scan_view(saved)
 
 logger = logging.getLogger("resync.main")
 
@@ -532,9 +541,7 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
 
         manuscript_id = await _resolve_manuscript_id(db_client, req, default_source_name=default_source_name)
 
-        # Bug 4: analysis_run_template_toc is a text column, stringify the list
-        toc_str = json.dumps(req.template_toc) if req.template_toc else None
-        source_identifier = req.doc_url or req.filename or default_source_name or "uploaded_file.docx"
+        toc = req.template_toc if req.template_toc else None
 
         # Bug 1: Add user_id to the insert payload
         await asyncio.to_thread(
@@ -543,13 +550,9 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
                 "user_id": req.user_id,
                 "manuscript_id": manuscript_id,
                 "analysis_run_status": "processing",
-                "analysis_run_template_toc": toc_str,
-                "analysis_run_coherence_score": 0,
-                # Plain-text mirror of the job state. The polling endpoint reads
-                # this rather than the enum column, because the enum has no
-                # 'failed' member (see migration 003).
-                "status": "processing",
-                "doc_url": source_identifier,
+                "analysis_run_template_toc": toc,
+                "analysis_run_score": 0,
+                "analysis_run_is_unlocked": False,
             }).execute()
         )
         logger.info(f"Provisioned analysis_run row: {analysis_run_id}")
@@ -817,7 +820,7 @@ async def _save_completed_result(result: ScanResponse) -> None:
     db_client = DatabasePersistenceService.get_client()
     await asyncio.to_thread(
         lambda: db_client.table("analysis_run").update({
-            "status": "completed", "result_json": result.model_dump(mode="json"),
+            "analysis_run_status": "completed", "analysis_run_result_json": result.model_dump(mode="json"),
         }).eq("analysis_run_id", result.analysis_run_id).execute()
     )
 
@@ -858,7 +861,7 @@ async def _run_scan_job(
             db_client = DatabasePersistenceService.get_client()
             await asyncio.to_thread(
                 lambda: db_client.table("analysis_run").update({
-                    "status": "failed", "error_message": str(exc)[:1000],
+                    "analysis_run_status": "failed", "analysis_run_error_message": str(exc)[:1000],
                 }).eq("analysis_run_id", analysis_run_id).execute()
             )
         except Exception:
@@ -1110,7 +1113,7 @@ async def get_scan_status(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table("analysis_run")
-                .select("analysis_run_id, user_id, status, error_message, result_json")
+                .select("analysis_run_id, user_id, analysis_run_status, analysis_run_error_message, analysis_run_result_json, analysis_run_is_unlocked")
                 .eq("analysis_run_id", analysis_run_id)
                 .execute()
         )
@@ -1136,25 +1139,25 @@ async def get_scan_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan {analysis_run_id} not found."
         )
-    job_status = row.get("status") or "processing"
+    job_status = row.get("analysis_run_status") or "processing"
 
     if job_status == "failed":
         return ScanStatusResponse(
             status="failed",
             analysis_run_id=analysis_run_id,
-            error=row.get("error_message") or "Scan failed for an unknown reason."
+            error=row.get("analysis_run_error_message") or "Scan failed for an unknown reason."
         )
 
     # `save_scan_transaction` flips status to 'completed' before the job
     # wrapper writes result_json, so treat 'completed without a report' as
     # still in progress. This closes that race instead of briefly handing
     # the client a completed status with an empty result.
-    result_json = row.get("result_json")
+    result_json = row.get("analysis_run_result_json")
     if job_status == "completed" and result_json:
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result=locked_scan_view(result_json)
+            result=_saved_scan_view(result_json, row["analysis_run_is_unlocked"])
         )
 
     position, estimate, level, message = _queue_state(analysis_run_id)
@@ -1217,7 +1220,7 @@ async def get_manuscript_preview(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table("analysis_run")
-                .select("user_id, result_json")
+                .select("user_id, analysis_run_result_json, analysis_run_is_unlocked")
                 .eq("analysis_run_id", scan_id)
                 .execute()
         )
@@ -1233,10 +1236,12 @@ async def get_manuscript_preview(
     if row.get("user_id") != authenticated_user_id:
         return {"available": False, "reason": "unreachable"}
         
-    result_json = row.get("result_json") or {}
+    result_json = row.get("analysis_run_result_json") or {}
     if result_json.get("manuscript_sections"):
-        sections = locked_scan_view(result_json).get("manuscript_sections") or []
+        sections = _saved_scan_view(result_json, row["analysis_run_is_unlocked"]).get("manuscript_sections") or []
         return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
+    if not row["analysis_run_is_unlocked"]:
+        return {"available": False, "reason": "locked"}
     doc_url = result_json.get("doc_url")
     
     if not doc_url or "docs.google.com" not in doc_url:
@@ -1337,7 +1342,7 @@ async def submit_issue_feedback(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> IssueFeedbackResponse:
     """
-    Stores user feedback for a specific inconsistency in public.issue_feedback.
+    Stores the owner's latest feedback on the inconsistency.
 
     Security:
     - Validates the caller's bearer token actually belongs to x_user_id.
@@ -1382,13 +1387,9 @@ async def submit_issue_feedback(
         feedback_id = str(uuid.uuid4())
 
         await asyncio.to_thread(
-            lambda: db_client.table("issue_feedback").insert({
-                "feedback_id": feedback_id,
-                "inconsistency_id": issue_id,
-                "user_id": x_user_id,
-                "is_helpful": body.helpful,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
+            lambda: db_client.table("inconsistency").update({
+                "inconsistency_is_helpful": body.helpful,
+            }).eq("inconsistency_id", issue_id).execute()
         )
 
         logger.info(
@@ -1417,6 +1418,33 @@ async def submit_issue_feedback(
 # confirm_checkout -> the purchase_credits RPC) instead of being invoked
 # directly by the client. Nothing else in the credits flow changes.
 # ---------------------------------------------------------------------------
+
+class DeviceRegistration(BaseModel):
+    player_id: str = Field(..., min_length=1, max_length=200)
+    platform: Literal["android", "ios", "web"]
+
+
+@app.post("/api/devices", tags=["Devices"])
+async def register_device(body: DeviceRegistration, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    client = DatabasePersistenceService.get_client()
+    await asyncio.to_thread(lambda: client.table("user_device_token").upsert({
+        "user_id": authenticated_user_id,
+        "user_device_token_player_id": body.player_id,
+        "user_device_token_platform": body.platform,
+    }, on_conflict="user_device_token_player_id").execute())
+    return {"registered": True}
+
+
+@app.delete("/api/devices/{player_id}", tags=["Devices"])
+async def remove_device(player_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    client = DatabasePersistenceService.get_client()
+    response = await asyncio.to_thread(lambda: client.table("user_device_token").delete()
+                                       .eq("user_device_token_player_id", player_id)
+                                       .eq("user_id", authenticated_user_id).execute())
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Device not found.")
+    return {"removed": True}
+
 
 class CreditBalanceResponse(BaseModel):
     user_id: str

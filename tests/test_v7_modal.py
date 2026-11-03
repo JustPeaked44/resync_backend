@@ -9,12 +9,13 @@ import modal
 from services.ml_client import MLClient, MODAL_APP_NAME
 
 
-def test_modal_app_constructs_without_importing_torch():
+def test_modal_app_constructs_without_importing_torch(monkeypatch):
+    monkeypatch.setattr(modal, "is_local", lambda: False)
     app = importlib.import_module("modal_app")
     assert app.app.name == MODAL_APP_NAME == "resync-ml-v7"
-    assert app.CHECKPOINT.is_file()
+    assert app.CHECKPOINT.name == "v7_final_model.pt"
     isolated = subprocess.run([sys.executable, "-c",
-                           "import modal_app,sys; assert 'torch' not in sys.modules; print(modal_app.app.name)"],
+                           "import modal,sys; modal.is_local=lambda:False; import modal_app; assert 'torch' not in sys.modules; print(modal_app.app.name)"],
                           capture_output=True, text=True, check=True)
     assert isolated.stdout.strip() == MODAL_APP_NAME
 
