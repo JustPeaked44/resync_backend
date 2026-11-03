@@ -1,7 +1,13 @@
--- Paste as one script. PostgreSQL requires the enum addition outside the transaction.
-ALTER TYPE public.credit_ledger_kind ADD VALUE IF NOT EXISTS 'adjustment';
-
+-- Run 012a_ledger_kind.sql FIRST (separately). Then paste this whole file as one script.
 BEGIN;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                 WHERE t.typname = 'credit_ledger_kind' AND e.enumlabel = 'adjustment') THEN
+    RAISE EXCEPTION 'Run migrations/012a_ledger_kind.sql first (on its own), then run 012_schema_cleanup.sql again.';
+  END IF;
+END $$;
 
 CREATE SCHEMA IF NOT EXISTS backup_012;
 DO $$

@@ -1,4 +1,4 @@
-﻿-- Restore the live pre-012 public schema in place. backup_012 is retained for audit.
+-- Restore the live pre-012 public schema in place. backup_012 is retained for audit.
 BEGIN;
 
 -- Keep balances earned or spent after 012 before replacing the ledger functions.

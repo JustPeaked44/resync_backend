@@ -40,6 +40,17 @@ def file(path):
     return run([BIN / "psql.exe", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", DB, "-f", path]).stdout.strip()
 
 
+def editor_run(path):
+    """Send the whole file as ONE request, the way the Supabase SQL editor does (not split by psql)."""
+    return run([BIN / "psql.exe", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", DB, "-c",
+                Path(path).read_text(encoding="utf-8")]).stdout.strip()
+
+
+def migrate_012():
+    editor_run(ROOT / "migrations" / "012a_ledger_kind.sql")
+    return editor_run(ROOT / "migrations" / "012_schema_cleanup.sql")
+
+
 def sql_error(query, message):
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".sql", delete=False) as f:
         f.write(query)
@@ -207,7 +218,11 @@ def main():
         check("before tables", len(catalog()), 15)
         before = signature()
         sql(SEED)
-        print("RUN 012", file(ROOT / "migrations" / "012_schema_cleanup.sql")[-100:])
+        skipped = run([BIN / "psql.exe", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", DB, "-c",
+                       (ROOT / "migrations" / "012_schema_cleanup.sql").read_text(encoding="utf-8")], check=False)
+        check("012 without 012a stops with a clear message",
+              (skipped.returncode != 0, "Run migrations/012a_ledger_kind.sql first" in skipped.stderr, len(catalog())), (True, True, 15))
+        print("RUN 012a+012 (editor-style)", migrate_012()[-100:])
         spec = json.loads((SOURCE / "build" / "final_schema.json").read_text())
         assert_schema(spec)
         check("B wallet balances", sql("""SELECT count(*) FROM backup_012.credit_wallet w
@@ -260,7 +275,7 @@ def main():
           INSERT INTO public.pair_verdict_cache(pair_verdict_cache_key,pair_verdict_cache_prompt_version,pair_verdict_cache_explanation)
           VALUES ('pair-new','v1','{}');""")
         sql("UPDATE public.inconsistency SET inconsistency_is_helpful=true WHERE inconsistency_id='30000000-0000-0000-0000-000000000001'")
-        print("RUN UNDO", file(ROOT / "migrations" / "012_schema_cleanup_undo.sql")[-100:])
+        print("RUN UNDO (editor-style)", editor_run(ROOT / "migrations" / "012_schema_cleanup_undo.sql")[-100:])
         after = signature()
         for part in ('columns', 'constraints', 'functions', 'triggers', 'rls', 'policies', 'grants', 'indexes', 'enums'):
             different = {key: (before[part].get(key), after[part].get(key))
@@ -277,7 +292,7 @@ def main():
         check("E changed vote mapped back", sql("SELECT is_helpful::text FROM public.issue_feedback WHERE inconsistency_id='30000000-0000-0000-0000-000000000001' ORDER BY created_at DESC,feedback_id DESC LIMIT 1"), "true")
         check("E new-only fields retained in backup", sql("SELECT (SELECT count(*) FROM backup_012.undo_pair_verdict_cache WHERE pair_verdict_cache_key='pair-new'),(SELECT value->>'manuscript_content_hash' FROM backup_012.undo_new_fields WHERE source_table='manuscript' AND row_id='10000000-0000-0000-0000-000000000005')"), "1|hash-new")
         sql("DROP SCHEMA backup_012 CASCADE")
-        print("RUN 012 AGAIN", file(ROOT / "migrations" / "012_schema_cleanup.sql")[-100:])
+        print("RUN 012a+012 AGAIN (editor-style)", migrate_012()[-100:])
         assert_schema(spec)
         check("E rerun wallets match", sql("SELECT count(*) FROM backup_012.credit_wallet w WHERE w.balance=public.get_credit_balance(w.user_id)"), "5")
         check("E rerun B statuses", sql("SELECT string_agg(analysis_run_status,',' ORDER BY analysis_run_id) FROM public.analysis_run"), "processing,completed,completed,failed,completed")

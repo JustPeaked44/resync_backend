@@ -11,3 +11,5 @@ The script starts the local PostgreSQL 17 cluster on `127.0.0.1:54329`, recreate
 The exported live `analysis_run_status_check` rejects the legacy text value `complete`. The synthetic fixture drops that check to exercise migration 012's normalization of such a row; the harness compares the undo against the unmodified live schema loaded before the fixture change. PostgreSQL 17 provides `gen_random_uuid()` without a separate `pgcrypto` install.
 
 The local database has no Supabase Storage schema, so migration 013 is reviewed as SQL only. The harness drops `backup_012` after verifying undo so it can test a fresh forward run; production backups must be retained until the owner authorizes cleanup.
+
+Every migration file is sent the way the Supabase SQL editor sends it: the whole file as ONE request (`psql -c`), not split statement by statement. That is why the enum value lives in `012a_ledger_kind.sql`, which must be run on its own first; `012_schema_cleanup.sql` stops with a clear message if 012a was skipped (also tested).
