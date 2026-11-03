@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 import main
 from services import credits
+from services.notification import NotificationDeliveryService
 from services.scan_access import locked_scan_view
 
 
@@ -154,3 +155,39 @@ def test_balance_uses_ledger_rpc_and_checkout_inserts_user_id(monkeypatch):
     assert calls[0] == ("get_credit_balance", {"p_user_id": "owner"})
     assert calls[1][1]["user_id"] == "owner" and "subscription_id" not in calls[1][1]
     assert result["amount"] == 50.0 and result["credit_amount"] == 2
+
+
+def test_notification_uses_registered_player_and_reports_push_delivery(monkeypatch):
+    sent = []
+
+    class DB:
+        def table(self, name):
+            assert name == "user_device_token"
+            return self
+
+        def select(self, column):
+            assert column == "user_device_token_player_id"
+            return self
+
+        def eq(self, column, value):
+            assert (column, value) == ("user_id", "owner")
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"user_device_token_player_id": "phone"}])
+
+    class HTTP:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+
+        async def post(self, url, **kwargs):
+            sent.append((url, kwargs["json"]["include_player_ids"]))
+            return SimpleNamespace(status_code=200, json=lambda: {"id": "push"})
+
+    monkeypatch.setattr(NotificationDeliveryService, "_get_supabase_client", lambda: DB())
+    monkeypatch.setattr("services.notification.httpx.AsyncClient", HTTP)
+    monkeypatch.setenv("ONESIGNAL_APP_ID", "fake")
+    monkeypatch.setenv("ONESIGNAL_REST_API_KEY", "fake")
+    assert asyncio.run(NotificationDeliveryService.send_scan_completion_alert("owner", "Paper", 80, "run")) is True
+    assert sent == [("https://onesignal.com/api/v1/notifications", ["phone"])]
