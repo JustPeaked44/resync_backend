@@ -1,0 +1,4 @@
+## 2024-05-24 - [Fix SSRF bypass in HTTP Redirects]
+**Vulnerability:** Application was checking hostnames for SSRF only on initial requests. When httpx encountered a redirect (e.g. HTTP 301/302) to an internal service, the subsequent request was not validated against `_is_safe_public_host`.
+**Learning:** `httpx` with `follow_redirects=True` handles redirects transparently but does not re-validate hosts per-hop automatically. The existing code assumed checking per-hop required significantly more code.
+**Prevention:** Use `httpx.AsyncClient(event_hooks={"request": [...]})` to inject an async check before every request is sent (including redirects). When doing this, ensure you pass the `request` object into any `httpx.ConnectError` and use `asyncio.to_thread` for blocking resolution operations.
