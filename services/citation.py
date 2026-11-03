@@ -172,10 +172,7 @@ def _is_safe_public_host(host: str) -> bool:
     """SSRF guard: reference links come from user-submitted manuscript text,
     so before fetching one, reject any hostname that resolves to a private,
     loopback, link-local, or otherwise non-public address (e.g. cloud
-    metadata endpoints or internal services). Only the initial URL is
-    checked -- a redirect to an internal address is a known residual gap,
-    acceptable here since httpx's automatic redirect handling doesn't
-    expose a per-hop hook without materially more code."""
+    metadata endpoints or internal services)."""
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
@@ -343,7 +340,19 @@ class CitationAuditService:
 
         sem = asyncio.Semaphore(10)
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async def _verify_request_host(request: httpx.Request) -> None:
+            """Ensure every request, including redirects, goes to a safe public host."""
+            host = request.url.host
+            if not host:
+                raise httpx.ConnectError("No host in URL", request=request)
+            is_safe = await asyncio.to_thread(_is_safe_public_host, host)
+            if not is_safe:
+                raise httpx.ConnectError(f"Host {host} is not a safe public host (SSRF protection)", request=request)
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            event_hooks={"request": [_verify_request_host]}
+        ) as client:
 
             async def _audit_one(entry: ParsedReferenceEntry) -> Dict[str, Any]:
                 async with sem:
