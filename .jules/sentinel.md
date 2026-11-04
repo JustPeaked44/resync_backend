@@ -1,0 +1,4 @@
+## 2023-11-04 - SSRF bypass through unchecked redirects in httpx
+**Vulnerability:** HTTP requests initiated for user-submitted citation URLs only validated the initial host, allowing attackers to exploit SSRF via HTTP redirects. `httpx.AsyncClient` automatically followed redirects, allowing attackers to access internal or reserved networks.
+**Learning:** `httpx`'s automatic redirect handling bypasses pre-request manual checks. In an async context, security properties validated ahead of an initial request do not apply to subsequent redirect jumps.
+**Prevention:** Always use `httpx` request event hooks (e.g. `event_hooks={'request': [_verify_request_host]}`) to run security checks on the target host before *every* request, including transparent redirects. When calling blocking operations within these hooks, safely wrap them in `asyncio.to_thread` to prevent stalling the async loop.
