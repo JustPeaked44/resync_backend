@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import time
 import uuid
 import logging
@@ -1680,6 +1681,33 @@ async def manuscript_outline(
 GDOC_DOCX_CACHE_SECONDS = 300
 _gdoc_docx_cache: Dict[str, Any] = {}
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+# A 1x1 transparent PNG that stands in for every picture.
+_PLACEHOLDER_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+
+def slim_docx_bytes(data: bytes) -> bytes:
+    """Swaps every picture in a Word file for a tiny placeholder. Only the writing is compared, so the pictures only make
+    the download, the preview and the scan slow. Text, tables and layout are untouched; anything unexpected returns the
+    original bytes."""
+    import io
+    import zipfile
+    if len(data) < 1_000_000:
+        return data
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as source:
+            names = source.namelist()
+            if not any(name.lower().startswith("word/media/") and not name.endswith("/") for name in names):
+                return data
+            out = io.BytesIO()
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as target:
+                for item in source.infolist():
+                    is_picture = item.filename.lower().startswith("word/media/") and not item.filename.endswith("/")
+                    target.writestr(item.filename, _PLACEHOLDER_PNG if is_picture else source.read(item.filename))
+        slim = out.getvalue()
+        return slim if len(slim) < len(data) else data
+    except Exception as exc:  # a file that cannot be read this way is still sent as it is
+        logger.warning("Could not shrink the Google Doc download: %s", exc)
+        return data
 
 
 @app.post(
@@ -1719,7 +1747,7 @@ async def google_doc_as_docx(
                                 detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
         if len(response.content) > 25 * 1024 * 1024:
             raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB.")
-        data = response.content
+        data = slim_docx_bytes(response.content)
         match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", response.headers.get("content-disposition", ""))
         filename = unquote(match.group(1) or match.group(2)) if match else "Google Doc.docx"
         if not filename.lower().endswith(".docx"):
