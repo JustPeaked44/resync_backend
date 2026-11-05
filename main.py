@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService, looks_like_html_document
+from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService
@@ -77,53 +78,76 @@ app.add_middleware(
 def read_root():
     return {"status": "Resync FastAPI Server is Live!"}
 
-# ponytail: single-slot global lock — one scan at a time on 0.1 CPU / 512MB.
-# Raise to 2+ only on a Standard (2GB) instance. Held across the whole
-# pipeline (not just the CPU-bound steps) so concurrent scans do not
-# multiply the Gemini pair and summary request rate.
-SCAN_SLOT = asyncio.Semaphore(1)
+class NotAResearchPaper(HTTPException):
+    """The document has no research-paper structure, so it is not scanned (and nothing is charged)."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NOT_A_PAPER_MESSAGE)
+
+    def __str__(self) -> str:
+        return NOT_A_PAPER_MESSAGE
+
+
+def _scan_concurrency() -> int:
+    """How many scans run at once. Everyone who uploads starts right away by default (no limit); set SCAN_CONCURRENCY to a
+    number only if the server runs out of memory."""
+    try:
+        limit = int(os.getenv("SCAN_CONCURRENCY", "0"))
+    except ValueError:
+        limit = 0
+    return limit if limit > 0 else 1000
+
+
+# Gemini's rolling request limit is shared by every scan in the process (services/gemini.py), so more scans never exceed
+# it: they split it.
+SCAN_CONCURRENCY = _scan_concurrency()
+SCAN_SLOT = asyncio.Semaphore(SCAN_CONCURRENCY)
 # shortcut: tickets live in one process; use durable storage if scans must survive restarts or multiple workers.
 _scan_queue = deque()
 _scan_durations = deque(maxlen=20)
-_scan_worker = None
-_running_scan_started = None
+_scan_workers = []
+_running_scan_starts = []
 
 
 def _queue_state(scan_id):
     for position, job in enumerate(_scan_queue, 1):
         if job[1] == scan_id:
             average = sum(_scan_durations) / len(_scan_durations) if _scan_durations else 240
-            remaining = (max(0, average - (time.monotonic() - _running_scan_started))
-                         if _running_scan_started else average if SCAN_SLOT.locked() else 0)
-            seconds = math.ceil(remaining + (position - 1) * average)
+            now = time.monotonic()
+            if len(_running_scan_starts) >= SCAN_CONCURRENCY:
+                remaining = min(max(0, average - (now - started)) for started in _running_scan_starts)
+            else:
+                remaining = average if SCAN_SLOT.locked() else 0
+            seconds = math.ceil(remaining + ((position - 1) // SCAN_CONCURRENCY) * average)
             minutes = max(1, math.ceil(seconds / 60))
             if position == 1:
-                return position, seconds, "info", f"You're next in line. Another scan is running, so yours will take a little longer than usual (about {minutes} minutes)."
+                return position, seconds, "info", f"You're next in line. Other scans are running, so yours will take a little longer than usual (about {minutes} minutes)."
             return position, seconds, "wait", f"You are #{position} in line. Your scan will start in about {minutes} minutes."
     return None, None, None, None
 
 
 def _enqueue_scan(*job):
-    global _scan_worker
     _scan_queue.append(job)
-    if _scan_worker is None or _scan_worker.done():
-        _scan_worker = asyncio.create_task(_drain_scan_queue())
+    _scan_workers[:] = [worker for worker in _scan_workers if not worker.done()]
+    # A live worker that is not running a scan is about to take the next job from the queue.
+    idle = len(_scan_workers) - len(_running_scan_starts)
+    for _ in range(min(SCAN_CONCURRENCY - len(_scan_workers), len(_scan_queue) - idle)):
+        _scan_workers.append(asyncio.create_task(_drain_scan_queue()))
 
 
 async def _drain_scan_queue():
-    global _scan_worker, _running_scan_started
-    try:
-        while _scan_queue:
-            async with SCAN_SLOT:
-                job = _scan_queue.popleft()
-                _running_scan_started = time.monotonic()
-                try:
-                    await _run_scan_job(*job)
-                finally:
-                    _scan_durations.append(time.monotonic() - _running_scan_started)
-                    _running_scan_started = None
-    finally:
-        _scan_worker = None
+    while _scan_queue:
+        async with SCAN_SLOT:
+            if not _scan_queue:
+                break
+            job = _scan_queue.popleft()
+            started = time.monotonic()
+            _running_scan_starts.append(started)
+            try:
+                await _run_scan_job(*job)
+            finally:
+                _scan_durations.append(time.monotonic() - started)
+                _running_scan_starts.remove(started)
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +659,10 @@ async def _execute_scan_pipeline(
         parse_result = await asyncio.to_thread(
             ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
         )
+    paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
+    if not paper["ok"]:
+        logger.info("Scan %s refused: not a research paper (%s)", analysis_run_id, paper["reason"])
+        raise NotAResearchPaper()
     # Saved for this manuscript either way, so /analyze_v7 can find it by manuscript_id (the save does not hold up the scan).
     SectionCache.save_in_background(manuscript_id, req.user_id, content_hash, parse_result, raw_text)
     parsed_sections: Dict[str, str] = parse_result["parsed_sections"]
@@ -1621,6 +1649,8 @@ class OutlineResponse(BaseModel):
     structure: str
     sections: List[OutlineSection]
     excerpt: List[str]
+    looks_like_paper: bool = True
+    paper_problem: Optional[str] = None
 
 
 @app.post(
@@ -1671,6 +1701,9 @@ async def manuscript_outline(
         sections=[OutlineSection(name=name, words=len(sections[name].split()), role=roles.get(name)) for name in order if name in sections],
         excerpt=[line[:420] for line in paragraphs[1:7]],
     )
+    paper = check_research_paper(raw_text, parsed)
+    response.looks_like_paper = paper["ok"]
+    response.paper_problem = None if paper["ok"] else NOT_A_PAPER_MESSAGE
     if file is None and doc_url:
         _outline_cache[doc_url] = (time.time(), response)
         for key in [key for key, (saved, _) in _outline_cache.items() if time.time() - saved > OUTLINE_CACHE_SECONDS]:

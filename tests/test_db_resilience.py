@@ -44,3 +44,29 @@ def test_other_errors_are_not_retried():
     with pytest.raises(ValueError):
         client.postgrest.session.request("GET", "/x")
     assert session.calls == 1
+
+
+def test_saving_rows_twice_leaves_one_copy():
+    from services.db_service import DatabasePersistenceService
+
+    calls = []
+
+    class Table:
+        def insert(self, rows):
+            calls.append(("insert", rows))
+            return self
+
+        def upsert(self, rows, on_conflict=None, ignore_duplicates=False):
+            calls.append(("upsert", on_conflict, ignore_duplicates))
+            return self
+
+        def execute(self):
+            return None
+
+    class Client:
+        def table(self, _):
+            return Table()
+
+    DatabasePersistenceService._save_rows(Client(), "citation", [{"citation_id": "a"}], "citation_id")
+    DatabasePersistenceService._save_rows(Client(), "x", [{"name": "no id"}], "x_id")
+    assert calls[0] == ("upsert", "citation_id", True) and calls[1][0] == "insert"

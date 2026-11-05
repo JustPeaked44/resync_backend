@@ -48,6 +48,14 @@ class DatabasePersistenceService:
         session.request = request
         return client
 
+    @staticmethod
+    def _save_rows(client: Client, table: str, rows: List[Dict[str, Any]], key: str):
+        """Saves rows so that saving them twice leaves one copy. A dropped connection is retried above, and a retry of an
+        insert whose first try had already gone through would otherwise fail with 'duplicate key' and lose the whole scan."""
+        if rows and all(row.get(key) for row in rows):
+            return client.table(table).upsert(rows, on_conflict=key, ignore_duplicates=True).execute()
+        return client.table(table).insert(rows).execute()
+
     @classmethod
     def get_client(cls) -> Client:
         """
@@ -207,7 +215,7 @@ class DatabasePersistenceService:
             if inconsistency_rows:
                 # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
                 await asyncio.to_thread(
-                    lambda: client.table("inconsistency").insert(inconsistency_rows).execute()
+                    lambda: cls._save_rows(client, "inconsistency", inconsistency_rows, "inconsistency_id")
                 )
 
         # Step 4: Insert rows into public.recommendation
@@ -246,7 +254,7 @@ class DatabasePersistenceService:
             if recommendation_rows:
                 # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
                 await asyncio.to_thread(
-                    lambda: client.table("recommendation").insert(recommendation_rows).execute()
+                    lambda: cls._save_rows(client, "recommendation", recommendation_rows, "recommendation_id")
                 )
 
         # Step 5: Insert rows into public.citation
@@ -294,7 +302,7 @@ class DatabasePersistenceService:
             if citation_rows:
                 # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
                 await asyncio.to_thread(
-                    lambda: client.table("citation").insert(citation_rows).execute()
+                    lambda: cls._save_rows(client, "citation", citation_rows, "citation_id")
                 )
 
         # Step 5b: Insert in-text/reference-list cross-match findings

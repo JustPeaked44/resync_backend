@@ -12,6 +12,11 @@ def identity_calibration(monkeypatch):
     monkeypatch.setattr(v7_scan, "CALIBRATION", ((0.0, 0.0), (1.0, 1.0)))
 
 
+@pytest.fixture(autouse=True)
+def fake_manuscripts_count_as_papers(monkeypatch):
+    """The fake manuscripts here are a few words long; the research-paper check has its own tests (test_paper_check)."""
+    monkeypatch.setattr(main, "check_research_paper", lambda *_, **__: {"ok": True, "reason": ""})
+
 
 def build_scan(monkeypatch, reuse_saved_sections=False):
     captured = {"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []}
