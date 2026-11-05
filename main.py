@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form
+from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form, Request
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
@@ -425,6 +425,9 @@ class AITextIndicatorReport(BaseModel):
     disclaimer: str = ""
 
 
+_scanned_manuscripts: Dict[Any, bool] = {}   # (user, text fingerprint) of scans that finished, so a repeat can say nothing changed
+
+
 class ScanResponse(BaseModel):
     """Consolidated report returned by the master production scan endpoint."""
     status: str
@@ -447,6 +450,7 @@ class ScanResponse(BaseModel):
     citations: List[CitationReport]
     score_breakdown: Optional[ScoreBreakdown] = None
     dimension_breakdown: Optional[Dict[str, Dict[str, Any]]] = None
+    rescan_unchanged: bool = False  # this exact text was scanned before: nothing in the manuscript has changed since
     structure_note: Optional[str] = None  # set when the paper had no usual headings, so the report can say how it was split
     ai_text_indicator: Optional[AITextIndicatorReport] = None
     db_save_status: str
@@ -596,6 +600,7 @@ async def _execute_scan_pipeline(
     content_hash = SectionCache.content_hash(payload, req.template_toc) if payload else None
     cached = await SectionCache.find(req.user_id, content_hash) if content_hash else None
     parse_result: Optional[Dict[str, Any]] = None
+    found = None
     if cached:
         raw_text, parse_result = cached["raw_text"], cached["parse_result"]
         logger.info("Scan %s reused the saved sections of manuscript %s", analysis_run_id, cached["manuscript_id"])
@@ -613,6 +618,10 @@ async def _execute_scan_pipeline(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No valid manuscript provided. Please provide a public Google Docs link or upload a .docx/.pdf file."
         )
+
+    # Has this person already had exactly this text scanned? Then a rescan found nothing new to review.
+    seen_key = (req.user_id, content_hash) if content_hash else None
+    rescan_unchanged = bool(cached) or bool(found) or (seen_key in _scanned_manuscripts if seen_key else False)
 
     derived_title = derive_title(raw_text) if req.doc_url and not req.manuscript_title else None
 
@@ -648,7 +657,7 @@ async def _execute_scan_pipeline(
         ml_result = await asyncio.to_thread(ml_client.analyze_v7, [{**section, "role": section_roles.get(section["name"])} for section in sections])
         manuscript_flow = assemble_flow(sections, ml_result["pairs"])
         (inconsistencies_data, recommendations, ai_synthesis), ai_text_result = await asyncio.gather(
-            explain_flow(sections, manuscript_flow),
+            explain_flow(sections, manuscript_flow, section_roles),
             asyncio.to_thread(ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}),
         )
         citation_audit_result: Dict[str, Any] = await citation_task
@@ -749,6 +758,10 @@ async def _execute_scan_pipeline(
     # ------------------------------------------------------------------
     # Step 8 – Return consolidated ScanResponse
     # ------------------------------------------------------------------
+    if seen_key:
+        _scanned_manuscripts[seen_key] = True
+        while len(_scanned_manuscripts) > 5000:
+            _scanned_manuscripts.pop(next(iter(_scanned_manuscripts)))
     return ScanResponse(
         status="completed",
         analysis_run_id=analysis_run_id,
@@ -784,6 +797,7 @@ async def _execute_scan_pipeline(
         score_breakdown=ScoreBreakdown(**score_breakdown_dict),
         dimension_breakdown=breakdown,
         structure_note=structure_note,
+        rescan_unchanged=rescan_unchanged,
         ai_text_indicator=AITextIndicatorReport(**ai_text_result),
         credits_remaining=credits_remaining,
         db_save_status=db_save_status,
@@ -1536,6 +1550,58 @@ async def confirm_credit_checkout(
         )
 
 
+class EmailCheckRequest(BaseModel):
+    email: str = Field(..., max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class EmailCheckResponse(BaseModel):
+    registered: bool
+
+
+_email_checks: Dict[str, List[float]] = {}
+EMAIL_CHECKS_PER_MINUTE = 5
+
+
+def _email_registered_sync(email: str) -> bool:
+    client = DatabasePersistenceService.get_client()
+    try:
+        return bool(client.rpc("email_registered", {"p_email": email}).execute().data)
+    except Exception as exc:
+        # The SQL function (migration 013) is not installed: look through the user list instead.
+        logger.warning("email_registered RPC unavailable, scanning users instead: %s", exc)
+    for page in range(1, 26):
+        users = client.auth.admin.list_users(page=page, per_page=200)
+        if not users:
+            return False
+        if any((getattr(user, "email", "") or "").lower() == email for user in users):
+            return True
+        if len(users) < 200:
+            return False
+    return False
+
+
+@app.post(
+    "/api/auth/email-registered",
+    response_model=EmailCheckResponse,
+    summary="Does this email belong to an account?",
+    description="Used by Forgot password to say 'Email not found' instead of silently sending nothing. Rate limited per caller.",
+    tags=["Auth"],
+)
+async def email_registered(body: EmailCheckRequest, request: Request) -> EmailCheckResponse:
+    caller = request.client.host if request.client else "unknown"
+    now = time.time()
+    recent = [moment for moment in _email_checks.get(caller, []) if now - moment < 60]
+    if len(recent) >= EMAIL_CHECKS_PER_MINUTE:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many attempts. Please wait a minute and try again.")
+    _email_checks[caller] = recent + [now]
+    try:
+        registered = await asyncio.to_thread(_email_registered_sync, body.email.strip().lower())
+    except Exception as exc:
+        logger.error("Email check failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We could not check that email right now. Please try again.")
+    return EmailCheckResponse(registered=registered)
+
+
 OUTLINE_CACHE_SECONDS = 300
 OUTLINE_FETCH_SECONDS = 25
 _outline_cache: Dict[str, Any] = {}
@@ -1666,6 +1732,64 @@ async def google_doc_as_docx(
     from urllib.parse import quote
     return Response(content=data, media_type=DOCX_MEDIA_TYPE,
                     headers={"X-Doc-Filename": quote(filename), "Access-Control-Expose-Headers": "X-Doc-Filename"})
+
+
+class PurchaseProof(BaseModel):
+    reference_number: str = Field(..., min_length=4, max_length=40, pattern=r"^[A-Za-z0-9 \-]+$")
+    payer_name: Optional[str] = Field(default=None, max_length=120)
+    file_name: Optional[str] = Field(default=None, max_length=200)
+    content_type: str
+    proof_data: str = Field(..., description="The receipt picture or PDF, base64 encoded")
+
+
+class PurchaseRequest(BaseModel):
+    credit_amount: int = Field(..., gt=0, le=100)
+    method: str = Field(default="card", pattern="^(card|gcash|bank_transfer)$")
+    proof: Optional[PurchaseProof] = None
+
+
+class PurchaseResponse(BaseModel):
+    pymt_txn_id: str
+    checkout_reference: str
+    amount: float
+    credit_amount: int
+    balance: int
+    method: str
+
+
+@app.post(
+    "/api/credits/purchase",
+    response_model=PurchaseResponse,
+    summary="Buy credits",
+    description=(
+        "Records the purchase and adds the credits to the caller's wallet. The price is set by the server. "
+        "No money is taken yet; a payment provider's confirmation would slot in here."
+    ),
+    tags=["Credits"],
+)
+async def purchase_credits(
+    body: PurchaseRequest,
+    x_user_id: str = Header(..., alias="X-User-Id", description="Supabase auth user UUID"),
+    authenticated_user_id: str = Depends(get_authenticated_user_id),
+) -> PurchaseResponse:
+    _assert_owner(authenticated_user_id, x_user_id)
+    proof = None
+    if body.proof:
+        if body.proof.content_type not in PROOF_TYPES:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Upload a PNG, JPEG, WebP or PDF file.")
+        if len(body.proof.proof_data) * 3 // 4 > PROOF_MAX_BYTES:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="The proof of payment is larger than 2 MB.")
+        proof = {"reference_number": body.proof.reference_number.strip(), "payer_name": body.proof.payer_name,
+                 "file_name": body.proof.file_name, "content_type": body.proof.content_type,
+                 "proof_data": f"data:{body.proof.content_type};base64,{body.proof.proof_data}"}
+    try:
+        return PurchaseResponse(**await credits_service.purchase(x_user_id, body.credit_amount, body.method, proof))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except Exception as exc:
+        logger.error("Credit purchase failed for user %s: %s", x_user_id, exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="The purchase could not be completed. No credits were added. Please try again.")
 
 
 PROOF_MAX_BYTES = 2 * 1024 * 1024

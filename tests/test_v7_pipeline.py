@@ -182,7 +182,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
             "status", "analysis_run_id", "user_id", "manuscript_id", "doc_url", "manuscript_title", "result_version",
         "overall_coherence_score", "sections_analyzed", "manuscript_sections", "access", "manuscript_flow", "inconsistencies_found",
         "inconsistencies", "recommendations", "ai_synthesis", "citations_audited", "citations",
-        "score_breakdown", "dimension_breakdown", "structure_note", "ai_text_indicator", "db_save_status", "notification_dispatched",
+        "score_breakdown", "dimension_breakdown", "structure_note", "rescan_unchanged", "ai_text_indicator", "db_save_status", "notification_dispatched",
         "credits_remaining"}
     assert payload["result_version"] == "v7"
     assert len(payload["manuscript_flow"]) == 1
@@ -301,3 +301,22 @@ def test_persistence_rounds_only_legacy_integer_mirror(monkeypatch):
     assert updates[0]["analysis_run_coherence_score"] == 77
     assert updates[0]["functional_metric_score"] == 77.1
     assert "structural_completeness_score" not in updates[0]
+
+
+def test_the_first_scan_of_a_text_is_not_flagged_as_unchanged(monkeypatch):
+    main._scanned_manuscripts.clear()
+    payload, _, _ = build_scan(monkeypatch)
+    assert payload["rescan_unchanged"] is False
+
+
+def test_scanning_the_same_text_again_says_nothing_has_changed(monkeypatch):
+    main._scanned_manuscripts.clear()
+    build_scan(monkeypatch)
+    second, _, _ = build_scan(monkeypatch)
+    assert second["rescan_unchanged"] is True
+
+
+def test_a_saved_parse_also_counts_as_the_same_text(monkeypatch):
+    main._scanned_manuscripts.clear()
+    payload, _, _ = build_scan(monkeypatch, reuse_saved_sections=True)
+    assert payload["rescan_unchanged"] is True

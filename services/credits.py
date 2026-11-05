@@ -9,17 +9,17 @@ stored report unlocked in one transaction.
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from services.db_service import DatabasePersistenceService
 
 logger = logging.getLogger("resync.credits")
 
-# ponytail: single env kill switch for capstone testing. CREDITS_ENABLED=false
-# makes the wallet report unlimited and turns debit/refund into no-ops, so the
-# scan pipeline never touches credit_wallet/credit_ledger. Flip back to true
-# (or drop the var) to re-enable the real ledger.
-CREDITS_ENABLED = os.getenv("CREDITS_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+# Credits are real: a new account starts with whatever its wallet holds (nothing, after migration 015) and every
+# unlock spends one. The only way to switch that off is an explicit testing flag; the old CREDITS_ENABLED=false setting
+# that made every account show 999 credits is no longer read, so it cannot be left on by mistake.
+CREDITS_ENABLED = os.getenv("CREDITS_UNLIMITED_FOR_TESTING", "false").strip().lower() not in ("true", "1", "yes")
 UNLIMITED_BALANCE = 999
 
 
@@ -152,6 +152,74 @@ class CreditsService:
             "amount": total_amount,
             "credit_amount": credit_amount,
         }
+
+    # What the app sells. The server decides the price, so a changed request cannot buy credits for less.
+    PACKAGES = {1: 25.0, 5: 25.0, 20: 22.5, 50: 20.0}   # credits -> price per credit (PHP)
+    METHODS = ("card", "gcash", "bank_transfer")
+
+    @classmethod
+    async def purchase(cls, user_id: str, credit_amount: int, method: str = "card",
+                       proof: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Records the purchase and adds the credits to the wallet in one step.
+
+        No money moves yet: this is where a payment provider's confirmation would go. Everything else is real: the
+        transaction is saved, the wallet balance rises, and the ledger shows a purchase entry the person can see.
+        """
+        import asyncio
+        if credit_amount not in cls.PACKAGES:
+            raise ValueError("Choose one of the credit packages.")
+        if method not in cls.METHODS:
+            raise ValueError("Unknown payment method.")
+        client = cls._client()
+        txn_id = str(uuid.uuid4())
+        total_amount = round(credit_amount * cls.PACKAGES[credit_amount], 2)
+        row = {"pymt_txn_id": txn_id, "pymt_txn_amount": total_amount, "pymt_txn_status": "pending",
+               "pymt_txn_credits": credit_amount, "pymt_txn_provider": method,
+               "pymt_txn_created_at": datetime.now(timezone.utc).isoformat()}
+
+        def _record():
+            # Payments in this project belong to the buyer's subscription record.
+            try:
+                found = (client.table("subscription").select("subscription_id")
+                         .eq("user_id", user_id).order("subscription_started_at", desc=True).limit(1).execute())
+                if found.data:
+                    row["subscription_id"] = found.data[0]["subscription_id"]
+            except Exception as error:
+                logger.warning("Could not look up the subscription for user %s: %s", user_id, error)
+            try:
+                client.table("pymt_txn").insert({**row, "user_id": user_id}).execute()
+            except Exception as error:
+                # Projects set up before migration 014 have no user_id column here; the ledger still names the buyer.
+                if "user_id" not in str(error):
+                    raise
+                client.table("pymt_txn").insert(row).execute()
+
+        await asyncio.to_thread(_record)
+
+        def _mark(status: str):
+            try:
+                client.table("pymt_txn").update({"pymt_txn_status": status}).eq("pymt_txn_id", txn_id).execute()
+            except Exception as error:
+                logger.error("Could not mark transaction %s as %s: %s", txn_id, status, error)
+
+        if proof:
+            # The receipt is a keepsake while no payment provider confirms the money: if it cannot be stored (for
+            # example migration 012 has not been run), the purchase still goes through.
+            try:
+                await asyncio.to_thread(lambda: client.table("payment_proof").insert(
+                    {"proof_id": str(uuid.uuid4()), "pymt_txn_id": txn_id, "user_id": user_id, "method": method, **proof}).execute())
+            except Exception as error:
+                logger.warning("Proof of payment for %s was not stored: %s", txn_id, error)
+        try:
+            balance = await asyncio.to_thread(lambda: client.rpc("purchase_credits", {
+                "p_user_id": user_id, "p_amount": credit_amount, "p_pymt_txn_id": txn_id,
+                "p_idempotency_key": f"purchase:{txn_id}"}).execute().data)
+        except Exception:
+            await asyncio.to_thread(_mark, "failed")   # a purchase that did not finish adds nothing
+            raise
+        await asyncio.to_thread(_mark, "paid")
+        return {"pymt_txn_id": txn_id, "checkout_reference": f"RS-{txn_id[:8].upper()}", "amount": total_amount,
+                "credit_amount": credit_amount, "balance": balance, "method": method}
 
     @classmethod
     async def save_payment_proof(cls, user_id: str, pymt_txn_id: str, method: str, reference_number: str,

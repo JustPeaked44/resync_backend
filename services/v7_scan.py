@@ -165,11 +165,49 @@ def select_worst_pairs(pairs, limit=12):   # limit=None keeps every pair
                   key=lambda p: (p["pair_score"], p["order"]))[:limit]
 
 
-def select_pairs_to_explain(pairs):
+# The far-apart sections that matter most, in the order they are looked at. Each is reviewed on its own, because a
+# contradiction between two sections on the same topic is found far more reliably one pair at a time than in a batch.
+FAR_REVIEW_LIMIT = int(os.getenv("FAR_REVIEW_LIMIT", "8"))
+FAR_REVIEW_ORDER = (("objectives", "conclusion"), ("objectives", "results"), ("methodology", "results"),
+                    ("methodology", "conclusion"), ("objectives", "methodology"), ("introduction", "conclusion"),
+                    ("abstract", "conclusion"), ("abstract", "results"), ("objectives", "discussion"), ("methodology", "discussion"))
+
+
+def main_far_pairs(pairs, sections, roles=None):
+    """The pairs joining the sections that must agree however far apart they sit: for each kind (objectives with
+    conclusion, methodology with results, ...) the pair made of the section that carries that role's name, or else the
+    first section with that role."""
+    if sections is None:
+        return []
+    role_of = lambda index: (roles or {}).get(sections[index]["name"]) or sections[index].get("role")
+
+    def pick(role):
+        indexes = [i for i in range(len(sections)) if role_of(i) == role]
+        named = [i for i in indexes if role in sections[i]["name"].lower() or sections[i]["name"].lower() in role]
+        return (named or indexes or [None])[0]
+
+    by_indexes = {(p["index_a"], p["index_b"]): p for p in pairs if p["scores"]["overall_coherence"] is not None}
+    chosen = []
+    for first, second in FAR_REVIEW_ORDER:
+        i, j = pick(first), pick(second)
+        if i is None or j is None or i == j:
+            continue
+        pair = by_indexes.get((min(i, j), max(i, j)))
+        if pair is not None and not pair.get("adjacent") and pair not in chosen:
+            chosen.append(pair)
+    return chosen[:FAR_REVIEW_LIMIT]
+
+
+def select_pairs_to_explain(pairs, sections=None, roles=None):
     """Every pair that is below the recommendation threshold gets a real explanation, weakest first, so
-    advice is equally specific across the whole manuscript. A cap applies only if EXPLAIN_LIMIT is set."""
+    advice is equally specific across the whole manuscript. A cap applies only if EXPLAIN_LIMIT is set.
+
+    The main far-apart pairs that must agree (objectives and conclusion, methodology and results) are always reviewed,
+    even when the model rates them as similar: two sections on one topic look alike to the model while saying opposite
+    things, and those contradictions are exactly what a reviewer needs to hear about."""
+    always = {id(p) for p in main_far_pairs(pairs, sections, roles)}
     weak = [p for p in pairs if p["scores"]["overall_coherence"] is not None
-            and p["scores"]["overall_coherence"] < RECOMMENDATION_THRESHOLD]
+            and (p["scores"]["overall_coherence"] < RECOMMENDATION_THRESHOLD or id(p) in always)]
     return select_worst_pairs(weak, EXPLAIN_LIMIT)
 
 
@@ -233,7 +271,82 @@ def pair_pointer(pair):
             "overall_coherence": overall, "score": round(pair["pair_score"] * 100, 2)}
 
 
-async def explain_flow(sections, flow):
+# ---- Counts that two sections report differently --------------------------------------------------------------------
+# The AI compares the end of one section with the start of the next, so a figure buried in the middle of a long section
+# (how many people answered a survey) can be contradicted elsewhere without the model ever seeing both. Headcounts are
+# simple enough to compare directly over the whole text of both sections.
+_COUNT_GROUPS = {"respondent": "respondents", "participant": "respondents", "subject": "respondents", "student": "respondents",
+                 "sample": "respondents", "user": "users", "expert": "experts", "panelist": "experts", "teacher": "teachers",
+                 "employee": "employees", "patient": "patients", "people": "people", "person": "people"}
+_COUNT_RE = re.compile(r"(?<![\w.,/-])(\d{1,3}(?:,\d{3})+|\d{2,5})(?!\s*%|\d|[.,]\d)\s+(?:[A-Za-z-]+\s+){0,2}?(respondent|participant|subject|student|"
+                       r"sample|user|expert|panelist|teacher|employee|patient|people|person)s?\b", re.I)
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_SIDE_GROUP_RE = re.compile(r"\b(pilot|preliminary|pre-?test|pre-?survey|trial|focus group|initial)\b", re.I)
+
+
+def _counts_in(text):
+    """{group: {number: first sentence stating it}} for the headcounts a section states."""
+    found = {}
+    for sentence in _SENTENCE_RE.split(text or ""):
+        if _SIDE_GROUP_RE.search(sentence):   # a pilot or a focus group is a different group of people, not the main sample
+            continue
+        for match in _COUNT_RE.finditer(sentence):
+            number = int(match.group(1).replace(",", ""))
+            if number < 10 or ("," not in match.group(1) and 1900 <= number <= 2100):   # small numbers and years
+                continue
+            found.setdefault(_COUNT_GROUPS[match.group(2).lower()], {}).setdefault(number, sentence.strip())
+    return found
+
+
+def figure_conflict(text_a, text_b):
+    """(group, number_a, sentence_a, number_b, sentence_b) when each section gives ONE headcount for the same kind of
+    people and the two differ; None otherwise. A section that mentions several different counts is left alone."""
+    counts_a, counts_b = _counts_in(text_a), _counts_in(text_b)
+    for group in counts_a.keys() & counts_b.keys():
+        if len(counts_a[group]) == 1 and len(counts_b[group]) == 1:
+            (number_a, sentence_a), = counts_a[group].items()
+            (number_b, sentence_b), = counts_b[group].items()
+            if number_a != number_b:
+                return group, number_a, sentence_a, number_b, sentence_b
+    return None
+
+
+def apply_figure_conflicts(flow, sections):
+    """Adds a quoted finding and a one-sentence fix for every pair whose sections report different headcounts."""
+    rank = {None: -1, "None": 0, "Minor": 1, "Moderate": 2, "Critical": 3}
+    for pair in flow:
+        if pair["scores"]["overall_coherence"] is None:
+            continue
+        a, b = sections[pair["index_a"]], sections[pair["index_b"]]
+        conflict = figure_conflict(a["text"], b["text"])
+        if not conflict:
+            continue
+        group, number_a, sentence_a, number_b, sentence_b = conflict
+        if sentence_a not in a["text"] or sentence_b not in b["text"]:
+            continue
+        written_b = f"{number_b:,}" if f"{number_b:,}" in sentence_b else str(number_b)
+        written_a = f"{number_a:,}" if "," in written_b else str(number_a)
+        fixed = sentence_b.replace(written_b, written_a, 1)
+        explanation = pair["explanation"] or {
+            "severity": "None", "failed_dimension": "none", "coherence_scores": {}, "link_summary": "",
+            "comparison": {"a_says": "", "b_says": ""}, "highlighted_inconsistencies": [], "recommendations": [],
+            "reference_list": [], "bridges": []}
+        explanation["highlighted_inconsistencies"].append({
+            "section": b["name"], "quote": sentence_b, "what": f"Different number of {group}",
+            "why": f"{a['name'].title()} says {number_a:,} {group}, but {b['name'].title()} says {number_b:,}."})
+        explanation["reference_list"].append({"section": a["name"], "sentence": sentence_a})
+        explanation["recommendations"].append({
+            "section": b["name"], "original_sentence": sentence_b, "recommended_revision": fixed, "kind": "edit",
+            "issue": f"This section reports {number_b:,} {group} but {a['name']} reports {number_a:,}. Use the correct number in both places.",
+            "category": "evidence"})
+        if rank.get(explanation.get("severity"), 0) < rank["Moderate"]:
+            explanation["severity"] = "Moderate"
+        explanation["failed_dimension"] = "numeric_consistency"
+        pair["numeric_applicable"] = True
+        pair["explanation"] = explanation
+
+
+async def explain_flow(sections, flow, roles=None):
     from services import gemini
     from services.v7_explain import (FLOW_SUGGESTION_BELOW, explain_batch, explain_pair, explain_summary, pair_cache_key,
                                      suggest_bridges_batch)
@@ -285,7 +398,7 @@ async def explain_flow(sections, flow):
             if second is not None and second["severity"] == "None":
                 pair["explanation"] = second
 
-    to_explain = select_pairs_to_explain(flow)
+    to_explain = select_pairs_to_explain(flow, sections, roles)
     # A pair whose text the AI has already judged keeps that verdict, so the same paper always gets the same score, and the
     # AI is only asked about pairs it has not seen (see verdict_cache).
     keys = {pair["order"]: pair_cache_key(pair["section_a"], sections[pair["index_a"]]["text"], pair["section_b"],
@@ -304,6 +417,12 @@ async def explain_flow(sections, flow):
         if missing:
             gemini.expect_calls(len(missing))
             await asyncio.gather(*(explain(pair) for pair in missing), return_exceptions=True)
+        # The main far-apart pairs get a review of their own whatever the batch said, so a contradiction is not lost in a group.
+        singles = [pair for pair in main_far_pairs(flow, sections, roles) if pair in to_review
+                   and (pair["explanation"] or {}).get("severity") in (None, "None")]
+        if singles:
+            gemini.expect_calls(len(singles))
+            await asyncio.gather(*(explain(pair) for pair in singles), return_exceptions=True)
         # Gemini fails more under load (429/503), so pairs it could not judge get one calmer, one-at-a-time second pass.
         for pair in to_explain:
             if pair["explanation"] and pair["explanation"]["severity"] is None:
@@ -336,6 +455,7 @@ async def explain_flow(sections, flow):
         # Remember what was just decided, linking sentences included, for the next scan of the same text.
         decided = [pair for pair in to_explain if pair["explanation"] and (pair in to_review or pair in loose)]
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
+        apply_figure_conflicts(flow, sections)
         for pair in flow:
             overall = pair["scores"]["overall_coherence"]
             if overall is None:

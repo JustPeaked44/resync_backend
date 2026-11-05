@@ -3,6 +3,9 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+import time
+
+import httpx
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -19,6 +22,32 @@ class DatabasePersistenceService:
 
     _client: Optional[Client] = None
 
+    # Supabase closes connections that sat idle while a long scan was computing; the next request on such a connection fails
+    # with "Server disconnected" even though the database is fine. Asking again opens a fresh connection and succeeds.
+    TRANSIENT_ERRORS = (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError, httpx.PoolTimeout)
+    RETRY_ATTEMPTS = 3
+
+    @classmethod
+    def _make_resilient(cls, client: Client) -> Client:
+        try:
+            session = client.postgrest.session
+        except Exception:   # a client without that session is used as it is
+            return client
+        original = session.request
+
+        def request(*args, **kwargs):
+            for attempt in range(cls.RETRY_ATTEMPTS):
+                try:
+                    return original(*args, **kwargs)
+                except cls.TRANSIENT_ERRORS as error:
+                    if attempt == cls.RETRY_ATTEMPTS - 1:
+                        raise
+                    logging.getLogger("resync.db").warning("Database connection dropped (%s); retrying", error)
+                    time.sleep(0.4 * (attempt + 1))
+
+        session.request = request
+        return client
+
     @classmethod
     def get_client(cls) -> Client:
         """
@@ -31,7 +60,7 @@ class DatabasePersistenceService:
                 raise ValueError(
                     "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured in environment."
                 )
-            cls._client = create_client(supabase_url, supabase_key)
+            cls._client = cls._make_resilient(create_client(supabase_url, supabase_key))
         return cls._client
 
     @classmethod

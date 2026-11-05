@@ -23,29 +23,26 @@ def create_sample_docx_bytes(title: str = "Test Thesis", sections: dict = None) 
     doc.save(buf)
     return buf.getvalue()
 
-@pytest.mark.asyncio
-async def test_docx_text_extraction():
+def test_docx_text_extraction():
     docx_bytes = create_sample_docx_bytes()
-    text = await DocumentIngestionService.extract_plaintext_from_upload(docx_bytes, "manuscript.docx")
+    text = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(docx_bytes, "manuscript.docx"))
     
     assert "Chapter 1: Introduction" in text
     assert "Chapter 2: Methodology" in text
     assert "N=100 participants" in text
 
-@pytest.mark.asyncio
-async def test_unsupported_format_raises_400():
+def test_unsupported_format_raises_400():
     with pytest.raises(HTTPException) as exc_info:
-        await DocumentIngestionService.extract_plaintext_from_upload(b"some plain text", "test.txt")
+        asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(b"some plain text", "test.txt"))
     assert exc_info.value.status_code == 400
     assert "Unsupported file format" in exc_info.value.detail
 
-@pytest.mark.asyncio
-async def test_empty_docx_raises_400():
+def test_empty_docx_raises_400():
     doc = docx.Document()
     buf = io.BytesIO()
     doc.save(buf)
     
     with pytest.raises(HTTPException) as exc_info:
-        await DocumentIngestionService.extract_plaintext_from_upload(buf.getvalue(), "empty.docx")
+        asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(buf.getvalue(), "empty.docx"))
     assert exc_info.value.status_code == 400
     assert "appears to be empty" in exc_info.value.detail
