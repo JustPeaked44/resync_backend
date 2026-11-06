@@ -830,8 +830,6 @@ async def _execute_scan_pipeline(
     )
 
     result.db_save_status = db_result.get("status", "unknown")
-    if not await _save_completed_result(result):
-        raise RuntimeError("Scan is no longer processing")
     manuscript_title: str = req.manuscript_title or derived_title or source_identifier
     try:
         ms_row = (
@@ -847,27 +845,24 @@ async def _execute_scan_pipeline(
     except Exception:
         pass  # silently fall back to URL/filename — non-critical
 
-    notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
-        user_id=req.user_id,
-        manuscript_title=manuscript_title,
-        coherence_score=int(overall_score),
-        analysis_run_id=analysis_run_id
-    )
+    try:
+        result.notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
+            user_id=req.user_id,
+            manuscript_title=manuscript_title,
+            coherence_score=int(overall_score),
+            analysis_run_id=analysis_run_id
+        )
+    except Exception:
+        logger.exception("Scan notification failed: %s", analysis_run_id)
+        result.notification_dispatched = False
 
-    # Publish before notifying; compare the published result before changing only its notification flag.
-    if notification_dispatched:
-        published = result.model_dump(mode="json")
-        updated = dict(published, notification_dispatched=True)
-        try:
-            response = await asyncio.to_thread(lambda: db_client.table(RUN_TABLE).update({RUN_RESULT: updated})
-                .eq(RUN_ID, analysis_run_id).eq(RUN_STATUS, "completed")
-                .eq(RUN_RESULT, json.dumps(published, separators=(",", ":"))).execute())
-            if response.data:
-                result.notification_dispatched = True
-            else:
-                logger.warning("Could not update notification flag for scan %s", analysis_run_id)
-        except Exception:
-            logger.exception("Could not update notification flag for scan %s", analysis_run_id)
+    # Publish once with the notification outcome; a failed publish may follow a sent notification.
+    try:
+        if not await _save_completed_result(result):
+            raise RuntimeError("Scan is no longer processing")
+    except Exception:
+        logger.exception("Failed to publish scan %s after notification", analysis_run_id)
+        raise
     if seen_key:
         _scanned_manuscripts[seen_key] = True
         while len(_scanned_manuscripts) > 5000:

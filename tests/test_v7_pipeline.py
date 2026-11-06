@@ -35,21 +35,23 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
         def update(self, payload):
             self.updated = True
             captured.setdefault("updates", []).append(payload)
-            captured.setdefault("update_filters", []).append([])
+            captured.setdefault("events", []).append("publish" if payload.get("status") == "completed" else "fail")
             return self
 
         def eq(self, *args):
-            if getattr(self, "updated", False):
-                captured["update_filters"][-1].append(args)
             return self
 
         def single(self):
             return self
 
         def execute(self):
-            if getattr(self, "updated", False) and captured.get("fail_flag") and len(captured["updates"]) > 1:
-                raise RuntimeError("flag update failed")
-            return SimpleNamespace(data=[{}] if getattr(self, "updated", False) else {})
+            if getattr(self, "updated", False):
+                payload = captured["updates"][-1]
+                if captured.get("fail_publish") and payload.get("status") == "completed":
+                    raise RuntimeError("publish failed")
+                captured.setdefault("row", {}).update(payload)
+                return SimpleNamespace(data=[{}])
+            return SimpleNamespace(data={})
 
     async def ingest(*_):
         captured["ingested"] += 1
@@ -94,11 +96,15 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
 
     async def save(**kwargs):
         captured["save"] = kwargs
+        captured.setdefault("events", []).append("save")
         return {"status": "success"}
 
     async def notify(**_):
         captured["notified"] = True
-        return True
+        captured.setdefault("events", []).append("notify")
+        if captured.get("notify_raises"):
+            raise RuntimeError("notification failed")
+        return captured.get("notify_result", True)
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: DB())
     monkeypatch.setattr(main.DatabasePersistenceService, "save_scan_transaction", save)
@@ -143,6 +149,9 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
     monkeypatch.setattr(main.SectionCache, "find", find_saved)
     monkeypatch.setattr(main.SectionCache, "save_in_background", lambda *args: captured["cache_save"].append(args))
     req = main.ScanRequest(user_id="user", manuscript_title="Test", filename="test.docx")
+    if captured.get("run_job"):
+        asyncio.run(main._run_scan_job(req, "run", "ms", 4, b"doc", "test.docx"))
+        return None, captured, sections
     result = asyncio.run(main._execute_scan_pipeline(req, "run", "ms", 4, b"doc", "test.docx"))
     payload = result.model_dump(mode="json")
     return payload, captured, sections
@@ -367,20 +376,23 @@ def test_invalid_report_is_not_saved_or_notified(monkeypatch):
     assert "notified" not in captured
 
 
-def test_notification_flag_saved_after_publication_and_failure_is_ignored(monkeypatch):
-    payload, captured, _ = build_scan(monkeypatch)
-    assert captured["updates"][0]["status"] == "completed"
-    assert captured["updates"][0]["result_json"]["notification_dispatched"] is False
-    assert list(captured["updates"][1]) == ["result_json"]
-    filters = captured["update_filters"][1]
-    assert filters[:2] == [("analysis_run_id", "run"), ("status", "completed")]
-    import json
-    assert json.loads(filters[2][1]) == captured["updates"][0]["result_json"]
-    assert filters[2][0] == "result_json"
-    assert captured["updates"][1]["result_json"]["notification_dispatched"] is True
-    assert payload["notification_dispatched"] is True
-    payload, captured, _ = build_scan(monkeypatch, captured={"fail_flag": True})
-    assert captured["notified"] and payload["notification_dispatched"] is False
+@pytest.mark.parametrize("notify_result,notify_raises", [(True, False), (False, False), (False, True)])
+def test_notification_outcome_is_published_once(monkeypatch, notify_result, notify_raises):
+    payload, captured, _ = build_scan(monkeypatch, captured={"notify_result": notify_result, "notify_raises": notify_raises})
+    assert captured["events"] == ["save", "notify", "publish"]
+    assert len(captured["updates"]) == 1
+    stored = captured["row"]["result_json"]
+    assert captured["row"]["status"] == "completed"
+    assert stored["notification_dispatched"] is notify_result
+    assert payload == stored
+
+
+def test_publish_failure_after_notification_marks_row_failed(monkeypatch, caplog):
+    _, captured, _ = build_scan(monkeypatch, captured={"fail_publish": True, "run_job": True})
+    assert captured["events"] == ["save", "notify", "publish", "fail"]
+    assert captured["row"]["status"] == "failed"
+    assert captured["row"]["error_message"] == main.GENERIC_FAILURE_MESSAGE.format(scan_number="run")
+    assert "Failed to publish scan run after notification" in caplog.text
 
 
 def test_pipeline_joins_cancelled_citation_and_whole_paper_tasks(monkeypatch):
