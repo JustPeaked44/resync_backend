@@ -106,14 +106,25 @@ app.add_middleware(
 )
 
 async def _read_upload(file: UploadFile, message: str) -> bytearray:
-    data = bytearray()
+    # Starlette's multipart file is seekable; reserve once to avoid repeated large reallocations.
+    try:
+        position = file.file.tell()
+        file.file.seek(0, 2)
+        expected = max(0, min(MAX_UPLOAD_BYTES, file.file.tell() - position))
+        file.file.seek(position)
+    except (AttributeError, OSError):
+        expected = 0
+    data = bytearray(expected)
+    used = 0
     while True:
-        chunk = await file.read(min(READ_CHUNK_BYTES, MAX_UPLOAD_BYTES - len(data) + 1))
+        chunk = await file.read(min(READ_CHUNK_BYTES, MAX_UPLOAD_BYTES - used + 1))
         if not chunk:
+            del data[used:]
             return data
-        if len(data) + len(chunk) > MAX_UPLOAD_BYTES:
+        if used + len(chunk) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail=message)
-        data.extend(chunk)
+        data[used:used + len(chunk)] = chunk
+        used += len(chunk)
 
 
 @app.get("/")
