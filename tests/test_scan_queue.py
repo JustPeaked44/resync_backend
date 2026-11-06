@@ -24,8 +24,9 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
             self.value = value
             return self
 
-        def eq(self, _, name):
-            self.name = name
+        def eq(self, key, name):
+            if key == "analysis_run_id":
+                self.name = name
             return self
 
         def execute(self):
@@ -58,7 +59,7 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
         assert started == ["first"]
         third = await main.get_scan_status("third", "owner")
         assert third.queue_position == 2 and third.estimated_wait_seconds >= 240
-        assert third.status_message_level == "wait" and "#2" in third.status_message
+        assert third.status_message_level == "wait" and third.status_message == main.QUEUE_MESSAGE
         gates["first"].set()
         for _ in range(100):
             if "second" in started:
@@ -66,8 +67,8 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
             await asyncio.sleep(0.01)
         assert rows["first"]["status"] == "failed"
         third = await main.get_scan_status("third", "owner")
-        assert third.queue_position == 1 and third.status_message_level == "info"
-        assert "You're next in line" in third.status_message
+        assert third.queue_position == 1 and third.status_message_level == "wait"
+        assert third.status_message == main.QUEUE_MESSAGE
         gates["second"].set()
         for _ in range(100):
             if "third" in started:

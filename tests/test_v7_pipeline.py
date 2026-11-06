@@ -18,8 +18,9 @@ def fake_manuscripts_count_as_papers(monkeypatch):
     monkeypatch.setattr(main, "check_research_paper", lambda *_, **__: {"ok": True, "reason": ""})
 
 
-def build_scan(monkeypatch, reuse_saved_sections=False):
-    captured = {"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []}
+def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
+    captured = captured if captured is not None else {}
+    captured.update({"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []})
     sections = {"Related Studies": "A source sentence with several words.",
                 "Related Studies (2)": "A second source sentence with several words.",
                 "Results": "The resulting text also contains several words."}
@@ -31,13 +32,25 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
         def select(self, *_):
             return self
 
-        def eq(self, *_):
+        def update(self, payload):
+            self.updated = True
+            captured.setdefault("updates", []).append(payload)
+            captured.setdefault("events", []).append("publish" if payload.get("status") == "completed" else "fail")
+            return self
+
+        def eq(self, *args):
             return self
 
         def single(self):
             return self
 
         def execute(self):
+            if getattr(self, "updated", False):
+                payload = captured["updates"][-1]
+                if captured.get("fail_publish") and payload.get("status") == "completed":
+                    raise RuntimeError("publish failed")
+                captured.setdefault("row", {}).update(payload)
+                return SimpleNamespace(data=[{}])
             return SimpleNamespace(data={})
 
     async def ingest(*_):
@@ -83,10 +96,15 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
 
     async def save(**kwargs):
         captured["save"] = kwargs
+        captured.setdefault("events", []).append("save")
         return {"status": "success"}
 
     async def notify(**_):
-        return True
+        captured["notified"] = True
+        captured.setdefault("events", []).append("notify")
+        if captured.get("notify_raises"):
+            raise RuntimeError("notification failed")
+        return captured.get("notify_result", True)
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: DB())
     monkeypatch.setattr(main.DatabasePersistenceService, "save_scan_transaction", save)
@@ -111,9 +129,29 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
 
     monkeypatch.setattr(v7_explain, "explain_batch", no_batch)
     monkeypatch.setattr(v7_explain, "suggest_bridges_batch", no_batch)
+    if captured.get("cancel_children"):
+        import threading
+        from services import full_check
+        started = [threading.Event(), threading.Event()]
+        async def child(index):
+            started[index].set()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                await asyncio.sleep(0.01)
+                captured.setdefault("joined", []).append(index)
+        def failing_ml(*_):
+            assert all(event.wait(5) for event in started)
+            raise ValueError("model failed")
+        monkeypatch.setattr(main.ml_client, "analyze_v7", failing_ml)
+        monkeypatch.setattr(main.CitationAuditService, "audit_citations", lambda *a, **k: child(0))
+        monkeypatch.setattr(full_check, "start", lambda *_: asyncio.create_task(child(1)))
     monkeypatch.setattr(main.SectionCache, "find", find_saved)
     monkeypatch.setattr(main.SectionCache, "save_in_background", lambda *args: captured["cache_save"].append(args))
     req = main.ScanRequest(user_id="user", manuscript_title="Test", filename="test.docx")
+    if captured.get("run_job"):
+        asyncio.run(main._run_scan_job(req, "run", "ms", 4, b"doc", "test.docx"))
+        return None, captured, sections
     result = asyncio.run(main._execute_scan_pipeline(req, "run", "ms", 4, b"doc", "test.docx"))
     payload = result.model_dump(mode="json")
     return payload, captured, sections
@@ -325,3 +363,40 @@ def test_a_saved_parse_also_counts_as_the_same_text(monkeypatch):
     main._scanned_manuscripts.clear()
     payload, _, _ = build_scan(monkeypatch, reuse_saved_sections=True)
     assert payload["rescan_unchanged"] is True
+
+
+def test_invalid_report_is_not_saved_or_notified(monkeypatch):
+    captured = {}
+    def invalid(**kwargs):
+        raise ValueError("invalid recommendation")
+    monkeypatch.setattr(main, "RecommendationReport", invalid)
+    with pytest.raises(ValueError, match="invalid recommendation"):
+        build_scan(monkeypatch, captured=captured)
+    assert "save" not in captured
+    assert "notified" not in captured
+
+
+@pytest.mark.parametrize("notify_result,notify_raises", [(True, False), (False, False), (False, True)])
+def test_notification_outcome_is_published_once(monkeypatch, notify_result, notify_raises):
+    payload, captured, _ = build_scan(monkeypatch, captured={"notify_result": notify_result, "notify_raises": notify_raises})
+    assert captured["events"] == ["save", "notify", "publish"]
+    assert len(captured["updates"]) == 1
+    stored = captured["row"]["result_json"]
+    assert captured["row"]["status"] == "completed"
+    assert stored["notification_dispatched"] is notify_result
+    assert payload == stored
+
+
+def test_publish_failure_after_notification_marks_row_failed(monkeypatch, caplog):
+    _, captured, _ = build_scan(monkeypatch, captured={"fail_publish": True, "run_job": True})
+    assert captured["events"] == ["save", "notify", "publish", "fail"]
+    assert captured["row"]["status"] == "failed"
+    assert captured["row"]["error_message"] == main.GENERIC_FAILURE_MESSAGE.format(scan_number="run")
+    assert "Failed to publish scan run after notification" in caplog.text
+
+
+def test_pipeline_joins_cancelled_citation_and_whole_paper_tasks(monkeypatch):
+    captured = {"cancel_children": True}
+    with pytest.raises(ValueError, match="model failed"):
+        build_scan(monkeypatch, captured=captured)
+    assert sorted(captured["joined"]) == [0, 1]
