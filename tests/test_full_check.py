@@ -24,7 +24,7 @@ def _sections():
     ]
 
 
-def _fake_ai(monkeypatch, genuine=True):
+def _fake_ai(monkeypatch, genuine=True, misnamed=False):
     prompts = []
 
     async def generate(prompt, max_tokens=None):
@@ -38,6 +38,9 @@ def _fake_ai(monkeypatch, genuine=True):
             return {"facts": []}
         if "STATEMENTS:" in prompt:
             ids = {line.split(" | ")[3]: line.split(" | ")[0] for line in prompt.split("STATEMENTS:")[1].strip().splitlines()}
+            if misnamed:   # the AI named its title field wrongly and left the reason out
+                return {"conflicts": [{"fact_a": ids["built with the Waterfall model"], "fact_b": ids["built with the Agile model"],
+                                       "severity": "Moderate", "category": "methodology", "claims": "Different development model"}]}
             return {"conflicts": [{"fact_a": ids["built with the Waterfall model"], "fact_b": ids["built with the Agile model"],
                                    "severity": "Moderate", "category": "methodology", "what": "Different development model",
                                    "why": f"Statement {ids['built with the Waterfall model']} says Waterfall but statement {ids['built with the Agile model']} says Agile.", "fix_id": ids["built with the Agile model"]}]}
@@ -119,3 +122,11 @@ def test_a_piece_whose_answer_comes_back_broken_is_read_again_in_halves(monkeypa
     sections = [{"name": "one", "text": "Alpha beta gamma delta. " * 400}, {"name": "two", "text": "Alpha beta gamma delta. " * 400}]
     asyncio.run(full_check.apply_full_check([], sections))
     assert any(size <= 7000 for size in sizes)     # the halves were asked after the whole piece failed
+
+
+def test_a_conflict_with_a_misnamed_or_missing_title_is_still_checked_and_reported(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch, misnamed=True)
+    sections = _sections()
+    flow = _flow(sections)
+    assert asyncio.run(full_check.apply_full_check(flow, sections)) == 1

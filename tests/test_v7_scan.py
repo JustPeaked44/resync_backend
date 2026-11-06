@@ -143,8 +143,8 @@ def test_checks_are_counted_per_pair_and_category_and_each_category_is_a_percent
              pair_for_score("Minor", "claim_support", order=3), pair_for_score("None", "none", order=4), pair_for_score(None, None, order=5)]
     score, breakdown = manuscript_score(pairs)
     assert {name: entry["score"] for name, entry in breakdown.items()} == {
-        "context_alignment": 100.0, "operational_alignment": 60.0, "evidence_consistency": 100.0, "logical_support": 80.0}
-    assert score == 85.0   # (100 + 60 + 100 + 80) / 4
+        "context_alignment": 100.0, "operational_alignment": 65.0, "evidence_consistency": 100.0, "logical_support": 90.0}
+    assert score == 89.0   # (100 + 65 + 100 + 90) / 4 = 88.75, rounded up
     operational = breakdown["operational_alignment"]
     assert (operational["items"], operational["passed"], operational["issues"]) == (5, 3, 2)
     assert [(f["reason"], f["severity"]) for f in operational["failures"]] == [("contradiction", "Critical"), ("contradiction", "Moderate")]   # traceable
@@ -163,8 +163,8 @@ def test_a_category_with_no_applicable_pair_is_na_and_left_out_of_the_average():
     pairs = [pair_for_score("Moderate", "claim_support", numeric=False, order=1), pair_for_score("None", "none", numeric=False, order=2)]
     score, breakdown = manuscript_score(pairs)
     assert breakdown["evidence_consistency"]["score"] == "N/A" and breakdown["evidence_consistency"]["failures"] == []
-    assert breakdown["logical_support"]["score"] == 50.0
-    assert score == 84.0   # (100 + 100 + 50) / 3 = 83.33, rounded up: figures are left out
+    assert breakdown["logical_support"]["score"] == 62.5
+    assert score == 88.0   # (100 + 100 + 62.5) / 3 = 87.5, rounded up: figures are left out
 
 
 def test_neighbors_fail_on_a_loose_link_but_far_apart_pairs_need_a_quoted_contradiction():
@@ -200,8 +200,8 @@ def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
     score, breakdown = manuscript_score(flow)
     logical = breakdown["logical_support"]
     assert (logical["items"], logical["passed"], logical["issues"]) == (4, 0, 3)   # three contradictions and one loose link (rated 0.3)
-    assert breakdown["context_alignment"]["score"] == 50.0   # the two low-rated neighbors (0.2 and 0.3) are loose links
-    assert score == 34.0   # (50 + 50 + 0) / 3 = 33.33, rounded up: numeric is N/A for these texts
+    assert breakdown["context_alignment"]["score"] == 62.5   # the two low-rated neighbors (0.2 and 0.3) are loose links and keep only their ratings
+    assert score == 51.0   # failed checks keep part of their credit; numeric is N/A for these texts
 
 
 def test_failed_reviews_get_a_second_one_at_a_time_pass(monkeypatch):
@@ -371,7 +371,7 @@ def test_many_easy_far_apart_pairs_cannot_hide_weak_flow_between_neighbors():
     context = breakdown["context_alignment"]
     assert (context["flow"], context["cross"]) == ({"items": 3, "passed": 0}, {"items": 10, "passed": 10})
     assert context["halves"] is True and (context["items"], context["passed"]) == (13, 10)
-    assert context["score"] == 50.0 and score == 50.0      # flow 0% and cross 100% average to 50; pooled it would read 77
+    assert context["score"] == 70.0 and score == 70.0      # flow keeps only its weak ratings and cross is 100%; the two halves are averaged, not pooled
     only_cross = [dict(pair_for_score("None", "none", order=1, overall=0.6), adjacent=False)]
     assert manuscript_score(only_cross)[1]["context_alignment"]["score"] == 100.0                    # a single kind of check stands alone
 
@@ -381,4 +381,4 @@ def test_a_kind_with_too_few_checks_is_pooled_instead_of_swinging_the_category()
     far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in (3, 4, 5)]
     category = manuscript_score(one_miss_of_two + far)[1]["context_alignment"]
     assert (category["flow"]["items"], category["cross"]["items"]) == (2, 3) and category["halves"] is False
-    assert category["score"] == 80.0      # 4 of 5 checks passed; split in halves, one miss in two flow checks would have read 75
+    assert category["score"] == 88.0      # 4 of 5 checks passed and the miss keeps part of its credit by severity; split in halves it would have read lower

@@ -316,9 +316,15 @@ async def _apply(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> 
     seen = set()
     for item in await _cross_check(facts):
         a, b = by_id.get(str(item.get("fact_a"))), by_id.get(str(item.get("fact_b")))
-        what, why = item.get("what"), item.get("why")
-        if not (a and b and a["index"] != b["index"] and isinstance(what, str) and isinstance(why, str) and what.strip() and why.strip()):
+        if not (a and b and a["index"] != b["index"]):
             continue
+        # The AI sometimes names a field wrongly ("claims" instead of "what") or leaves one out. The two statements are what
+        # matter, and the confirm step re-checks them with the real quotes, so a missing title or reason is filled in.
+        spare = [v for k, v in item.items() if k not in ("fact_a", "fact_b", "severity", "category", "fix_id", "what", "why")
+                 and isinstance(v, str) and v.strip()]
+        what = item.get("what") if isinstance(item.get("what"), str) and item["what"].strip() else (spare[0] if spare else "Statements disagree")
+        why = item.get("why") if isinstance(item.get("why"), str) and item["why"].strip() else (
+            spare[-1] if len(spare) > 1 else f"The {a['section']} and {b['section']} sections do not agree.")
         if (a["index"], b["index"]) > (b["index"], a["index"]):
             a, b = b, a
         if (a["id"], b["id"]) in seen:

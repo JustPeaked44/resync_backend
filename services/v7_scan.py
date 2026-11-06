@@ -20,6 +20,9 @@ CALIBRATION = ((0.15, 0.0), (0.45, 0.60), (0.65, 0.86), (0.82, 1.0))
 SEVERITY_PENALTY = {"Critical": 10, "Moderate": 5, "Minor": 1, "None": 0}
 START_SCORE = 100
 MIN_HALF_CHECKS = 3  # a kind of check with fewer than this is too small to weigh as its own half: one miss would swing the category
+# A failed check still earns part of a point so the four categories do not all drop by the same step when one pair is weak:
+# a contradiction keeps this share of the point by severity; a loose link keeps its own rating for that category (under 0.5).
+CONTRADICTION_CREDIT = {"Critical": 0.0, "Moderate": 0.25, "Minor": 0.5}
 CHECK_PASS_AT = 0.5  # a neighboring pair rated below this for a category fails that check (a loose link)
 # Internal score keys (as the model and Gemini name them) -> the names the API and UI show.
 DIMENSION_NAMES = {"objectives_alignment": "context_alignment", "methodology_fit": "operational_alignment",
@@ -101,7 +104,7 @@ def manuscript_score(pairs, transitions=None):
     breakdown = {}
     for key, name in DIMENSION_NAMES.items():
         failures = []
-        counts = {"flow": [0, 0], "cross": [0, 0]}   # kind -> [checks, passed]
+        counts = {"flow": [0, 0, 0.0], "cross": [0, 0, 0.0]}   # kind -> [checks, passed, credit]
         for p in scored:
             rating = p["scores"].get(key)
             if rating is None or (key == "numeric_consistency" and not p.get("numeric_applicable", True)):
@@ -111,10 +114,13 @@ def manuscript_score(pairs, transitions=None):
             kind[0] += 1
             if severity in ("Critical", "Moderate", "Minor") and p.get("failed_dimension") == key:
                 reason = "contradiction"
+                kind[2] += CONTRADICTION_CREDIT.get(severity, 0.0)
             elif rating < CHECK_PASS_AT and (neighbors or severity is None):
                 reason = "loose_link"
+                kind[2] += max(0.0, min(CHECK_PASS_AT, rating))
             else:
                 kind[1] += 1
+                kind[2] += 1
                 continue
             failures.append({"order": p.get("order"), "section_a": p.get("section_a", ""), "section_b": p.get("section_b", ""),
                              "reason": reason, "severity": severity if reason == "contradiction" else None,
@@ -126,8 +132,8 @@ def manuscript_score(pairs, transitions=None):
                                "baseline": None, "penalty": 0, "deductions": []}
             continue
         halves = counts["flow"][0] >= MIN_HALF_CHECKS and counts["cross"][0] >= MIN_HALF_CHECKS
-        rates = [passed / items for items, passed in counts.values() if items]
-        score = sum(rates) / len(rates) if halves else (counts["flow"][1] + counts["cross"][1]) / total   # small samples are pooled, not split
+        rates = [credit / items for items, _, credit in counts.values() if items]
+        score = sum(rates) / len(rates) if halves else (counts["flow"][2] + counts["cross"][2]) / total   # small samples are pooled, not split
         breakdown[name] = {"score": round(score * 100, 2), "halves": halves, "items": total,
                            "passed": counts["flow"][1] + counts["cross"][1],
                            "issues": sum(f["reason"] == "contradiction" for f in failures), "pairs": total,
@@ -338,7 +344,7 @@ def apply_figure_conflicts(flow, sections):
         explanation["recommendations"].append({
             "section": b["name"], "original_sentence": sentence_b, "recommended_revision": fixed, "kind": "edit",
             "issue": f"This section reports {number_b:,} {group} but {a['name']} reports {number_a:,}. Use the correct number in both places.",
-            "category": "evidence"})
+            "category": "numeric"})
         if rank.get(explanation.get("severity"), 0) < rank["Moderate"]:
             explanation["severity"] = "Moderate"
         explanation["failed_dimension"] = "numeric_consistency"
@@ -539,7 +545,7 @@ def flatten_explanations(flow, sections=None):
                                     "kind": item.get("kind", "edit"),
                                     **({"placement": item["placement"]} if item.get("placement") else {}),
                                     "section": item["section"],
-                                    "category": item.get("category", fallback_category),
+                                    "category": item.get("category") if item.get("category") in ("objectives", "methodology", "claims", "numeric") else fallback_category,
                                     "recommended_revision": revision, "recommendation_text": revision,
                                     "recommendation_priority": "High" if score < 50 else "Medium" if score < 70 else "Low",
                                     "target_section_name": item["section"]})

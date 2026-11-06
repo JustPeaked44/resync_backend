@@ -236,7 +236,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
 
 async def _generate(prompt, max_tokens=None):
     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-               "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
+               "generationConfig": {"temperature": 0, "seed": 7, "responseMimeType": "application/json",
                                     **({"maxOutputTokens": max_tokens} if max_tokens else {})}}
     response = await gemini.post_gemini_with_retry(payload)
     response.raise_for_status()
