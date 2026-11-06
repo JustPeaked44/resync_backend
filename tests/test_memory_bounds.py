@@ -132,3 +132,23 @@ def test_upload_refuses_oversized_archive_before_docx_parsing(monkeypatch):
         asyncio.run(ingestion.DocumentIngestionService.extract_plaintext_from_upload(data.getvalue(), 'paper.docx'))
     assert exc.value.status_code == 413
     assert 'too large' in exc.value.detail
+
+
+def test_legacy_nlp_import_loads_once_when_requested(monkeypatch):
+    import types
+    from services import parser
+    calls = []
+    class Pipeline:
+        def add_pipe(self, name): calls.append(name)
+    pipeline = Pipeline()
+    def blank(language):
+        calls.append(language)
+        return pipeline
+    monkeypatch.setitem(sys.modules, 'spacy', types.SimpleNamespace(blank=blank))
+    monkeypatch.delitem(parser.__dict__, 'nlp', raising=False)
+    try:
+        assert parser.nlp is pipeline
+        assert parser.nlp is pipeline
+        assert calls == ['en', 'sentencizer']
+    finally:
+        parser.__dict__.pop('nlp', None)

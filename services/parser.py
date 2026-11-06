@@ -1,5 +1,21 @@
 import re
+import threading
 from typing import Dict, List, Any, Optional
+
+_nlp_lock = threading.Lock()
+
+
+def __getattr__(name):
+    if name != "nlp":
+        raise AttributeError(name)
+    # The legacy AI text service imports this pipeline; parsing does not use it.
+    with _nlp_lock:
+        if "nlp" not in globals():
+            import spacy
+            pipeline = spacy.blank("en")
+            pipeline.add_pipe("sentencizer")
+            globals()["nlp"] = pipeline
+        return globals()["nlp"]
 
 # Default Capstone TOC Template
 DEFAULT_TOC_TEMPLATE = [
