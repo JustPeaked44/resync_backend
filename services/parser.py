@@ -1,10 +1,21 @@
 import re
-import spacy
+import threading
 from typing import Dict, List, Any, Optional
 
-# Load spaCy English NLP model (lightweight sentencizer only)
-nlp = spacy.blank("en")
-nlp.add_pipe("sentencizer")
+_nlp_lock = threading.Lock()
+
+
+def __getattr__(name):
+    if name != "nlp":
+        raise AttributeError(name)
+    # The legacy AI text service imports this pipeline; parsing does not use it.
+    with _nlp_lock:
+        if "nlp" not in globals():
+            import spacy
+            pipeline = spacy.blank("en")
+            pipeline.add_pipe("sentencizer")
+            globals()["nlp"] = pipeline
+        return globals()["nlp"]
 
 # Default Capstone TOC Template
 DEFAULT_TOC_TEMPLATE = [
@@ -142,7 +153,7 @@ ROLE_MAPPING: dict = {
 
 class ManuscriptParserService:
     """
-    Uses spaCy NLP to parse raw manuscript text and segment it into 
+    Parses raw manuscript text and segments it into
     structured sections matching the mandatory Department Template TOC.
     """
 
