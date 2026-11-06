@@ -61,10 +61,31 @@ def _references_text(parsed_sections: Dict[str, str], section_roles: Dict[str, s
 gemini_key = os.getenv("GEMINI_API_KEY")
 supabase_url = os.getenv("SUPABASE_URL")
 
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+
+
+@asynccontextmanager
+async def application_lifespan(app):
+    executor = ThreadPoolExecutor(max_workers=4)
+    asyncio.get_running_loop().set_default_executor(executor)
+    async def sweep_later():
+        await asyncio.sleep(INTERRUPTED_GRACE_SECONDS)
+        await _sweep_interrupted()
+    sweep = asyncio.create_task(sweep_later())
+    try:
+        yield
+    finally:
+        sweep.cancel()
+        await asyncio.gather(sweep, return_exceptions=True)
+        executor.shutdown(wait=True)
+
+
 app = FastAPI(
     title="Resync AI API",
     description="Backend API for Research Manuscript Correlation & Inconsistency Detection",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=application_lifespan,
 )
 
 # Enable CORS
@@ -1046,16 +1067,6 @@ async def _sweep_interrupted():
         logger.exception("Interrupted scan sweep failed")
 
 
-@app.on_event("startup")
-async def _schedule_interrupted_sweep():
-    from concurrent.futures import ThreadPoolExecutor
-    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=4))
-    async def sweep_later():
-        await asyncio.sleep(INTERRUPTED_GRACE_SECONDS)
-        await _sweep_interrupted()
-    asyncio.create_task(sweep_later())
-
-
 @app.post(
     "/api/scans/run",
     response_model=ScanResponse,
@@ -1989,6 +2000,35 @@ DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingm
 _PLACEHOLDER_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
 
 
+class _BufferReader:
+    """Seekable view of an existing buffer, without duplicating it."""
+    def __init__(self, data):
+        self.data = memoryview(data)
+        self.position = 0
+
+    def seek(self, offset, whence=0):
+        if whence == 1:
+            offset += self.position
+        elif whence == 2:
+            offset += len(self.data)
+        if offset < 0:
+            raise ValueError("negative seek")
+        self.position = offset
+        return offset
+
+    def tell(self):
+        return self.position
+
+    def read(self, size=-1):
+        end = len(self.data) if size < 0 else min(len(self.data), self.position + size)
+        result = self.data[self.position:end].tobytes()
+        self.position = end
+        return result
+
+    def seekable(self):
+        return True
+
+
 def slim_docx_bytes(data: bytes) -> bytes:
     """Swaps every picture in a Word file for a tiny placeholder. Only the writing is compared, so the pictures only make
     the download, the preview and the scan slow. Text, tables and layout are untouched; anything unexpected returns the
@@ -1998,7 +2038,7 @@ def slim_docx_bytes(data: bytes) -> bytes:
     if len(data) < 1_000_000:
         return data
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as source:
+        with zipfile.ZipFile(_BufferReader(data)) as source:
             names = source.namelist()
             if not any(name.lower().startswith("word/media/") and not name.endswith("/") for name in names):
                 return data
@@ -2006,7 +2046,12 @@ def slim_docx_bytes(data: bytes) -> bytes:
             with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as target:
                 for item in source.infolist():
                     is_picture = item.filename.lower().startswith("word/media/") and not item.filename.endswith("/")
-                    target.writestr(item.filename, _PLACEHOLDER_PNG if is_picture else source.read(item.filename))
+                    if is_picture:
+                        target.writestr(item.filename, _PLACEHOLDER_PNG)
+                    else:
+                        import shutil
+                        with source.open(item) as reader, target.open(item.filename, "w") as writer:
+                            shutil.copyfileobj(reader, writer, length=READ_CHUNK_BYTES)
         slim = out.getvalue()
         return slim if len(slim) < len(data) else data
     except Exception as exc:  # a file that cannot be read this way is still sent as it is
