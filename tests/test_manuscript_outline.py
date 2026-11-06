@@ -88,7 +88,7 @@ def test_a_google_doc_comes_back_as_a_word_file(monkeypatch):
     _fake_google(monkeypatch, _Stream(200, {"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                             "content-disposition": "attachment; filename=\"My Capstone.docx\""}, b"PK\x03\x04docx-bytes"))
     response = asyncio.run(main.google_doc_as_docx(doc_url="https://docs.google.com/document/d/abcDEF123456/edit", authenticated_user_id="u"))
-    assert response.body.startswith(b"PK") and response.headers["x-doc-filename"] == "My%20Capstone.docx"
+    assert bytes(response.body).startswith(b"PK") and response.headers["x-doc-filename"] == "My%20Capstone.docx"
 
 
 def test_a_private_google_doc_is_refused_with_a_sharing_hint(monkeypatch):

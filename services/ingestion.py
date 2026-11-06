@@ -38,7 +38,8 @@ def validate_docx_archive(file_bytes: bytes) -> None:
     """Reject oversized archives before python-docx decompresses their members."""
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
         members = archive.infolist()
-        if (sum(member.file_size for member in members) > MAX_DECOMPRESSED_BYTES
+        if (len(members) > 20_000
+                or sum(member.file_size for member in members) > MAX_DECOMPRESSED_BYTES
                 or any(member.file_size > MAX_ARCHIVE_MEMBER_BYTES for member in members)):
             raise HTTPException(status_code=413, detail="This document is too large to open. Please use a smaller file.")
         for member in members:

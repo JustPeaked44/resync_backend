@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 # override=True ensures .env values WIN over Windows system env vars.
 load_dotenv(override=True)
 
-from services.ingestion import DocumentIngestionService, looks_like_html_document
+from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES
 from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
@@ -83,6 +83,17 @@ app.add_middleware(
     allow_headers=["*"],
     max_age=600,
 )
+
+async def _read_upload(file: UploadFile, message: str) -> bytearray:
+    data = bytearray()
+    while True:
+        chunk = await file.read(min(READ_CHUNK_BYTES, MAX_UPLOAD_BYTES - len(data) + 1))
+        if not chunk:
+            return data
+        if len(data) + len(chunk) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=message)
+        data.extend(chunk)
+
 
 @app.get("/")
 def read_root():
@@ -312,7 +323,7 @@ async def test_ingestion(doc_url: str = Query(..., description="Public Google Do
 async def test_upload_ingestion(file: UploadFile = File(..., description="Manuscript file (.docx or .pdf)")):
     """Endpoint to test .docx / .pdf file text extraction."""
     _require_test_endpoints_enabled()
-    file_bytes = await file.read()
+    file_bytes = await _read_upload(file, "File exceeds maximum allowed size of 25 MB.")
     extracted_text = await DocumentIngestionService.extract_plaintext_from_upload(file_bytes, file.filename or "uploaded.docx")
     return {
         "status": "success",
@@ -645,9 +656,16 @@ async def _execute_scan_pipeline(
     # A file this user already scanned is not read or parsed again: its sections were saved the first time (SectionCache).
     payload = file_bytes
     if payload is None and req.file_content_base64:
+        if len(req.file_content_base64) > ((MAX_UPLOAD_BYTES + 2) // 3) * 4:
+            raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 25 MB.")
         import base64
         try:
             payload = base64.b64decode(req.file_content_base64)
+            req.file_content_base64 = None
+            if len(payload) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 25 MB.")
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -991,6 +1009,8 @@ async def _sweep_interrupted():
 
 @app.on_event("startup")
 async def _schedule_interrupted_sweep():
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=4))
     async def sweep_later():
         await asyncio.sleep(INTERRUPTED_GRACE_SECONDS)
         await _sweep_interrupted()
@@ -1122,7 +1142,7 @@ async def upload_and_start_scan(
 
     # 25 MB max file size
     MAX_FILE_SIZE = 25 * 1024 * 1024
-    file_bytes = await file.read()
+    file_bytes = await _read_upload(file, "File exceeds maximum allowed size of 25 MB.")
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -1194,7 +1214,7 @@ async def upload_and_run_scan(
     _assert_owner(authenticated_user_id, user_id)
 
     MAX_FILE_SIZE = 25 * 1024 * 1024
-    file_bytes = await file.read()
+    file_bytes = await _read_upload(file, "File exceeds maximum allowed size of 25 MB.")
     if len(file_bytes) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -1471,15 +1491,13 @@ async def get_manuscript_preview(
             follow_redirects=True,
             headers={"User-Agent": _BROWSER_UA}
         ) as client:
-            resp = await client.get(export_url)
-
-            if resp.status_code in (401, 403):
-                return {"available": False, "reason": "private"}
-            if resp.status_code == 404:
-                return {"available": False, "reason": "unreachable"}
-            resp.raise_for_status()
-
-            raw_text = resp.text
+            async with client.stream("GET", export_url) as resp:
+                if resp.status_code in (401, 403):
+                    return {"available": False, "reason": "private"}
+                if resp.status_code == 404:
+                    return {"available": False, "reason": "unreachable"}
+                resp.raise_for_status()
+                raw_text = (await bounded_download(resp)).decode(resp.encoding or "utf-8", errors="replace")
 
             # Google returns an HTML login-redirect page instead of 403
             # when the doc is private. Catch it here.
@@ -1820,9 +1838,7 @@ async def manuscript_outline(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> OutlineResponse:
     if file is not None:
-        data = await file.read()
-        if len(data) > 25 * 1024 * 1024:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This file is larger than 25 MB.")
+        data = await _read_upload(file, "This file is larger than 25 MB.")
         raw_text = await DocumentIngestionService.extract_plaintext_from_upload(data, file.filename or "uploaded.docx")
     elif doc_url and doc_url.startswith("http"):
         # The same link is often asked about twice (when it is pasted and again on the confirm step): remember it briefly.
@@ -1914,11 +1930,7 @@ async def download_google_docx(doc_id: str):
                 if code == 200 and "html" not in content_type:
                     # Read in pieces: a Google Doc full of pictures can be far bigger than the 25 MB limit, and the
                     # pictures are removed below, so only a truly huge download is refused.
-                    async for chunk in response.aiter_bytes(1 << 20):
-                        raw.extend(chunk)
-                        if len(raw) > GDOC_MAX_DOWNLOAD:
-                            too_big = True
-                            break
+                    raw = await bounded_download(response, GDOC_MAX_DOWNLOAD)
     except httpx.HTTPError as exc:
         logger.error("Google Doc download failed for %s: %s", doc_id, exc)
         raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
@@ -1929,7 +1941,7 @@ async def download_google_docx(doc_id: str):
                             detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
     if too_big:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is too large to open (over 120 MB).")
-    data = await asyncio.to_thread(slim_docx_bytes, bytes(raw))
+    data = await asyncio.to_thread(slim_docx_bytes, raw)
     del raw
     if len(data) > 25 * 1024 * 1024:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB even without its pictures.")
@@ -1977,7 +1989,7 @@ async def google_doc_as_docx(
     from fastapi.responses import Response
     from urllib.parse import quote
     data, filename = await download_google_docx(DocumentIngestionService.extract_google_doc_id(doc_url))
-    return Response(content=data, media_type=DOCX_MEDIA_TYPE,
+    return Response(content=memoryview(data) if isinstance(data, bytearray) else data, media_type=DOCX_MEDIA_TYPE,
                     headers={"X-Doc-Filename": quote(filename), "Access-Control-Expose-Headers": "X-Doc-Filename"})
 
 

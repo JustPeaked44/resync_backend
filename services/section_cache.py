@@ -1,4 +1,4 @@
-"""Parsed manuscripts kept in Supabase.
+﻿"""Parsed manuscripts kept in Supabase.
 
 A scan reads the uploaded file and parses it into sections before anything is compared. The result is saved here, so the
 same file scanned again by the same person skips both steps, and /analyze_v7 can take a manuscript_id instead of the
@@ -37,7 +37,7 @@ class SectionCache:
         digest = hashlib.sha256()
         digest.update(CACHE_VERSION.encode())
         digest.update(json.dumps(template_toc, sort_keys=True).encode())
-        digest.update(content if isinstance(content, bytes) else str(content).encode("utf-8"))
+        digest.update(content if isinstance(content, (bytes, bytearray, memoryview)) else str(content).encode("utf-8"))
         return digest.hexdigest()
 
     @staticmethod
