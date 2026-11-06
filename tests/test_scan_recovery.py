@@ -148,3 +148,113 @@ def test_enqueue_failure_marks_row_failed(monkeypatch):
         assert db.rows[0]['status'] == 'failed'
         assert db.rows[0]['error_message'] == main.GENERIC_FAILURE_MESSAGE.format(scan_number='abcdefgh')
     asyncio.run(run())
+
+
+def test_conditional_filters_and_terminal_races(monkeypatch):
+    db = FakeDB([row('old'), row('done', 'completed')])
+    monkeypatch.setattr(main, '_active_scans', {'active'})
+    db.rows[1]['result_json'] = {'report': 'preserved'}
+    monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: db)
+    async def run():
+        await main._sweep_interrupted()
+        assert db.updates[-1][1] == [('status', 'processing'), ('result_json', None), ('created_at', ('lt', main.PROCESS_START.isoformat())), ('analysis_run_id', ('ne', 'active'))]
+        await main._mark_failed('done', main.INTERRUPTED_MESSAGE)
+        assert db.updates[-1][1] == [('analysis_run_id', 'done'), ('status', 'processing'), ('result_json', None), ('created_at', ('lt', main.PROCESS_START.isoformat()))]
+        await main._mark_failed('done', main.TIMEOUT_MESSAGE)
+        assert db.updates[-1][1] == [('analysis_run_id', 'done'), ('status', 'processing')]
+        result = SimpleNamespace(analysis_run_id='done', model_dump=lambda **_: {'late': True})
+        assert not await main._save_completed_result(result)
+        assert db.updates[-1][1] == [('analysis_run_id', 'done'), ('status', 'processing')]
+        assert db.rows[1]['status'] == 'completed' and db.rows[1]['result_json'] == {'report': 'preserved'}
+    asyncio.run(run())
+
+
+def test_failure_write_retries_once_even_when_both_attempts_fail(monkeypatch, caplog):
+    for failures in (1, 2):
+        calls = []
+        db = FakeDB([row('id')])
+        def client():
+            calls.append(1)
+            if len(calls) <= failures: raise RuntimeError('offline')
+            return db
+        monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', client)
+        asyncio.run(main._mark_failed('id', main.TIMEOUT_MESSAGE))
+        assert len(calls) == 2
+        assert db.rows[0]['status'] == ('failed' if failures == 1 else 'processing')
+    assert 'attempt 2' in caplog.text
+
+
+def test_each_safe_refusal_is_returned_as_refused(monkeypatch):
+    messages = [main.NOT_A_PAPER_MESSAGE, 'Google Doc not found.', 'Unable to open the document.',
+        'Unable to access document.', 'Document access restricted.', 'Invalid Google Docs URL format.',
+        'The submitted Google Doc appears to be empty.', 'The uploaded document appears to be empty',
+        'Unsupported file format.', 'No valid manuscript provided.', 'Invalid base64 encoding',
+        'This Google Doc is too large', 'This Google Doc is larger', 'Document is too large to process']
+    async def run():
+        for message in messages:
+            db = FakeDB([dict(row('id', 'failed'), error_message=message)])
+            monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: db)
+            response = await main.get_scan_status('id', 'owner')
+            assert (response.failure_kind, response.error) == ('refused', message)
+    asyncio.run(run())
+
+
+def test_sync_endpoints_record_error_and_deadline(monkeypatch):
+    import io
+    import pytest
+    from starlette.datastructures import UploadFile
+    async def provision(*args, **kwargs): return 'abcdefgh-id', 'm', 0
+    monkeypatch.setattr(main, '_provision_analysis_run', provision)
+    monkeypatch.setattr(main, 'SCAN_DEADLINE_SECONDS', 0.001)
+    async def run():
+        for upload in (False, True):
+            for timeout in (False, True):
+                db = FakeDB([row('abcdefgh-id')])
+                monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: db)
+                async def pipeline(*args, **kwargs):
+                    if timeout: await asyncio.sleep(1)
+                    raise ValueError('secret')
+                monkeypatch.setattr(main, '_execute_scan_pipeline', pipeline)
+                with pytest.raises((ValueError, asyncio.TimeoutError)):
+                    if upload:
+                        await main.upload_and_run_scan(file=UploadFile(filename='x.docx', file=io.BytesIO(b'doc')), user_id='owner', manuscript_id=None, manuscript_title=None, template_toc=None, style_reference_url=None, authenticated_user_id='owner')
+                    else:
+                        await main.run_scan(main.ScanRequest(user_id='owner'), 'owner')
+                assert db.rows[0]['status'] == 'failed'
+                assert db.rows[0]['error_message'] == (main.TIMEOUT_MESSAGE if timeout else main.GENERIC_FAILURE_MESSAGE.format(scan_number='abcdefgh'))
+    asyncio.run(run())
+
+
+def test_cancelled_insert_finishes_before_failure_write(monkeypatch):
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    events = []
+    class DB:
+        def table(self, name): self.name = name; return self
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def insert(self, *_): self.inserting = True; return self
+        def execute(self):
+            if getattr(self, 'inserting', False):
+                entered.set(); release.wait(5); events.append('insert')
+            return SimpleNamespace(data=[{}])
+    async def noop(*args, **kwargs): return 'm'
+    async def failed(*args): events.append('failed')
+    monkeypatch.setattr(main, '_check_scan_rate_limit', noop)
+    monkeypatch.setattr(main, '_resolve_manuscript_id', noop)
+    monkeypatch.setattr(main, '_mark_failed', failed)
+    monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: DB())
+    async def run():
+        task = asyncio.create_task(main._provision_analysis_run(main.ScanRequest(user_id='owner')))
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert events == []
+        release.set()
+        try: await task
+        except asyncio.CancelledError: pass
+        assert events == ['insert', 'failed']
+    try: asyncio.run(run())
+    finally: release.set()

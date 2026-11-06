@@ -153,6 +153,7 @@ async def _drain_scan_queue():
             finally:
                 _scan_durations.append(time.monotonic() - started)
                 _running_scan_starts.remove(started)
+                del job
 
 
 # ---------------------------------------------------------------------------
@@ -571,9 +572,9 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
         source_identifier = req.doc_url or req.filename or default_source_name or "uploaded_file.docx"
 
         # Bug 1: Add user_id to the insert payload
-        await asyncio.to_thread(
-            lambda: db_client.table("analysis_run").insert({
-                "analysis_run_id": analysis_run_id,
+        insertion = asyncio.create_task(asyncio.to_thread(
+            lambda: db_client.table(RUN_TABLE).insert({
+                RUN_ID: analysis_run_id,
                 "user_id": req.user_id,
                 "manuscript_id": manuscript_id,
                 "analysis_run_status": "processing",
@@ -582,10 +583,25 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
                 # Plain-text mirror of the job state. The polling endpoint reads
                 # this rather than the enum column, because the enum has no
                 # 'failed' member (see migration 003).
-                "status": "processing",
+                RUN_STATUS: "processing",
                 "doc_url": source_identifier,
             }).execute()
-        )
+        ))
+        try:
+            await asyncio.shield(insertion)
+        except asyncio.CancelledError:
+            while not insertion.done():
+                try:
+                    await asyncio.shield(insertion)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                insertion.result()
+            except Exception:
+                logger.exception("Scan insertion failed during cancellation: %s", analysis_run_id)
+            raise
         logger.info(f"Provisioned analysis_run row: {analysis_run_id}")
     except asyncio.CancelledError:
         await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
@@ -838,7 +854,20 @@ async def _execute_scan_pipeline(
         analysis_run_id=analysis_run_id
     )
 
-    result.notification_dispatched = notification_dispatched
+    # Publish before notifying; compare the published result before changing only its notification flag.
+    if notification_dispatched:
+        published = result.model_dump(mode="json")
+        updated = dict(published, notification_dispatched=True)
+        try:
+            response = await asyncio.to_thread(lambda: db_client.table(RUN_TABLE).update({RUN_RESULT: updated})
+                .eq(RUN_ID, analysis_run_id).eq(RUN_STATUS, "completed")
+                .eq(RUN_RESULT, json.dumps(published, separators=(",", ":"))).execute())
+            if response.data:
+                result.notification_dispatched = True
+            else:
+                logger.warning("Could not update notification flag for scan %s", analysis_run_id)
+        except Exception:
+            logger.exception("Could not update notification flag for scan %s", analysis_run_id)
     if seen_key:
         _scanned_manuscripts[seen_key] = True
         while len(_scanned_manuscripts) > 5000:
@@ -892,8 +921,11 @@ async def _mark_failed(scan_id: str, message: str) -> None:
     for attempt in range(2):
         try:
             client = DatabasePersistenceService.get_client()
-            await asyncio.to_thread(lambda: client.table(RUN_TABLE).update({RUN_STATUS: "failed", RUN_ERROR: message})
-                                    .eq(RUN_ID, scan_id).eq(RUN_STATUS, "processing").execute())
+            query = client.table(RUN_TABLE).update({RUN_STATUS: "failed", RUN_ERROR: message}) \
+                .eq(RUN_ID, scan_id).eq(RUN_STATUS, "processing")
+            if message == INTERRUPTED_MESSAGE:
+                query = query.is_(RUN_RESULT, "null").lt(RUN_CREATED, PROCESS_START.isoformat())
+            await asyncio.to_thread(query.execute)
             return
         except Exception:
             logger.exception("Could not mark scan %s failed (attempt %s)", scan_id, attempt + 1)
@@ -919,7 +951,19 @@ def _failure_message(scan_id: str, exc: BaseException) -> str:
     return GENERIC_FAILURE_MESSAGE.format(scan_number=scan_id[:8])
 
 
+def _log_scan_memory(scan_id, phase):
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    logger.info("Scan %s %s memory %s", scan_id[:8], phase, line.split(":", 1)[1].strip())
+                    break
+    except OSError:
+        pass
+
+
 async def _run_scan_job(req, analysis_run_id, manuscript_id, credits_remaining, file_bytes=None, filename=None):
+    _log_scan_memory(analysis_run_id, "start")
     scan_context.set(analysis_run_id)
     try:
         await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining,
@@ -932,6 +976,7 @@ async def _run_scan_job(req, analysis_run_id, manuscript_id, credits_remaining, 
         logger.exception("Async scan job failed: %s", analysis_run_id)
         await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
     finally:
+        _log_scan_memory(analysis_run_id, "end")
         _active_scans.discard(analysis_run_id)
 
 
@@ -995,6 +1040,7 @@ async def run_scan(
         await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
         _active_scans.discard(analysis_run_id)
         raise
+    _log_scan_memory(analysis_run_id, "start")
     try:
         result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
         return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
@@ -1003,6 +1049,7 @@ async def run_scan(
         await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
         raise
     finally:
+        _log_scan_memory(analysis_run_id, "end")
         _active_scans.discard(analysis_run_id)
         SCAN_SLOT.release()
 
@@ -1197,6 +1244,7 @@ async def upload_and_run_scan(
         await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
         _active_scans.discard(analysis_run_id)
         raise
+    _log_scan_memory(analysis_run_id, "start")
     try:
         result = await asyncio.wait_for(_execute_scan_pipeline(
             req, analysis_run_id, resolved_manuscript_id, credits_remaining,
@@ -1208,6 +1256,7 @@ async def upload_and_run_scan(
         await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
         raise
     finally:
+        _log_scan_memory(analysis_run_id, "end")
         _active_scans.discard(analysis_run_id)
         SCAN_SLOT.release()
 
@@ -1233,9 +1282,9 @@ async def get_scan_status(
     try:
         run_resp = await asyncio.to_thread(
             lambda: db_client
-                .table("analysis_run")
-                .select("analysis_run_id, user_id, status, error_message, result_json, created_at")
-                .eq("analysis_run_id", analysis_run_id)
+                .table(RUN_TABLE)
+                .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED)))
+                .eq(RUN_ID, analysis_run_id)
                 .execute()
         )
     except Exception as exc:
@@ -1260,7 +1309,7 @@ async def get_scan_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan {analysis_run_id} not found."
         )
-    job_status = row.get("status") or "processing"
+    job_status = row.get(RUN_STATUS) or "processing"
     created = row.get(RUN_CREATED)
     try:
         created = datetime.fromisoformat(created.replace("Z", "+00:00")) if isinstance(created, str) else created
@@ -1272,7 +1321,7 @@ async def get_scan_status(
             and (datetime.now(timezone.utc) - PROCESS_START).total_seconds() >= INTERRUPTED_GRACE_SECONDS):
         await _mark_failed(analysis_run_id, INTERRUPTED_MESSAGE)
         run_resp = await asyncio.to_thread(lambda: db_client.table(RUN_TABLE)
-            .select("analysis_run_id, user_id, status, error_message, result_json, created_at")
+            .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED)))
             .eq(RUN_ID, analysis_run_id).execute())
         row = run_resp.data[0]
         job_status = row.get(RUN_STATUS) or "processing"
@@ -1293,7 +1342,7 @@ async def get_scan_status(
         )
 
     # Older rows can say completed without a saved report.
-    result_json = row.get("result_json")
+    result_json = row.get(RUN_RESULT)
     if job_status == "completed" and result_json:
         return ScanStatusResponse(
             status="completed",
@@ -1377,7 +1426,7 @@ async def get_manuscript_preview(
     if row.get("user_id") != authenticated_user_id:
         return {"available": False, "reason": "unreachable"}
         
-    result_json = row.get("result_json") or {}
+    result_json = row.get(RUN_RESULT) or {}
     if result_json.get("manuscript_sections"):
         sections = locked_scan_view(result_json).get("manuscript_sections") or []
         return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
