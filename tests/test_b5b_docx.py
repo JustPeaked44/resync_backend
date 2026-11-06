@@ -103,6 +103,9 @@ def test_oversized_document_xml_is_refused():
     with pytest.raises(HTTPException) as error:
         asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "large.docx"))
     assert (error.value.status_code, error.value.detail) == (413, DOCX_COMPLEX_MESSAGE)
+    import main
+    assert main._failure_message("12345678", error.value) == DOCX_COMPLEX_MESSAGE
+    assert main._safe_refusal(DOCX_COMPLEX_MESSAGE)
 
 
 def test_element_stream_stops_early_on_oversized_text():

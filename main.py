@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 # override=True ensures .env values WIN over Windows system env vars.
 load_dotenv(override=True)
 
-from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES
+from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES, DOCX_COMPLEX_MESSAGE
 from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
@@ -1017,7 +1017,7 @@ async def _mark_failed(scan_id: str, message: str) -> None:
 
 
 def _safe_refusal(message: str) -> bool:
-    return message == NOT_A_PAPER_MESSAGE or message.startswith((
+    return message in (NOT_A_PAPER_MESSAGE, DOCX_COMPLEX_MESSAGE) or message.startswith((
         "Google Doc not found.", "Unable to open the document.", "Unable to access document.",
         "Document access restricted.", "Invalid Google Docs URL format.",
         "The submitted Google Doc appears to be empty.", "The uploaded document appears to be empty",
