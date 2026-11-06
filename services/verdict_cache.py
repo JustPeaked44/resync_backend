@@ -18,12 +18,15 @@ from collections import OrderedDict
 from typing import Any, Dict, Iterable, List
 
 from services.db_service import DatabasePersistenceService
+from services.gemini import scan_user
 
 logger = logging.getLogger("resync.verdict_cache")
 
 TABLE = "pair_verdict_cache"
 # Bump this whenever the pair prompts, the rules or how answers are read change: verdicts saved before no longer match.
 PROMPT_VERSION = "2"
+# Old unscoped keys no longer match; existing rows are left untouched.
+KEY_VERSION = "1"
 MEMORY_LIMIT = 4000
 CHUNK = 100   # keys per database lookup
 
@@ -38,13 +41,13 @@ class VerdictCache:
     @staticmethod
     def fingerprint(*parts: Any) -> str:
         """The same input always gives the same key; any change to what the AI was shown gives a different one."""
-        return hashlib.sha256(json.dumps([PROMPT_VERSION, *parts], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return hashlib.sha256(json.dumps([KEY_VERSION, PROMPT_VERSION, scan_user.get(), *parts], sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     @classmethod
     async def get_many(cls, keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
         """{key: saved explanation} for every key that has one."""
         wanted = list(dict.fromkeys(keys))
-        if not cls.enabled() or not wanted:
+        if scan_user.get() is None or not cls.enabled() or not wanted:
             return {}
         found = {key: copy.deepcopy(_memory[key]) for key in wanted if key in _memory}
         missing = [key for key in wanted if key not in found]
@@ -67,7 +70,7 @@ class VerdictCache:
     async def save_many(cls, verdicts: Dict[str, Dict[str, Any]]) -> None:
         """Only complete verdicts are kept: a pair the AI could not judge (severity None) is never remembered."""
         keep = {key: value for key, value in verdicts.items() if isinstance(value, dict) and value.get("severity") is not None}
-        if not cls.enabled() or not keep:
+        if scan_user.get() is None or not cls.enabled() or not keep:
             return
         for key, value in keep.items():
             cls._remember(key, value)

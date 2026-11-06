@@ -256,6 +256,39 @@ def _pair_view(role_a, text_a, role_b, text_b, adjacent):
             "text_a": gemini.truncate_text(text_a, 3500), "text_b": gemini.truncate_text(text_b, 3500)}
 
 
+def valid_cached_explanation(value, names):
+    """Only reuse pair verdicts that the report can safely consume."""
+    if not isinstance(value, dict) or value.get("severity") not in SEVERITIES:
+        return False
+    if not isinstance(value.get("failed_dimension"), str) or not isinstance(value.get("link_summary"), str):
+        return False
+    if not isinstance(value.get("coherence_scores"), dict) or not isinstance(value.get("comparison"), dict):
+        return False
+    if not all(isinstance(value["comparison"].get(k), str) for k in ("a_says", "b_says")):
+        return False
+    fields = {"recommendations": ("section", "original_sentence", "issue", "recommended_revision"),
+              "highlighted_inconsistencies": ("section", "what", "why"),
+              "reference_list": ("section", "sentence"), "bridges": ("section", "sentence")}
+    for key, required in fields.items():
+        items = value.get(key)
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict) or not all(isinstance(item.get(k), str) for k in required):
+                return False
+            if item["section"] not in names:
+                return False
+            if key == "highlighted_inconsistencies" and ("quote" not in item or not isinstance(item["quote"], (str, type(None)))):
+                return False
+            if key == "recommendations" and (item.get("kind", "edit") not in ("edit", "add")
+                    or item.get("placement") not in (None, "start", "end")
+                    or item.get("category") not in (None, "objectives", "methodology", "claims", "numeric")):
+                return False
+            if key == "bridges" and item.get("placement") not in ("start", "end"):
+                return False
+    return True
+
+
 def pair_cache_key(role_a, text_a, role_b, text_b, scores, adjacent):
     """The fingerprint of everything the AI is shown for a pair: same text and ratings, same key, so the same saved verdict."""
     view = _pair_view(role_a, text_a, role_b, text_b, adjacent)

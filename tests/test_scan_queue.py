@@ -53,7 +53,7 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
 
     async def run():
         for name in rows:
-            main._enqueue_scan(None, name, None, 0)
+            main._enqueue_scan(SimpleNamespace(user_id="owner"), name, None, 0)
         await asyncio.sleep(0)
         assert started == ["first"]
         third = await main.get_scan_status("third", "owner")
@@ -130,7 +130,7 @@ def test_scans_run_side_by_side_up_to_the_limit(monkeypatch):
 
     async def run():
         for name in gates:
-            main._enqueue_scan(None, name, None, 0)
+            main._enqueue_scan(SimpleNamespace(user_id="owner"), name, None, 0)
         await asyncio.sleep(0.05)
         assert started == ["a", "b"]          # two at once, the third waits
         assert [j[1] for j in main._scan_queue] == ["c"]

@@ -31,6 +31,7 @@ def quota_blocked():
 
 # Set per scan job (see main._run_scan_job) so the limiter can report status to that scan's poller.
 scan_context = contextvars.ContextVar("gemini_scan_id", default=None)
+scan_user = contextvars.ContextVar("gemini_scan_user", default=None)
 
 _WHITESPACE = re.compile(r"\s+")
 _QUOTES = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
