@@ -90,3 +90,55 @@ def test_docx_above_character_cap_is_refused():
     with pytest.raises(HTTPException) as error:
         asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx"))
     assert error.value.status_code == 413
+
+
+def test_oversized_document_xml_is_refused():
+    import zipfile
+    import pytest
+    from fastapi import HTTPException
+    from services.ingestion import MAX_DOCUMENT_XML_BYTES, DOCX_COMPLEX_MESSAGE
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b" " * (MAX_DOCUMENT_XML_BYTES + 1))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "large.docx"))
+    assert (error.value.status_code, error.value.detail) == (413, DOCX_COMPLEX_MESSAGE)
+
+
+def test_element_stream_stops_early_on_oversized_text():
+    import pytest
+    from fastapi import HTTPException
+    from services.ingestion import _check_element_text, DOCX_COMPLEX_MESSAGE
+    xml = (b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           b'<w:body><w:p><w:r><w:t>' + b'x' * 600_000 + b'</w:t></w:r></w:p></w:body></w:document>' + b' ' * 200_000)
+    stream = io.BytesIO(xml)
+    with pytest.raises(HTTPException) as error:
+        _check_element_text(stream)
+    assert (error.value.status_code, error.value.detail) == (413, DOCX_COMPLEX_MESSAGE)
+    assert stream.tell() < len(xml)
+
+
+def test_bytearray_input_is_viewed_without_full_copy(monkeypatch):
+    import services.ingestion as ingestion
+    data = bytearray(make_document())
+    original = ingestion.BufferReader
+    seen = []
+    class InspectReader(original):
+        def __init__(self, source):
+            super().__init__(source)
+            seen.append(self.data.obj is source)
+    monkeypatch.setattr(ingestion, "BufferReader", InspectReader)
+    actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
+    assert actual == old_output(data)
+    assert seen == [True, True]
+
+
+def test_xml_heavy_document_matches_old_output():
+    doc = Document()
+    for i in range(1200):
+        doc.add_paragraph(f"Paragraph {i}: text for comparing extraction.")
+    out = io.BytesIO()
+    doc.save(out)
+    data = out.getvalue()
+    actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
+    assert actual == old_output(data)

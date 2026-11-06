@@ -9,6 +9,9 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
+MAX_DOCUMENT_XML_BYTES = 40 * 1024 * 1024
+MAX_ELEMENT_TEXT_CHARS = 500_000
+DOCX_COMPLEX_MESSAGE = "This document is too complex to read. Please save a simpler copy and try again."
 READ_CHUNK_BYTES = 1024 * 1024
 
 
@@ -34,18 +37,99 @@ async def bounded_download(response, limit: int = MAX_DOWNLOAD_BYTES) -> bytearr
     return data
 
 
+class BufferReader:
+    """Seekable view without copying the entire buffer."""
+
+    def __init__(self, data):
+        self.data = memoryview(data)
+        self.position = 0
+
+    def seek(self, offset, whence=0):
+        if whence == 1:
+            offset += self.position
+        elif whence == 2:
+            offset += len(self.data)
+        if offset < 0:
+            raise ValueError("negative seek")
+        self.position = offset
+        return offset
+
+    def tell(self):
+        return self.position
+
+    def read(self, size=-1):
+        end = len(self.data) if size < 0 else min(len(self.data), self.position + size)
+        result = self.data[self.position:end].tobytes()
+        self.position = end
+        return result
+
+    def seekable(self):
+        return True
+
+
+def _check_element_text(stream):
+    """Count text during streaming before an individual block grows too large."""
+    from xml.parsers import expat
+    parser = expat.ParserCreate(namespace_separator="}")
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    depth = 0
+    block_depth = None
+    text_depth = None
+    chars = 0
+
+    def start(name, attrs):
+        nonlocal depth, block_depth, text_depth, chars
+        depth += 1
+        if depth == 3 and name in (ns + "p", ns + "tbl"):
+            block_depth, chars = depth, 0
+        if block_depth is not None:
+            if name == ns + "t":
+                text_depth = depth
+            elif name in (ns + "tab", ns + "br", ns + "cr"):
+                chars += 1
+                if chars > MAX_ELEMENT_TEXT_CHARS:
+                    raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
+
+    def end(name):
+        nonlocal depth, block_depth, text_depth
+        if text_depth == depth:
+            text_depth = None
+        if block_depth == depth:
+            block_depth = None
+        depth -= 1
+
+    def text(data):
+        nonlocal chars
+        if text_depth is not None:
+            chars += len(data)
+            if chars > MAX_ELEMENT_TEXT_CHARS:
+                raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.CharacterDataHandler = text
+    while chunk := stream.read(64 * 1024):
+        parser.Parse(chunk, False)
+    parser.Parse(b"", True)
+
+
 def validate_docx_archive(file_bytes: bytes) -> None:
     """Reject oversized archives before python-docx decompresses their members."""
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+    with zipfile.ZipFile(BufferReader(file_bytes)) as archive:
         members = archive.infolist()
         if (len(members) > 20_000
                 or sum(member.file_size for member in members) > MAX_DECOMPRESSED_BYTES
                 or any(member.file_size > MAX_ARCHIVE_MEMBER_BYTES for member in members)):
             raise HTTPException(status_code=413, detail="This document is too large to open. Please use a smaller file.")
+        if any(member.filename == "word/document.xml" and member.file_size > MAX_DOCUMENT_XML_BYTES for member in members):
+            raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
         for member in members:
             with archive.open(member) as stream:
-                while stream.read(READ_CHUNK_BYTES):
-                    pass
+                if member.filename == "word/document.xml":
+                    _check_element_text(stream)
+                else:
+                    while stream.read(READ_CHUNK_BYTES):
+                        pass
 
 
 def extract_docx_text(file_bytes) -> str:
@@ -71,7 +155,7 @@ def extract_docx_text(file_bytes) -> str:
             counts[group] = len(cleaned)
 
     validate_docx_archive(file_bytes)
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+    with zipfile.ZipFile(BufferReader(file_bytes)) as archive:
         with archive.open("word/document.xml") as stream:
             context = etree.iterparse(stream, events=("start", "end"), resolve_entities=False, no_network=True)
             depth = 0
@@ -84,13 +168,18 @@ def extract_docx_text(file_bytes) -> str:
                     if element.tag == ns + "p":
                         append(0, Paragraph(node, None).text.strip())
                     else:
+                        table_chars = 0
                         for row in Table(node, None).rows:
                             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
                             unique = []
                             for cell in cells:
                                 if not unique or cell != unique[-1]:
                                     unique.append(cell)
-                            append(1, " | ".join(unique))
+                            row_text = " | ".join(unique)
+                            table_chars += len(row_text) + 1
+                            if table_chars > MAX_ELEMENT_TEXT_CHARS + 1:
+                                raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
+                            append(1, row_text)
                     element.clear()
                     while element.getprevious() is not None:
                         del element.getparent()[0]
