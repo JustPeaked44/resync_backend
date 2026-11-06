@@ -48,6 +48,56 @@ def validate_docx_archive(file_bytes: bytes) -> None:
                     pass
 
 
+def extract_docx_text(file_bytes) -> str:
+    """Extract top-level paragraphs first, then tables, without loading pictures or the whole XML tree."""
+    from lxml import etree
+    from docx.oxml import parse_xml
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    groups = [[], []]
+    counts = [0, 0]
+
+    def append(group, text):
+        if not text:
+            return
+        groups[group].append(text)
+        counts[group] += len(text) + 1
+        if counts[group] > 500_002:
+            cleaned = DocumentIngestionService.strip_document_noise("\n".join(groups[group]))
+            DocumentIngestionService.enforce_size_limits(cleaned)
+            groups[group] = [cleaned] if cleaned else []
+            counts[group] = len(cleaned)
+
+    validate_docx_archive(file_bytes)
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+        with archive.open("word/document.xml") as stream:
+            context = etree.iterparse(stream, events=("start", "end"), resolve_entities=False, no_network=True)
+            depth = 0
+            for event, element in context:
+                if event == "start":
+                    depth += 1
+                    continue
+                if depth == 3 and element.tag in (ns + "p", ns + "tbl"):
+                    node = parse_xml(etree.tostring(element))
+                    if element.tag == ns + "p":
+                        append(0, Paragraph(node, None).text.strip())
+                    else:
+                        for row in Table(node, None).rows:
+                            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                            unique = []
+                            for cell in cells:
+                                if not unique or cell != unique[-1]:
+                                    unique.append(cell)
+                            append(1, " | ".join(unique))
+                    element.clear()
+                    while element.getprevious() is not None:
+                        del element.getparent()[0]
+                depth -= 1
+    return "\n".join(groups[0] + groups[1])
+
+
 def looks_like_html_document(text: str) -> bool:
     return bool(re.match(r"(?is)^\s*(?:<!doctype\s+html\b|<html\b)", text.lstrip("\ufeff")))
 
@@ -144,28 +194,7 @@ class DocumentIngestionService:
         
         try:
             if filename_lower.endswith(".docx"):
-                import docx
-                validate_docx_archive(file_bytes)
-                doc = docx.Document(io.BytesIO(file_bytes))
-                lines = []
-                for p in doc.paragraphs:
-                    text = p.text.strip()
-                    if text:
-                        lines.append(text)
-                # Also extract text from tables if any
-                for table in doc.tables:
-                    for row in table.rows:
-                        row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                        if row_cells:
-                            # Avoid duplicate cells from merged rows/cols
-                            unique_cells = []
-                            for c in row_cells:
-                                if not unique_cells or c != unique_cells[-1]:
-                                    unique_cells.append(c)
-                            if unique_cells:
-                                lines.append(" | ".join(unique_cells))
-                raw_text = "\n".join(lines)
-                del lines
+                raw_text = extract_docx_text(file_bytes)
             elif filename_lower.endswith(".pdf"):
                 import pypdf
                 pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
