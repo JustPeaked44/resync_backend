@@ -136,6 +136,11 @@ _scan_reservations = {}
 _scan_reservations_by_id = {}
 
 
+def _check_base64_size(req):
+    if req.file_content_base64 and len(req.file_content_base64) > ((MAX_UPLOAD_BYTES + 2) // 3) * 4:
+        raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 25 MB.")
+
+
 def _reserve_scan(user_id, size, queued=True):
     if sum(entry["user"] == user_id for entry in _scan_reservations.values()) >= 2:
         raise HTTPException(status_code=429, detail=USER_FULL_MESSAGE)
@@ -691,8 +696,7 @@ async def _execute_scan_pipeline(
     # A file this user already scanned is not read or parsed again: its sections were saved the first time (SectionCache).
     payload = file_bytes
     if payload is None and req.file_content_base64:
-        if len(req.file_content_base64) > ((MAX_UPLOAD_BYTES + 2) // 3) * 4:
-            raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 25 MB.")
+        _check_base64_size(req)
         import base64
         try:
             payload = base64.b64decode(req.file_content_base64)
@@ -1076,6 +1080,7 @@ async def run_scan(
     fast with 503 so the Android client gets an honest "busy, retry" instead
     of a silent timeout."""
     _assert_owner(authenticated_user_id, req.user_id)
+    _check_base64_size(req)
     reservation = _reserve_scan(req.user_id, 0, queued=False)
     try:
         analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
@@ -1137,6 +1142,7 @@ async def start_scan(
     fast with 404 instead of failing in the background.
     """
     _assert_owner(authenticated_user_id, req.user_id)
+    _check_base64_size(req)
     reservation = _reserve_scan(req.user_id, len(req.file_content_base64 or ""))
     handed_off = False
     try:

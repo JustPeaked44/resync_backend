@@ -52,3 +52,17 @@ def test_docx_entry_count_refused():
 def test_cache_hash_matches_for_mutable_upload_buffer():
     from services.section_cache import SectionCache
     assert SectionCache.content_hash(bytearray(b"abc")) == SectionCache.content_hash(b"abc")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", [main.start_scan, main.run_scan])
+async def test_large_base64_refused_before_provision(monkeypatch, endpoint):
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 6)
+    async def provision(*args, **kwargs):
+        pytest.fail("oversized base64 reached provisioning")
+    monkeypatch.setattr(main, "_provision_analysis_run", provision)
+    req = main.ScanRequest(user_id="a", file_content_base64="A" * 9)
+    with pytest.raises(HTTPException) as exc:
+        await endpoint(req, authenticated_user_id="a")
+    assert exc.value.status_code == 413
+    assert not main._scan_reservations
