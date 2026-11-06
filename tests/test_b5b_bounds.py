@@ -66,3 +66,15 @@ async def test_large_base64_refused_before_provision(monkeypatch, endpoint):
         await endpoint(req, authenticated_user_id="a")
     assert exc.value.status_code == 413
     assert not main._scan_reservations
+
+
+@pytest.mark.asyncio
+async def test_actual_25_mib_upload_boundary():
+    limit = 25 * 1024 * 1024
+    exact = Upload(b"x" * limit)
+    assert len(await main._read_upload(exact, "too large")) == limit
+    oversized = Upload(b"x" * (limit + 1) + b"unread")
+    with pytest.raises(HTTPException) as exc:
+        await main._read_upload(oversized, "too large")
+    assert (exc.value.status_code, exc.value.detail) == (413, "too large")
+    assert oversized.stream.tell() == limit + 1
