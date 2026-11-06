@@ -18,8 +18,9 @@ def fake_manuscripts_count_as_papers(monkeypatch):
     monkeypatch.setattr(main, "check_research_paper", lambda *_, **__: {"ok": True, "reason": ""})
 
 
-def build_scan(monkeypatch, reuse_saved_sections=False):
-    captured = {"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []}
+def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
+    captured = captured if captured is not None else {}
+    captured.update({"ingested": 0, "parsed": 0, "cache_find": [], "cache_save": []})
     sections = {"Related Studies": "A source sentence with several words.",
                 "Related Studies (2)": "A second source sentence with several words.",
                 "Results": "The resulting text also contains several words."}
@@ -31,6 +32,10 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
         def select(self, *_):
             return self
 
+        def update(self, *_):
+            self.updated = True
+            return self
+
         def eq(self, *_):
             return self
 
@@ -38,7 +43,7 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
             return self
 
         def execute(self):
-            return SimpleNamespace(data={})
+            return SimpleNamespace(data=[{}] if getattr(self, "updated", False) else {})
 
     async def ingest(*_):
         captured["ingested"] += 1
@@ -86,6 +91,7 @@ def build_scan(monkeypatch, reuse_saved_sections=False):
         return {"status": "success"}
 
     async def notify(**_):
+        captured["notified"] = True
         return True
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: DB())
@@ -325,3 +331,14 @@ def test_a_saved_parse_also_counts_as_the_same_text(monkeypatch):
     main._scanned_manuscripts.clear()
     payload, _, _ = build_scan(monkeypatch, reuse_saved_sections=True)
     assert payload["rescan_unchanged"] is True
+
+
+def test_invalid_report_is_not_saved_or_notified(monkeypatch):
+    captured = {}
+    def invalid(**kwargs):
+        raise ValueError("invalid recommendation")
+    monkeypatch.setattr(main, "RecommendationReport", invalid)
+    with pytest.raises(ValueError, match="invalid recommendation"):
+        build_scan(monkeypatch, captured=captured)
+    assert "save" not in captured
+    assert "notified" not in captured

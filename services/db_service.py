@@ -14,6 +14,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+RUN_TABLE = "analysis_run"
+RUN_ID = "analysis_run_id"
+RUN_STATUS = "status"
+RUN_ERROR = "error_message"
+RUN_CREATED = "created_at"
+RUN_RESULT = "result_json"
+
 class DatabasePersistenceService:
     """
     Database persistence service for persisting manuscript scan analysis transactions
@@ -115,9 +122,7 @@ class DatabasePersistenceService:
         # Step 2: Update public.analysis_run
         # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
         analysis_run_update: Dict[str, Any] = {
-            "analysis_run_status": "completed", # Bug 6: Valid enum is 'completed'
             "analysis_run_coherence_score": round(coherence_score),
-            "analysis_run_completed_at": now_iso,
         }
         if sections_analyzed is not None:
             analysis_run_update["sections_analyzed"] = sections_analyzed
@@ -135,10 +140,7 @@ class DatabasePersistenceService:
             analysis_run_update["ai_text_indicator_score"] = ai_text_indicator.get("overall_score")
             analysis_run_update["ai_text_indicator_json"] = ai_text_indicator
 
-        await asyncio.to_thread(
-            lambda: client.table("analysis_run").update(analysis_run_update)
-                .eq("analysis_run_id", analysis_run_id).execute()
-        )
+
 
         # Step 3: Insert rows into public.inconsistency
         if inconsistencies:
@@ -328,6 +330,11 @@ class DatabasePersistenceService:
                 await asyncio.to_thread(
                     lambda: client.table("citation_crossmatch_issue").insert(issue_rows).execute()
                 )
+
+        await asyncio.to_thread(
+            lambda: client.table("analysis_run").update(analysis_run_update)
+                .eq(RUN_ID, analysis_run_id).eq(RUN_STATUS, "processing").execute()
+        )
 
         # Step 6: Return response dict
         return {

@@ -27,7 +27,7 @@ from services.ingestion import DocumentIngestionService, looks_like_html_documen
 from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
-from services.db_service import DatabasePersistenceService
+from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT
 from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
@@ -40,6 +40,15 @@ from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
 
 logger = logging.getLogger("resync.main")
+PROCESS_START = datetime.now(timezone.utc)
+INTERRUPTED_GRACE_SECONDS = int(os.getenv("INTERRUPTED_GRACE_SECONDS", "180"))
+SCAN_DEADLINE_SECONDS = int(os.getenv("SCAN_DEADLINE_SECONDS", "2700"))
+INTERRUPTED_MESSAGE = "This scan was interrupted because our server restarted. Nothing was charged. Please start it again."
+TIMEOUT_MESSAGE = "This scan took too long and was stopped. Nothing was charged. Please start it again."
+GENERIC_FAILURE_MESSAGE = "We could not finish this scan. Please try again. If it keeps happening, tell us this scan number: {scan_number}."
+QUEUE_MESSAGE = "Other scans are running. Yours will start soon."
+_active_scans = set()
+
 
 
 def _references_text(parsed_sections: Dict[str, str], section_roles: Dict[str, str]) -> str:
@@ -89,13 +98,11 @@ class NotAResearchPaper(HTTPException):
 
 
 def _scan_concurrency() -> int:
-    """How many scans run at once. Everyone who uploads starts right away by default (no limit); set SCAN_CONCURRENCY to a
-    number only if the server runs out of memory."""
     try:
-        limit = int(os.getenv("SCAN_CONCURRENCY", "0"))
+        limit = int(os.getenv("SCAN_CONCURRENCY", "1"))
     except ValueError:
-        limit = 0
-    return limit if limit > 0 else 1000
+        limit = 1
+    return limit if limit > 0 else 1
 
 
 # Gemini's rolling request limit is shared by every scan in the process (services/gemini.py), so more scans never exceed
@@ -119,14 +126,12 @@ def _queue_state(scan_id):
             else:
                 remaining = average if SCAN_SLOT.locked() else 0
             seconds = math.ceil(remaining + ((position - 1) // SCAN_CONCURRENCY) * average)
-            minutes = max(1, math.ceil(seconds / 60))
-            if position == 1:
-                return position, seconds, "info", f"You're next in line. Other scans are running, so yours will take a little longer than usual (about {minutes} minutes)."
-            return position, seconds, "wait", f"You are #{position} in line. Your scan will start in about {minutes} minutes."
+            return position, seconds, "wait", QUEUE_MESSAGE
     return None, None, None, None
 
 
 def _enqueue_scan(*job):
+    _active_scans.add(job[1])
     _scan_queue.append(job)
     _scan_workers[:] = [worker for worker in _scan_workers if not worker.done()]
     # A live worker that is not running a scan is about to take the next job from the queue.
@@ -582,16 +587,25 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
             }).execute()
         )
         logger.info(f"Provisioned analysis_run row: {analysis_run_id}")
+    except asyncio.CancelledError:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        raise
     except HTTPException:
         raise
     except Exception as exc:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
         logger.error(f"Failed to provision analysis_run in DB: {exc}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database setup failed before scan could start."
         )
 
-    return analysis_run_id, manuscript_id, await credits_service.get_balance(req.user_id)
+    try:
+        balance = await credits_service.get_balance(req.user_id)
+    except BaseException:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        raise
+    return analysis_run_id, manuscript_id, balance
 
 
 async def _execute_scan_pipeline(
@@ -697,6 +711,7 @@ async def _execute_scan_pipeline(
         citation_task.cancel()  # do not leave the audit running if the scan failed
         if full_check_task is not None:
             full_check_task.cancel()
+        await asyncio.gather(*(task for task in (citation_task, full_check_task) if task is not None), return_exceptions=True)
         raise
     _, dimensions, dimension_weights = four_part_score(manuscript_flow)
     overall_score, breakdown = manuscript_score(manuscript_flow, ml_result.get("transition_averages"))
@@ -736,67 +751,7 @@ async def _execute_scan_pipeline(
         },
     }
 
-    # ------------------------------------------------------------------
-    # Step 6 – Database Persistence
-    # ------------------------------------------------------------------
-    db_result: Dict[str, Any] = await DatabasePersistenceService.save_scan_transaction(
-        user_id=req.user_id,
-        manuscript_id=manuscript_id,
-        analysis_run_id=analysis_run_id,
-        coherence_score=overall_score,
-        inconsistencies=inconsistencies_data,   # accepts Pydantic models or dicts
-        recommendations=recommendations,
-        citations=citations,
-        crossmatch_issues=citation_crossmatch,
-        score_breakdown=score_breakdown_dict,
-        ai_text_indicator={
-            "overall_score": ai_text_result["overall_score"],
-            "section_scores": ai_text_result["section_scores"],
-            "flagged_sections": ai_text_result["flagged_sections"],
-        },
-        doc_url=source_identifier,
-        sections_analyzed=[section["name"] for section in sections],
-        inconsistencies_found=len(inconsistencies_data),
-        citations_audited=len(citations),
-    )
-    db_save_status: str = db_result.get("status", "unknown")
-
-    # ------------------------------------------------------------------
-    # Step 7 – Notification (non-blocking background task)
-    # ------------------------------------------------------------------
-    # Derive a human-readable manuscript title for the push message.
-    # We use the source identifier as a fallback since the title may not be
-    # in the request model; the notification service only needs a string.
-    manuscript_title: str = req.manuscript_title or derived_title or source_identifier
-    try:
-        ms_row = (
-            db_client
-            .table("manuscript")
-            .select("manuscript_title")
-            .eq("manuscript_id", manuscript_id)
-            .single()
-            .execute()
-        )
-        if not derived_title and ms_row and ms_row.data and ms_row.data.get("manuscript_title"):
-            manuscript_title = ms_row.data["manuscript_title"]
-    except Exception:
-        pass  # silently fall back to URL/filename — non-critical
-
-    notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
-        user_id=req.user_id,
-        manuscript_title=manuscript_title,
-        coherence_score=int(overall_score),
-        analysis_run_id=analysis_run_id
-    )
-
-    # ------------------------------------------------------------------
-    # Step 8 – Return consolidated ScanResponse
-    # ------------------------------------------------------------------
-    if seen_key:
-        _scanned_manuscripts[seen_key] = True
-        while len(_scanned_manuscripts) > 5000:
-            _scanned_manuscripts.pop(next(iter(_scanned_manuscripts)))
-    return ScanResponse(
+    result = ScanResponse(
         status="completed",
         analysis_run_id=analysis_run_id,
         user_id=req.user_id,
@@ -834,9 +789,62 @@ async def _execute_scan_pipeline(
         rescan_unchanged=rescan_unchanged,
         ai_text_indicator=AITextIndicatorReport(**ai_text_result),
         credits_remaining=credits_remaining,
-        db_save_status=db_save_status,
-        notification_dispatched=notification_dispatched,
+        db_save_status="pending",
+        notification_dispatched=False,
     )
+    db_result: Dict[str, Any] = await DatabasePersistenceService.save_scan_transaction(
+        user_id=req.user_id,
+        manuscript_id=manuscript_id,
+        analysis_run_id=analysis_run_id,
+        coherence_score=overall_score,
+        inconsistencies=inconsistencies_data,   # accepts Pydantic models or dicts
+        recommendations=recommendations,
+        citations=citations,
+        crossmatch_issues=citation_crossmatch,
+        score_breakdown=score_breakdown_dict,
+        ai_text_indicator={
+            "overall_score": ai_text_result["overall_score"],
+            "section_scores": ai_text_result["section_scores"],
+            "flagged_sections": ai_text_result["flagged_sections"],
+        },
+        doc_url=source_identifier,
+        sections_analyzed=[section["name"] for section in sections],
+        inconsistencies_found=len(inconsistencies_data),
+        citations_audited=len(citations),
+    )
+
+    result.db_save_status = db_result.get("status", "unknown")
+    if not await _save_completed_result(result):
+        raise RuntimeError("Scan is no longer processing")
+    manuscript_title: str = req.manuscript_title or derived_title or source_identifier
+    try:
+        ms_row = (
+            db_client
+            .table("manuscript")
+            .select("manuscript_title")
+            .eq("manuscript_id", manuscript_id)
+            .single()
+            .execute()
+        )
+        if not derived_title and ms_row and ms_row.data and ms_row.data.get("manuscript_title"):
+            manuscript_title = ms_row.data["manuscript_title"]
+    except Exception:
+        pass  # silently fall back to URL/filename — non-critical
+
+    notification_dispatched = await NotificationDeliveryService.send_scan_completion_alert(
+        user_id=req.user_id,
+        manuscript_title=manuscript_title,
+        coherence_score=int(overall_score),
+        analysis_run_id=analysis_run_id
+    )
+
+    result.notification_dispatched = notification_dispatched
+    if seen_key:
+        _scanned_manuscripts[seen_key] = True
+        while len(_scanned_manuscripts) > 5000:
+            _scanned_manuscripts.pop(next(iter(_scanned_manuscripts)))
+    return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +855,12 @@ class ScanJobResponse(BaseModel):
     """202 response acknowledging an accepted async scan job."""
     status: str
     analysis_run_id: str
+    queue_position: Optional[int] = None
+    estimated_wait_seconds: Optional[int] = None
+    status_message: Optional[str] = None
+    status_message_level: Optional[str] = None
+    elapsed_seconds: Optional[int] = None
+    failure_kind: Optional[str] = None
 
 
 class ScanStatusResponse(BaseModel):
@@ -854,6 +868,8 @@ class ScanStatusResponse(BaseModel):
     status: str = Field(..., description="processing | completed | failed")
     analysis_run_id: str
     error: Optional[str] = None
+    elapsed_seconds: Optional[int] = None
+    failure_kind: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     queue_position: Optional[int] = None
     estimated_wait_seconds: Optional[int] = None
@@ -861,56 +877,82 @@ class ScanStatusResponse(BaseModel):
     status_message_level: Optional[str] = Field(default=None, description="info | wait, matching status_message")
 
 
-async def _save_completed_result(result: ScanResponse) -> None:
+async def _save_completed_result(result: ScanResponse) -> bool:
     db_client = DatabasePersistenceService.get_client()
-    await asyncio.to_thread(
-        lambda: db_client.table("analysis_run").update({
-            "status": "completed", "result_json": result.model_dump(mode="json"),
-        }).eq("analysis_run_id", result.analysis_run_id).execute()
+    response = await asyncio.to_thread(
+        lambda: db_client.table(RUN_TABLE).update({
+            RUN_STATUS: "completed", RUN_RESULT: result.model_dump(mode="json"),
+            "analysis_run_status": "completed", "analysis_run_completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq(RUN_ID, result.analysis_run_id).eq(RUN_STATUS, "processing").execute()
     )
+    return bool(response.data)
 
 
-async def _run_scan_job(
-    req: ScanRequest,
-    analysis_run_id: str,
-    manuscript_id: str,
-    credits_remaining: int,
-    file_bytes: Optional[bytes] = None,
-    filename: Optional[str] = None,
-) -> None:
-    """
-    Background wrapper around the scan pipeline for the async job endpoint.
+async def _mark_failed(scan_id: str, message: str) -> None:
+    for attempt in range(2):
+        try:
+            client = DatabasePersistenceService.get_client()
+            await asyncio.to_thread(lambda: client.table(RUN_TABLE).update({RUN_STATUS: "failed", RUN_ERROR: message})
+                                    .eq(RUN_ID, scan_id).eq(RUN_STATUS, "processing").execute())
+            return
+        except Exception:
+            logger.exception("Could not mark scan %s failed (attempt %s)", scan_id, attempt + 1)
 
-    Persists the finished report to `analysis_run.result_json` so the polling
-    endpoint can return it verbatim — identical to what the synchronous
-    endpoint would have returned, with no field lost in reconstruction.
 
-    Any failure is recorded on the row. Without the status
-    update, an exception would be swallowed by the background-task runner
-    and leave the job pinned at 'processing' forever, with the client
-    polling indefinitely.
+def _safe_refusal(message: str) -> bool:
+    return message == NOT_A_PAPER_MESSAGE or message.startswith((
+        "Google Doc not found.", "Unable to open the document.", "Unable to access document.",
+        "Document access restricted.", "Invalid Google Docs URL format.",
+        "The submitted Google Doc appears to be empty.", "The uploaded document appears to be empty",
+        "Unsupported file format.", "No valid manuscript provided.", "Invalid base64 encoding",
+        "This Google Doc is too large", "This Google Doc is larger", "Document is too large to process",
+    ))
 
-    The FIFO worker owns SCAN_SLOT for this job.
-    """
+
+def _failure_message(scan_id: str, exc: BaseException) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        return TIMEOUT_MESSAGE
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+        detail = re.sub(r"^\d{3}:\s*", "", exc.detail)
+        if _safe_refusal(detail):
+            return detail
+    return GENERIC_FAILURE_MESSAGE.format(scan_number=scan_id[:8])
+
+
+async def _run_scan_job(req, analysis_run_id, manuscript_id, credits_remaining, file_bytes=None, filename=None):
     scan_context.set(analysis_run_id)
     try:
-        result = await _execute_scan_pipeline(
-            req, analysis_run_id, manuscript_id, credits_remaining,
-            file_bytes=file_bytes, filename=filename,
-        )
-        await _save_completed_result(result)
+        await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining,
+                               file_bytes=file_bytes, filename=filename), timeout=SCAN_DEADLINE_SECONDS)
         logger.info("Async scan job completed: %s", analysis_run_id)
+    except asyncio.CancelledError:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        raise
     except Exception as exc:
         logger.exception("Async scan job failed: %s", analysis_run_id)
-        try:
-            db_client = DatabasePersistenceService.get_client()
-            await asyncio.to_thread(
-                lambda: db_client.table("analysis_run").update({
-                    "status": "failed", "error_message": str(exc)[:1000],
-                }).eq("analysis_run_id", analysis_run_id).execute()
-            )
-        except Exception:
-            logger.exception("Could not mark scan job %s as failed", analysis_run_id)
+        await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
+    finally:
+        _active_scans.discard(analysis_run_id)
+
+
+async def _sweep_interrupted():
+    try:
+        client = DatabasePersistenceService.get_client()
+        query = client.table(RUN_TABLE).update({RUN_STATUS: "failed", RUN_ERROR: INTERRUPTED_MESSAGE}) \
+            .eq(RUN_STATUS, "processing").is_(RUN_RESULT, "null").lt(RUN_CREATED, PROCESS_START.isoformat())
+        for scan_id in tuple(_active_scans):
+            query = query.neq(RUN_ID, scan_id)
+        await asyncio.to_thread(query.execute)
+    except Exception:
+        logger.exception("Interrupted scan sweep failed")
+
+
+@app.on_event("startup")
+async def _schedule_interrupted_sweep():
+    async def sweep_later():
+        await asyncio.sleep(INTERRUPTED_GRACE_SECONDS)
+        await _sweep_interrupted()
+    asyncio.create_task(sweep_later())
 
 
 @app.post(
@@ -938,21 +980,30 @@ async def run_scan(
     of a silent timeout."""
     _assert_owner(authenticated_user_id, req.user_id)
     analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
+    _active_scans.add(analysis_run_id)
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
+        await _mark_failed(analysis_run_id, TIMEOUT_MESSAGE)
+        _active_scans.discard(analysis_run_id)
         raise HTTPException(
             status_code=503,
             detail="Another scan is currently in progress. Please retry shortly.",
             headers={"Retry-After": "60"},
         )
+    except asyncio.CancelledError:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        _active_scans.discard(analysis_run_id)
+        raise
     try:
-        result = await _execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining)
-        await _save_completed_result(result)
+        result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
         return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
-    except Exception:
+    except BaseException as exc:
+        logger.exception("Synchronous scan failed: %s", analysis_run_id)
+        await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
         raise
     finally:
+        _active_scans.discard(analysis_run_id)
         SCAN_SLOT.release()
 
 
@@ -982,9 +1033,19 @@ async def start_scan(
     """
     _assert_owner(authenticated_user_id, req.user_id)
     analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
-    _enqueue_scan(req, analysis_run_id, manuscript_id, credits_remaining)
+    try:
+        _enqueue_scan(req, analysis_run_id, manuscript_id, credits_remaining)
+    except Exception:
+        _active_scans.discard(analysis_run_id)
+        _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
+        _scan_queue.clear()
+        _scan_queue.extend(_scan_queue_copy)
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        raise
     logger.info("Accepted async scan job: %s", analysis_run_id)
-    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
+    position, estimate, level, message = _queue_state(analysis_run_id)
+    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
+                           estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
 
 
 @app.post(
@@ -1049,10 +1110,20 @@ async def upload_and_start_scan(
     analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
         req, default_source_name=file.filename
     )
-    _enqueue_scan(req, analysis_run_id, resolved_manuscript_id, credits_remaining,
-                  file_bytes, file.filename)
+    try:
+        _enqueue_scan(req, analysis_run_id, resolved_manuscript_id, credits_remaining,
+                      file_bytes, file.filename)
+    except Exception:
+        _active_scans.discard(analysis_run_id)
+        _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
+        _scan_queue.clear()
+        _scan_queue.extend(_scan_queue_copy)
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        raise
     logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
-    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id)
+    position, estimate, level, message = _queue_state(analysis_run_id)
+    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
+                           estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
 
 
 @app.post(
@@ -1111,28 +1182,33 @@ async def upload_and_run_scan(
     analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
         req, default_source_name=file.filename
     )
+    _active_scans.add(analysis_run_id)
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
+        await _mark_failed(analysis_run_id, TIMEOUT_MESSAGE)
+        _active_scans.discard(analysis_run_id)
         raise HTTPException(
             status_code=503,
             detail="Another scan is currently in progress. Please retry shortly.",
             headers={"Retry-After": "60"},
         )
+    except asyncio.CancelledError:
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+        _active_scans.discard(analysis_run_id)
+        raise
     try:
-        result = await _execute_scan_pipeline(
-            req,
-            analysis_run_id,
-            resolved_manuscript_id,
-            credits_remaining,
-            file_bytes=file_bytes,
-            filename=file.filename,
-        )
-        await _save_completed_result(result)
+        result = await asyncio.wait_for(_execute_scan_pipeline(
+            req, analysis_run_id, resolved_manuscript_id, credits_remaining,
+            file_bytes=file_bytes, filename=file.filename,
+        ), SCAN_DEADLINE_SECONDS)
         return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
-    except Exception:
+    except BaseException as exc:
+        logger.exception("Synchronous scan failed: %s", analysis_run_id)
+        await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
         raise
     finally:
+        _active_scans.discard(analysis_run_id)
         SCAN_SLOT.release()
 
 
@@ -1158,7 +1234,7 @@ async def get_scan_status(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table("analysis_run")
-                .select("analysis_run_id, user_id, status, error_message, result_json")
+                .select("analysis_run_id, user_id, status, error_message, result_json, created_at")
                 .eq("analysis_run_id", analysis_run_id)
                 .execute()
         )
@@ -1185,18 +1261,38 @@ async def get_scan_status(
             detail=f"Scan {analysis_run_id} not found."
         )
     job_status = row.get("status") or "processing"
+    created = row.get(RUN_CREATED)
+    try:
+        created = datetime.fromisoformat(created.replace("Z", "+00:00")) if isinstance(created, str) else created
+        elapsed = max(0, int((datetime.now(timezone.utc) - created).total_seconds())) if created else None
+    except (ValueError, TypeError):
+        created, elapsed = None, None
+    if (job_status == "processing" and not row.get(RUN_RESULT) and created and created < PROCESS_START
+            and analysis_run_id not in _active_scans
+            and (datetime.now(timezone.utc) - PROCESS_START).total_seconds() >= INTERRUPTED_GRACE_SECONDS):
+        await _mark_failed(analysis_run_id, INTERRUPTED_MESSAGE)
+        run_resp = await asyncio.to_thread(lambda: db_client.table(RUN_TABLE)
+            .select("analysis_run_id, user_id, status, error_message, result_json, created_at")
+            .eq(RUN_ID, analysis_run_id).execute())
+        row = run_resp.data[0]
+        job_status = row.get(RUN_STATUS) or "processing"
 
     if job_status == "failed":
+        error = row.get(RUN_ERROR) or ""
+        generic = GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8])
+        if error not in (INTERRUPTED_MESSAGE, TIMEOUT_MESSAGE, generic) and not _safe_refusal(error):
+            error = generic
         return ScanStatusResponse(
             status="failed",
             analysis_run_id=analysis_run_id,
-            error=row.get("error_message") or "Scan failed for an unknown reason."
+            error=error,
+            elapsed_seconds=elapsed,
+            failure_kind=("interrupted" if error == INTERRUPTED_MESSAGE else
+                          "timeout" if error == TIMEOUT_MESSAGE else
+                          "error" if error == generic else "refused")
         )
 
-    # `save_scan_transaction` flips status to 'completed' before the job
-    # wrapper writes result_json, so treat 'completed without a report' as
-    # still in progress. This closes that race instead of briefly handing
-    # the client a completed status with an empty result.
+    # Older rows can say completed without a saved report.
     result_json = row.get("result_json")
     if job_status == "completed" and result_json:
         return ScanStatusResponse(
@@ -1209,7 +1305,7 @@ async def get_scan_status(
     if position is None:
         level, message = scan_status_message(analysis_run_id)
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id,
-                              queue_position=position, estimated_wait_seconds=estimate,
+                              elapsed_seconds=elapsed, queue_position=position, estimated_wait_seconds=estimate,
                               status_message=message, status_message_level=level)
 
 
