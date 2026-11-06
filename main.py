@@ -127,6 +127,38 @@ _scan_durations = deque(maxlen=20)
 _scan_workers = []
 _running_scan_starts = []
 
+MAX_QUEUED_SCANS = max(0, int(os.getenv("MAX_QUEUED_SCANS", "8")))
+MAX_QUEUED_BYTES = max(0, int(os.getenv("MAX_QUEUED_BYTES", str(80 * 1024 * 1024))))
+QUEUE_FULL_MESSAGE = "Many scans are waiting right now. Please try again in a few minutes."
+USER_FULL_MESSAGE = "You already have scans in progress. Please wait for them to finish."
+# Reservations cover provisioning as well as queued and running work; no await occurs in admission.
+_scan_reservations = {}
+_scan_reservations_by_id = {}
+
+
+def _reserve_scan(user_id, size, queued=True):
+    if sum(entry["user"] == user_id for entry in _scan_reservations.values()) >= 2:
+        raise HTTPException(status_code=429, detail=USER_FULL_MESSAGE)
+    waiting = [entry for entry in _scan_reservations.values() if entry["queued"]]
+    if queued and (len(waiting) >= MAX_QUEUED_SCANS or sum(entry["bytes"] for entry in waiting) + size > MAX_QUEUED_BYTES):
+        raise HTTPException(status_code=429, detail=QUEUE_FULL_MESSAGE)
+    token = object()
+    _scan_reservations[token] = {"user": user_id, "bytes": size if queued else 0, "queued": queued}
+    return token
+
+
+def _release_reservation(token):
+    _scan_reservations.pop(token, None)
+
+
+def _start_reserved_scan(scan_id):
+    token = _scan_reservations_by_id.get(scan_id)
+    entry = _scan_reservations.get(token)
+    if entry is not None:
+        entry["queued"] = False
+        entry["bytes"] = 0
+
+
 
 def _queue_state(scan_id):
     for position, job in enumerate(_scan_queue, 1):
@@ -158,6 +190,7 @@ async def _drain_scan_queue():
             if not _scan_queue:
                 break
             job = _scan_queue.popleft()
+            _start_reserved_scan(job[1])
             started = time.monotonic()
             _running_scan_starts.append(started)
             try:
@@ -165,6 +198,8 @@ async def _drain_scan_queue():
             finally:
                 _scan_durations.append(time.monotonic() - started)
                 _running_scan_starts.remove(started)
+                token = _scan_reservations_by_id.pop(job[1], None)
+                _release_reservation(token)
                 del job
 
 
@@ -1041,36 +1076,40 @@ async def run_scan(
     fast with 503 so the Android client gets an honest "busy, retry" instead
     of a silent timeout."""
     _assert_owner(authenticated_user_id, req.user_id)
-    analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
-    _active_scans.add(analysis_run_id)
+    reservation = _reserve_scan(req.user_id, 0, queued=False)
     try:
-        await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
-    except asyncio.TimeoutError:
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        _active_scans.discard(analysis_run_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Another scan is currently in progress. Please retry shortly.",
-            headers={"Retry-After": "60"},
-        )
-    except asyncio.CancelledError:
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        _active_scans.discard(analysis_run_id)
-        raise
-    _log_scan_memory(analysis_run_id, "start")
-    scan_context.set(analysis_run_id)
-    scan_user.set(req.user_id)
-    try:
-        result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
-        return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
-    except BaseException as exc:
-        logger.exception("Synchronous scan failed: %s", analysis_run_id)
-        await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
-        raise
+        analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
+        _active_scans.add(analysis_run_id)
+        try:
+            await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            _active_scans.discard(analysis_run_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Another scan is currently in progress. Please retry shortly.",
+                headers={"Retry-After": "60"},
+            )
+        except asyncio.CancelledError:
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            _active_scans.discard(analysis_run_id)
+            raise
+        _log_scan_memory(analysis_run_id, "start")
+        scan_context.set(analysis_run_id)
+        scan_user.set(req.user_id)
+        try:
+            result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
+            return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
+        except BaseException as exc:
+            logger.exception("Synchronous scan failed: %s", analysis_run_id)
+            await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
+            raise
+        finally:
+            _log_scan_memory(analysis_run_id, "end")
+            _active_scans.discard(analysis_run_id)
+            SCAN_SLOT.release()
     finally:
-        _log_scan_memory(analysis_run_id, "end")
-        _active_scans.discard(analysis_run_id)
-        SCAN_SLOT.release()
+        _release_reservation(reservation)
 
 
 @app.post(
@@ -1098,20 +1137,30 @@ async def start_scan(
     fast with 404 instead of failing in the background.
     """
     _assert_owner(authenticated_user_id, req.user_id)
-    analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
+    reservation = _reserve_scan(req.user_id, len(req.file_content_base64 or ""))
+    handed_off = False
     try:
-        _enqueue_scan(req, analysis_run_id, manuscript_id, credits_remaining)
-    except Exception:
-        _active_scans.discard(analysis_run_id)
-        _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
-        _scan_queue.clear()
-        _scan_queue.extend(_scan_queue_copy)
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        raise
-    logger.info("Accepted async scan job: %s", analysis_run_id)
-    position, estimate, level, message = _queue_state(analysis_run_id)
-    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
-                           estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+        analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
+        _scan_reservations_by_id[analysis_run_id] = reservation
+        try:
+            _enqueue_scan(req, analysis_run_id, manuscript_id, credits_remaining)
+            handed_off = True
+        except Exception:
+            _active_scans.discard(analysis_run_id)
+            _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
+            _scan_queue.clear()
+            _scan_queue.extend(_scan_queue_copy)
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            raise
+        logger.info("Accepted async scan job: %s", analysis_run_id)
+        position, estimate, level, message = _queue_state(analysis_run_id)
+        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
+                               estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+    finally:
+        if not handed_off:
+            _release_reservation(reservation)
+            if "analysis_run_id" in locals():
+                _scan_reservations_by_id.pop(analysis_run_id, None)
 
 
 @app.post(
@@ -1173,23 +1222,33 @@ async def upload_and_start_scan(
         style_reference_url=style_reference_url,
     )
 
-    analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
-        req, default_source_name=file.filename
-    )
+    reservation = _reserve_scan(req.user_id, len(file_bytes))
+    handed_off = False
     try:
-        _enqueue_scan(req, analysis_run_id, resolved_manuscript_id, credits_remaining,
-                      file_bytes, file.filename)
-    except Exception:
-        _active_scans.discard(analysis_run_id)
-        _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
-        _scan_queue.clear()
-        _scan_queue.extend(_scan_queue_copy)
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        raise
-    logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
-    position, estimate, level, message = _queue_state(analysis_run_id)
-    return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
-                           estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+        analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
+            req, default_source_name=file.filename
+        )
+        _scan_reservations_by_id[analysis_run_id] = reservation
+        try:
+            _enqueue_scan(req, analysis_run_id, resolved_manuscript_id, credits_remaining,
+                          file_bytes, file.filename)
+            handed_off = True
+        except Exception:
+            _active_scans.discard(analysis_run_id)
+            _scan_queue_copy = [job for job in _scan_queue if job[1] != analysis_run_id]
+            _scan_queue.clear()
+            _scan_queue.extend(_scan_queue_copy)
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            raise
+        logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
+        position, estimate, level, message = _queue_state(analysis_run_id)
+        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
+                               estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+    finally:
+        if not handed_off:
+            _release_reservation(reservation)
+            if "analysis_run_id" in locals():
+                _scan_reservations_by_id.pop(analysis_run_id, None)
 
 
 @app.post(
@@ -1245,41 +1304,45 @@ async def upload_and_run_scan(
         style_reference_url=style_reference_url,
     )
 
-    analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
-        req, default_source_name=file.filename
-    )
-    _active_scans.add(analysis_run_id)
+    reservation = _reserve_scan(req.user_id, 0, queued=False)
     try:
-        await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
-    except asyncio.TimeoutError:
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        _active_scans.discard(analysis_run_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Another scan is currently in progress. Please retry shortly.",
-            headers={"Retry-After": "60"},
+        analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
+            req, default_source_name=file.filename
         )
-    except asyncio.CancelledError:
-        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
-        _active_scans.discard(analysis_run_id)
-        raise
-    _log_scan_memory(analysis_run_id, "start")
-    scan_context.set(analysis_run_id)
-    scan_user.set(req.user_id)
-    try:
-        result = await asyncio.wait_for(_execute_scan_pipeline(
-            req, analysis_run_id, resolved_manuscript_id, credits_remaining,
-            file_bytes=file_bytes, filename=file.filename,
-        ), SCAN_DEADLINE_SECONDS)
-        return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
-    except BaseException as exc:
-        logger.exception("Synchronous scan failed: %s", analysis_run_id)
-        await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
-        raise
+        _active_scans.add(analysis_run_id)
+        try:
+            await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            _active_scans.discard(analysis_run_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Another scan is currently in progress. Please retry shortly.",
+                headers={"Retry-After": "60"},
+            )
+        except asyncio.CancelledError:
+            await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
+            _active_scans.discard(analysis_run_id)
+            raise
+        _log_scan_memory(analysis_run_id, "start")
+        scan_context.set(analysis_run_id)
+        scan_user.set(req.user_id)
+        try:
+            result = await asyncio.wait_for(_execute_scan_pipeline(
+                req, analysis_run_id, resolved_manuscript_id, credits_remaining,
+                file_bytes=file_bytes, filename=file.filename,
+            ), SCAN_DEADLINE_SECONDS)
+            return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
+        except BaseException as exc:
+            logger.exception("Synchronous scan failed: %s", analysis_run_id)
+            await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
+            raise
+        finally:
+            _log_scan_memory(analysis_run_id, "end")
+            _active_scans.discard(analysis_run_id)
+            SCAN_SLOT.release()
     finally:
-        _log_scan_memory(analysis_run_id, "end")
-        _active_scans.discard(analysis_run_id)
-        SCAN_SLOT.release()
+        _release_reservation(reservation)
 
 
 @app.get(
