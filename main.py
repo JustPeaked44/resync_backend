@@ -681,17 +681,22 @@ async def _execute_scan_pipeline(
     # its own much larger DoS-guard cap (150,000 chars) internally.
     references_text = _references_text(parsed_sections, section_roles)
     citation_task = asyncio.create_task(CitationAuditService.audit_citations(references_text, body_text=raw_text))
+    # The whole-paper check needs only the sections, so it starts now too and runs while the model rates the pairs.
+    from services import full_check as _full_check
+    full_check_task = _full_check.start(sections)
     try:
         # The model rates every pair of sections; section roles tell it which far-apart pairs should agree.
         ml_result = await asyncio.to_thread(ml_client.analyze_v7, [{**section, "role": section_roles.get(section["name"])} for section in sections])
         manuscript_flow = assemble_flow(sections, ml_result["pairs"])
         (inconsistencies_data, recommendations, ai_synthesis), ai_text_result = await asyncio.gather(
-            explain_flow(sections, manuscript_flow, section_roles),
+            explain_flow(sections, manuscript_flow, section_roles, full_check_task=full_check_task),
             asyncio.to_thread(ml_client.analyze_ai_text, {section["name"]: section["text"] for section in sections}),
         )
         citation_audit_result: Dict[str, Any] = await citation_task
     except BaseException:
         citation_task.cancel()  # do not leave the audit running if the scan failed
+        if full_check_task is not None:
+            full_check_task.cancel()
         raise
     _, dimensions, dimension_weights = four_part_score(manuscript_flow)
     overall_score, breakdown = manuscript_score(manuscript_flow, ml_result.get("transition_averages"))

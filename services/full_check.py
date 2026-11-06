@@ -274,22 +274,37 @@ def _add_finding(pair: Dict[str, Any], sections: List[Dict[str, Any]], conflict:
     pair["explanation"] = explanation
 
 
-async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], roles: Optional[Dict[str, str]] = None) -> int:
+def start(sections: List[Dict[str, Any]]) -> Optional["asyncio.Future"]:
+    """Begins reading and comparing the whole paper now, so it runs while the pair reviews and the model are still working.
+    The finished work is handed to apply_full_check(prepared=...). None when the check is off or not possible."""
+    if not enabled() or len(sections) < 2 or gemini.quota_blocked():
+        return None
+    return asyncio.ensure_future(_prepare(sections))
+
+
+async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], roles: Optional[Dict[str, str]] = None,
+                           prepared: Optional["asyncio.Future"] = None) -> int:
     """Reads every section in full, compares all of it, and adds the confirmed mismatches to the flow. Returns how many."""
     if not enabled() or len(sections) < 2 or gemini.quota_blocked():
+        if prepared is not None:
+            prepared.cancel()
         return 0
     try:
-        return await _apply(flow, sections)
+        found = await (prepared if prepared is not None else _prepare(sections))
+        return _commit(flow, sections, found)
+    except asyncio.CancelledError:
+        raise
     except Exception:
         logger.exception("Full check failed; the report keeps the pair review's findings")
         return 0
 
 
-async def _apply(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> int:
+async def _prepare(sections: List[Dict[str, Any]]):
+    """Everything that needs the AI: (candidates, confirmed). It does not touch the report, so it can run early."""
     jobs = [(index, chunk) for index, section in enumerate(sections) if len((section["text"] or "").split()) >= MIN_SECTION_WORDS
             for chunk in chunk_text(section["text"])][:MAX_CHUNK_CALLS]
     if not jobs:
-        return 0
+        return [], {}
     gemini.expect_calls(len(jobs) + 2)
     gate = asyncio.Semaphore(CONCURRENCY)
 
@@ -309,7 +324,7 @@ async def _apply(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> 
         for fact in found if isinstance(found, list) else []:
             facts.append({**fact, "id": f"F{len(facts) + 1}", "index": index, "section": sections[index]["name"]})
     if len({fact["index"] for fact in facts}) < 2:
-        return 0
+        return [], {}
     by_id = {fact["id"]: fact for fact in facts}
 
     candidates: List[Dict[str, Any]] = []
@@ -347,7 +362,12 @@ async def _apply(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]]) -> 
                           "quote": _exact(text, fact["quote"]), "context": _paragraph_around(text, fact["quote"])})
         candidates.append({"a": sides[0], "b": sides[1], "fix": sides[0] if fix is a else sides[1], "what": what.strip(), "why": why.strip(),
                            "severity": severity, "category": category})
-    confirmed = await _confirm(candidates)
+    return candidates, await _confirm(candidates)
+
+
+def _commit(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], found) -> int:
+    """Adds the confirmed mismatches to the report. Returns how many."""
+    candidates, confirmed = found
     added = 0
     for number, verdict in confirmed.items():
         c = candidates[number - 1]

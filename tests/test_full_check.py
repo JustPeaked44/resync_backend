@@ -130,3 +130,18 @@ def test_a_conflict_with_a_misnamed_or_missing_title_is_still_checked_and_report
     sections = _sections()
     flow = _flow(sections)
     assert asyncio.run(full_check.apply_full_check(flow, sections)) == 1
+
+
+def test_a_check_started_early_gives_the_same_report_as_one_run_in_place(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    sections = _sections()
+    flow_early, flow_late = _flow(sections), _flow(sections)
+
+    async def early():
+        task = full_check.start(sections)          # begun while other work is still going on
+        await asyncio.sleep(0)
+        return await full_check.apply_full_check(flow_early, sections, prepared=task)
+
+    assert asyncio.run(early()) == asyncio.run(full_check.apply_full_check(flow_late, sections)) == 1
+    assert flow_early[-1]["explanation"] == flow_late[-1]["explanation"]

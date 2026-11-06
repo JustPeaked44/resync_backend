@@ -352,12 +352,18 @@ def apply_figure_conflicts(flow, sections):
         pair["explanation"] = explanation
 
 
-async def explain_flow(sections, flow, roles=None):
+async def explain_flow(sections, flow, roles=None, full_check_task=None):
     from services import gemini
     from services.v7_explain import (FLOW_SUGGESTION_BELOW, explain_batch, explain_pair, explain_summary, pair_cache_key,
                                      suggest_bridges_batch)
     from services.verdict_cache import VerdictCache
 
+    from services import full_check
+    # The whole-paper check does not depend on the pair reviews, so it reads and compares the paper while they run (the caller
+    # may have started it even earlier, while the model was still rating). Its findings are added to the report below, in
+    # the same place and order as before, so the result does not change, only the waiting.
+    if full_check_task is None:
+        full_check_task = full_check.start(sections)
     semaphore = asyncio.Semaphore(EXPLAIN_CONCURRENCY)
     log = logging.getLogger("resync.v7_scan")
 
@@ -463,8 +469,8 @@ async def explain_flow(sections, flow, roles=None):
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
         apply_figure_conflicts(flow, sections)
         # The pair review sees where sections meet; this reads every section in full and compares all of it (full_check).
-        from services.full_check import apply_full_check
-        await apply_full_check(flow, sections, roles)
+        await full_check.apply_full_check(flow, sections, roles, prepared=full_check_task)
+        full_check_task = None
         for pair in flow:
             overall = pair["scores"]["overall_coherence"]
             if overall is None:
@@ -486,6 +492,8 @@ async def explain_flow(sections, flow, roles=None):
                      "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None,
                      "review_status": review_status}
     finally:
+        if full_check_task is not None:   # the scan stopped early: do not leave the paper check running
+            full_check_task.cancel()
         gemini.expect_calls(0)
     return findings, recommendations, synthesis
 
