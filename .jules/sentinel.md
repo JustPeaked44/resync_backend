@@ -1,0 +1,4 @@
+## 2024-05-18 - SSRF Vulnerability in Citation Link Redirects
+**Vulnerability:** A Server-Side Request Forgery (SSRF) vulnerability existed in `services/citation.py`. While the initial URL host was checked against private/internal IPs, HTTP redirects (followed automatically by `httpx.AsyncClient`) were not validated, allowing an attacker to bypass the initial check and force the server to request internal endpoints.
+**Learning:** `httpx` follows redirects by default when `follow_redirects=True`, but doesn't automatically re-validate the host of the redirect target against custom logic.
+**Prevention:** Use `httpx` event hooks (`event_hooks={'request': [hook_function]}`) to run validation logic before *every* request, including those triggered by redirects. Remember to use `asyncio.to_thread` if the hook needs to call blocking synchronous functions like `socket.getaddrinfo`.
