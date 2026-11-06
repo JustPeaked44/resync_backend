@@ -1026,7 +1026,7 @@ async def run_scan(
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
-        await _mark_failed(analysis_run_id, TIMEOUT_MESSAGE)
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
         _active_scans.discard(analysis_run_id)
         raise HTTPException(
             status_code=503,
@@ -1038,6 +1038,8 @@ async def run_scan(
         _active_scans.discard(analysis_run_id)
         raise
     _log_scan_memory(analysis_run_id, "start")
+    scan_context.set(analysis_run_id)
+    scan_user.set(req.user_id)
     try:
         result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
         return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
@@ -1230,7 +1232,7 @@ async def upload_and_run_scan(
     try:
         await asyncio.wait_for(SCAN_SLOT.acquire(), timeout=5.0)
     except asyncio.TimeoutError:
-        await _mark_failed(analysis_run_id, TIMEOUT_MESSAGE)
+        await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
         _active_scans.discard(analysis_run_id)
         raise HTTPException(
             status_code=503,
@@ -1242,6 +1244,8 @@ async def upload_and_run_scan(
         _active_scans.discard(analysis_run_id)
         raise
     _log_scan_memory(analysis_run_id, "start")
+    scan_context.set(analysis_run_id)
+    scan_user.set(req.user_id)
     try:
         result = await asyncio.wait_for(_execute_scan_pipeline(
             req, analysis_run_id, resolved_manuscript_id, credits_remaining,

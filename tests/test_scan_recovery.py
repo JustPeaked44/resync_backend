@@ -94,7 +94,7 @@ def test_deadline_failure_and_late_completion(monkeypatch):
     async def pipeline(*args, **kwargs): await asyncio.sleep(10)
     monkeypatch.setattr(main, '_execute_scan_pipeline', pipeline)
     async def run():
-        await main._run_scan_job(None, 'abcdefgh-id', None, 0)
+        await main._run_scan_job(SimpleNamespace(user_id='owner'), 'abcdefgh-id', None, 0)
         assert db.rows[0]['error_message'] == main.TIMEOUT_MESSAGE
         result = SimpleNamespace(analysis_run_id='abcdefgh-id', model_dump=lambda **kwargs: {'x': 1})
         await main._save_completed_result(result)
@@ -109,14 +109,14 @@ def test_safe_failure_and_cancellation(monkeypatch):
     async def pipeline(*args, **kwargs): raise ValueError('secret technical error')
     monkeypatch.setattr(main, '_execute_scan_pipeline', pipeline)
     async def run():
-        await main._run_scan_job(None, 'abcdefgh-id', None, 0)
+        await main._run_scan_job(SimpleNamespace(user_id='owner'), 'abcdefgh-id', None, 0)
         result = await main.get_scan_status('abcdefgh-id', 'owner')
         assert result.error == main.GENERIC_FAILURE_MESSAGE.format(scan_number='abcdefgh')
         assert result.failure_kind == 'error' and 'secret' not in result.error
         db.rows[0]['status'] = 'processing'
         async def wait(*args, **kwargs): await asyncio.sleep(10)
         monkeypatch.setattr(main, '_execute_scan_pipeline', wait)
-        task = asyncio.create_task(main._run_scan_job(None, 'abcdefgh-id', None, 0))
+        task = asyncio.create_task(main._run_scan_job(SimpleNamespace(user_id='owner'), 'abcdefgh-id', None, 0))
         await asyncio.sleep(0)
         task.cancel()
         try: await task
