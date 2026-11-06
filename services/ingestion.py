@@ -1,8 +1,50 @@
 import logging
 import re
 import io
+import zipfile
 import httpx
 from fastapi import HTTPException, status
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
+READ_CHUNK_BYTES = 1024 * 1024
+
+
+def bounded_read(stream, limit: int) -> bytearray:
+    """Read at most limit bytes from a binary stream, raising on overflow."""
+    data = bytearray()
+    while True:
+        chunk = stream.read(min(READ_CHUNK_BYTES, limit - len(data) + 1))
+        if not chunk:
+            return data
+        if len(data) + len(chunk) > limit:
+            raise ValueError("Stream exceeds size limit")
+        data.extend(chunk)
+
+
+async def bounded_download(response, limit: int = MAX_DOWNLOAD_BYTES) -> bytearray:
+    """Consume an HTTP response without buffering more than the byte limit."""
+    data = bytearray()
+    async for chunk in response.aiter_bytes(READ_CHUNK_BYTES):
+        if len(data) + len(chunk) > limit:
+            raise HTTPException(status_code=413, detail="This Google Doc is too large to open (over 120 MB).")
+        data.extend(chunk)
+    return data
+
+
+def validate_docx_archive(file_bytes: bytes) -> None:
+    """Reject oversized archives before python-docx decompresses their members."""
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+        members = archive.infolist()
+        if (sum(member.file_size for member in members) > MAX_DECOMPRESSED_BYTES
+                or any(member.file_size > MAX_ARCHIVE_MEMBER_BYTES for member in members)):
+            raise HTTPException(status_code=413, detail="This document is too large to open. Please use a smaller file.")
+        for member in members:
+            with archive.open(member) as stream:
+                while stream.read(READ_CHUNK_BYTES):
+                    pass
 
 
 def looks_like_html_document(text: str) -> bool:
@@ -47,21 +89,19 @@ class DocumentIngestionService:
             headers=headers
         ) as client:
             try:
-                response = await client.get(export_url)
-                
-                if response.status_code == 404:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Google Doc not found. Please verify the document URL exists."
-                    )
-                elif response.status_code != 200:
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Unable to access document. Make sure sharing is set to 'Anyone with the link can view'."
-                    )
-                
-                raw_text = response.text
-                
+                async with client.stream("GET", export_url) as response:
+                    if response.status_code == 404:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Google Doc not found. Please verify the document URL exists."
+                        )
+                    elif response.status_code != 200:
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Unable to access document. Make sure sharing is set to 'Anyone with the link can view'."
+                        )
+                    raw_text = (await bounded_download(response)).decode(response.encoding or "utf-8", errors="replace")
+
                 # Catch Private Document Redirect (Google returns HTML login page)
                 if looks_like_html_document(raw_text):
                     raise HTTPException(
@@ -104,6 +144,7 @@ class DocumentIngestionService:
         try:
             if filename_lower.endswith(".docx"):
                 import docx
+                validate_docx_archive(file_bytes)
                 doc = docx.Document(io.BytesIO(file_bytes))
                 lines = []
                 for p in doc.paragraphs:
@@ -123,6 +164,7 @@ class DocumentIngestionService:
                             if unique_cells:
                                 lines.append(" | ".join(unique_cells))
                 raw_text = "\n".join(lines)
+                del lines
             elif filename_lower.endswith(".pdf"):
                 import pypdf
                 pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))

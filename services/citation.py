@@ -4,6 +4,7 @@ import logging
 import re
 import socket
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -69,6 +70,8 @@ BROWSER_HEADERS = {
 # small for a real 150-reference APA list and was silently truncating
 # real bibliographies mid-entry.
 MAX_REFERENCES_TEXT_CHARS = 150_000
+MAX_VERIFICATION_CACHE_ENTRIES = 2_000
+MAX_THROTTLE_DOMAINS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -82,16 +85,22 @@ class VerificationCache:
     within a single scan (and ideally across scans while the dyno is warm)."""
 
     def __init__(self) -> None:
-        self._store: Dict[str, Dict[str, Any]] = {}
+        self._store: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def get(self, key: str) -> Optional[Dict[str, Any]]:
         async with self._lock:
-            return self._store.get(key)
+            value = self._store.get(key)
+            if key in self._store:
+                self._store.move_to_end(key)
+            return value
 
     async def set(self, key: str, value: Dict[str, Any]) -> None:
         async with self._lock:
             self._store[key] = value
+            self._store.move_to_end(key)
+            if len(self._store) > MAX_VERIFICATION_CACHE_ENTRIES:
+                self._store.popitem(last=False)
 
 
 class DomainThrottle:
@@ -100,8 +109,12 @@ class DomainThrottle:
     reference list with 15 links to the same publisher doesn't hammer it."""
 
     def __init__(self, max_concurrent_per_domain: int = 2, min_interval: float = 0.5) -> None:
-        self._sems: Dict[str, asyncio.Semaphore] = {}
+        self._sems: OrderedDict[str, asyncio.Semaphore] = OrderedDict()
         self._last: Dict[str, float] = {}
+        self._active: Dict[str, int] = {}
+        self._overflow_sem = asyncio.Semaphore(1)
+        self._overflow_last = 0.0
+        self._overflow_active = 0
         self._lock = asyncio.Lock()
         self.max_concurrent = max_concurrent_per_domain
         self.min_interval = min_interval
@@ -115,25 +128,66 @@ class _DomainSlot:
         self.throttle = throttle
         self.domain = domain
         self._sem: Optional[asyncio.Semaphore] = None
+        self._tracked = False
 
     async def __aenter__(self) -> "_DomainSlot":
         async with self.throttle._lock:
-            sem = self.throttle._sems.setdefault(
-                self.domain, asyncio.Semaphore(self.throttle.max_concurrent)
-            )
-        await sem.acquire()
-        loop = asyncio.get_event_loop()
-        last = self.throttle._last.get(self.domain, 0.0)
-        wait = self.throttle.min_interval - (loop.time() - last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self.throttle._last[self.domain] = loop.time()
+            sem = self.throttle._sems.get(self.domain)
+            if sem is None and not self.throttle._overflow_active:
+                if len(self.throttle._sems) >= MAX_THROTTLE_DOMAINS:
+                    oldest = next((key for key in self.throttle._sems if not self.throttle._active.get(key)), None)
+                    if oldest is not None:
+                        del self.throttle._sems[oldest]
+                        self.throttle._last.pop(oldest, None)
+                if len(self.throttle._sems) < MAX_THROTTLE_DOMAINS:
+                    sem = self.throttle._sems[self.domain] = asyncio.Semaphore(self.throttle.max_concurrent)
+            if sem is not None:
+                self._tracked = True
+                self.throttle._sems.move_to_end(self.domain)
+                self.throttle._active[self.domain] = self.throttle._active.get(self.domain, 0) + 1
+            else:
+                sem = self.throttle._overflow_sem
+                self.throttle._overflow_active += 1
+        try:
+            await sem.acquire()
+        except BaseException:
+            if self._tracked:
+                async with self.throttle._lock:
+                    self.throttle._active[self.domain] -= 1
+                    if not self.throttle._active[self.domain]:
+                        del self.throttle._active[self.domain]
+            else:
+                async with self.throttle._lock:
+                    self.throttle._overflow_active -= 1
+            raise
         self._sem = sem
+        loop = asyncio.get_event_loop()
+        last = self.throttle._last.get(self.domain, 0.0) if self._tracked else self.throttle._overflow_last
+        wait = self.throttle.min_interval - (loop.time() - last)
+        try:
+            if wait > 0:
+                await asyncio.sleep(wait)
+        except BaseException:
+            await self.__aexit__()
+            raise
+        if self._tracked:
+            self.throttle._last[self.domain] = loop.time()
+        else:
+            self.throttle._overflow_last = loop.time()
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
         if self._sem is not None:
             self._sem.release()
+            if self._tracked:
+                async with self.throttle._lock:
+                    self.throttle._active[self.domain] -= 1
+                    if not self.throttle._active[self.domain]:
+                        del self.throttle._active[self.domain]
+            else:
+                async with self.throttle._lock:
+                    self.throttle._overflow_active -= 1
+            self._sem = None
 
 
 _verification_cache = VerificationCache()

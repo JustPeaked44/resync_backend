@@ -1,10 +1,5 @@
 import re
-import spacy
 from typing import Dict, List, Any, Optional
-
-# Load spaCy English NLP model (lightweight sentencizer only)
-nlp = spacy.blank("en")
-nlp.add_pipe("sentencizer")
 
 # Default Capstone TOC Template
 DEFAULT_TOC_TEMPLATE = [
@@ -142,7 +137,7 @@ ROLE_MAPPING: dict = {
 
 class ManuscriptParserService:
     """
-    Uses spaCy NLP to parse raw manuscript text and segment it into 
+    Parses raw manuscript text and segments it into
     structured sections matching the mandatory Department Template TOC.
     """
 
