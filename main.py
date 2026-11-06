@@ -1482,6 +1482,37 @@ def _structure_note(structure: Optional[str], parts: int) -> Optional[str]:
 # TTL is 10 minutes. Max keys = 100 to prevent OOM.
 _manuscript_cache = {}
 
+CACHE_MAX_BYTES = max(0, int(os.getenv("DOCUMENT_CACHE_MAX_BYTES", str(48 * 1024 * 1024))))
+CACHE_MAX_ENTRIES = 100
+
+
+def _cache_size(value):
+    import sys
+    if isinstance(value, BaseModel):
+        return sys.getsizeof(value) + _cache_size(value.__dict__)
+    if isinstance(value, dict):
+        return sys.getsizeof(value) + sum(_cache_size(k) + _cache_size(v) for k, v in value.items())
+    if isinstance(value, (tuple, list)):
+        return sys.getsizeof(value) + sum(_cache_size(item) for item in value)
+    return sys.getsizeof(value)
+
+
+def _prune_document_cache(cache, now, expiry):
+    for key in list(cache):
+        if expiry(cache[key]) <= now:
+            del cache[key]
+    while cache and (len(cache) > CACHE_MAX_ENTRIES or _cache_size(cache) > CACHE_MAX_BYTES):
+        del cache[next(iter(cache))]
+
+
+def _preview_cache_prune(now):
+    _prune_document_cache(_manuscript_cache, now, lambda value: value["expires_at"])
+
+
+def _outline_cache_prune(now):
+    _prune_document_cache(_outline_cache, now, lambda value: value[0] + OUTLINE_CACHE_SECONDS)
+
+
 @app.get(
     "/api/scans/{scan_id}/manuscript",
     response_model=None,
@@ -1529,6 +1560,7 @@ async def get_manuscript_preview(
         )
         
     now = time.time()
+    _preview_cache_prune(now)
     if not nocache and scan_id in _manuscript_cache:
         cached = _manuscript_cache[scan_id]
         if now < cached["expires_at"]:
@@ -1579,15 +1611,14 @@ async def get_manuscript_preview(
         
     processed_text = DocumentIngestionService.strip_document_noise(raw_text.lstrip("\ufeff"))
     
-    if len(_manuscript_cache) >= 100:
-        oldest_key = min(_manuscript_cache.keys(), key=lambda k: _manuscript_cache[k]["expires_at"])
-        del _manuscript_cache[oldest_key]
-        
+    _preview_cache_prune(now)
+    _manuscript_cache.pop(scan_id, None)
     _manuscript_cache[scan_id] = {
         "text": processed_text,
         "expires_at": now + 600,
         "fetched_at": now
     }
+    _preview_cache_prune(now)
     
     return {
         "available": True,
@@ -1911,6 +1942,7 @@ async def manuscript_outline(
         raw_text = await DocumentIngestionService.extract_plaintext_from_upload(data, file.filename or "uploaded.docx")
     elif doc_url and doc_url.startswith("http"):
         # The same link is often asked about twice (when it is pasted and again on the confirm step): remember it briefly.
+        _outline_cache_prune(time.time())
         cached = _outline_cache.get(doc_url)
         if cached and time.time() - cached[0] < OUTLINE_CACHE_SECONDS:
             return cached[1]
@@ -1941,9 +1973,11 @@ async def manuscript_outline(
     response.looks_like_paper = paper["ok"]
     response.paper_problem = None if paper["ok"] else NOT_A_PAPER_MESSAGE
     if file is None and doc_url:
-        _outline_cache[doc_url] = (time.time(), response)
-        for key in [key for key, (saved, _) in _outline_cache.items() if time.time() - saved > OUTLINE_CACHE_SECONDS]:
-            _outline_cache.pop(key, None)
+        now = time.time()
+        _outline_cache_prune(now)
+        _outline_cache.pop(doc_url, None)
+        _outline_cache[doc_url] = (now, response)
+        _outline_cache_prune(now)
     return response
 
 
