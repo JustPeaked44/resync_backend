@@ -9,7 +9,8 @@ from typing import Any, Dict, Optional
 
 from services.reference_parser import extract_intext_citations
 
-MIN_WORDS = 600
+MIN_WORDS = 200          # below this there is nothing to compare
+SHORT_PAPER_WORDS = 600  # a short paper must show the full set of paper headings to count
 # Roles that only a research paper's headings map to. "body" and the synthetic "part N of M" splits do not count.
 _ACADEMIC_ROLES = {"abstract", "introduction", "objectives", "literature", "methodology", "results", "discussion",
                    "conclusion", "references", "limitations", "future_work"}
@@ -38,6 +39,8 @@ def check_research_paper(raw_text: str, parse_result: Optional[Dict[str, Any]], 
     signals = {"words": words, "academic_roles": sorted(academic), "citations": citations, "vocabulary": round(vocabulary, 4)}
 
     if words < MIN_WORDS:
+        return {"ok": False, "reason": "too_short", **signals}
+    if words < SHORT_PAPER_WORDS and len(academic) < 4:
         return {"ok": False, "reason": "too_short", **signals}
     needed = 2 if has_template else 3
     structured = len(academic) >= needed or (len(academic) >= 2 and (citations >= 3 or has_references))

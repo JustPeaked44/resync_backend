@@ -293,7 +293,7 @@ async def analyze_v7(req: V7AnalyzeRequest, user_id: str = Depends(get_authentic
 async def test_ingestion(doc_url: str = Query(..., description="Public Google Docs Link")):
     """Endpoint to test Google Docs text extraction."""
     _require_test_endpoints_enabled()
-    extracted_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
+    extracted_text = await google_doc_text(doc_url)
     return {
         "status": "success",
         "doc_url": doc_url,
@@ -328,7 +328,7 @@ async def test_parser(
     """
     _require_test_endpoints_enabled()
     from services.parser import ManuscriptParserService
-    raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
+    raw_text = await google_doc_text(doc_url)
     parse_result = ManuscriptParserService.parse_manuscript_sections(raw_text, template_toc)
     
     return {
@@ -633,7 +633,7 @@ async def _execute_scan_pipeline(
         fname = filename or req.filename or req.doc_url or "document.docx"
         raw_text: str = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname)
     elif req.doc_url and ("docs.google.com" in req.doc_url or req.doc_url.startswith("http")):
-        raw_text = await DocumentIngestionService.fetch_plaintext_from_gdoc(req.doc_url)
+        raw_text = await google_doc_text(req.doc_url)
         # The link had to be fetched, but if its text is unchanged it can still skip the parser.
         content_hash = SectionCache.content_hash(raw_text, req.template_toc)
         found = await SectionCache.find(req.user_id, content_hash)
@@ -1679,7 +1679,7 @@ async def manuscript_outline(
         if cached and time.time() - cached[0] < OUTLINE_CACHE_SECONDS:
             return cached[1]
         try:
-            raw_text = await asyncio.wait_for(DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url), timeout=OUTLINE_FETCH_SECONDS)
+            raw_text = await asyncio.wait_for(google_doc_text(doc_url), timeout=OUTLINE_FETCH_SECONDS)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                                 detail="Google Docs is taking too long to answer. Try again, or run the scan without a preview.")
@@ -1712,6 +1712,7 @@ async def manuscript_outline(
 
 
 GDOC_DOCX_CACHE_SECONDS = 300
+GDOC_MAX_DOWNLOAD = 120 * 1024 * 1024
 _gdoc_docx_cache: Dict[str, Any] = {}
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 # A 1x1 transparent PNG that stands in for every picture.
@@ -1743,6 +1744,72 @@ def slim_docx_bytes(data: bytes) -> bytes:
         return data
 
 
+async def download_google_docx(doc_id: str):
+    """(docx bytes, file name) of a public Google Doc, pictures removed. Raises HTTPException with a plain message."""
+    import httpx
+    from urllib.parse import unquote
+    cached = _gdoc_docx_cache.get(doc_id)
+    if cached and time.time() - cached[0] < GDOC_DOCX_CACHE_SECONDS:
+        return cached[1], cached[2]
+    export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    raw = bytearray()
+    too_big = False
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(90.0, connect=15.0), headers=headers) as client:
+            async with client.stream("GET", export_url) as response:
+                code, content_type = response.status_code, response.headers.get("content-type", "")
+                disposition = response.headers.get("content-disposition", "")
+                if code == 200 and "html" not in content_type:
+                    # Read in pieces: a Google Doc full of pictures can be far bigger than the 25 MB limit, and the
+                    # pictures are removed below, so only a truly huge download is refused.
+                    async for chunk in response.aiter_bytes(1 << 20):
+                        raw.extend(chunk)
+                        if len(raw) > GDOC_MAX_DOWNLOAD:
+                            too_big = True
+                            break
+    except httpx.HTTPError as exc:
+        logger.error("Google Doc download failed for %s: %s", doc_id, exc)
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
+    if code == 404:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google Doc not found. Please verify the document URL exists.")
+    if code != 200 or "html" in content_type or not raw.startswith(b"PK"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
+    if too_big:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is too large to open (over 120 MB).")
+    data = await asyncio.to_thread(slim_docx_bytes, bytes(raw))
+    del raw
+    if len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB even without its pictures.")
+    match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", disposition)
+    filename = unquote(match.group(1) or match.group(2)) if match else "Google Doc.docx"
+    if not filename.lower().endswith(".docx"):
+        filename += ".docx"
+    _gdoc_docx_cache[doc_id] = (time.time(), data, filename)
+    for key in [key for key, entry in _gdoc_docx_cache.items() if time.time() - entry[0] > GDOC_DOCX_CACHE_SECONDS][:20]:
+        _gdoc_docx_cache.pop(key, None)
+    while len(_gdoc_docx_cache) > 8:
+        _gdoc_docx_cache.pop(next(iter(_gdoc_docx_cache)), None)
+    return data, filename
+
+
+async def google_doc_text(doc_url: str) -> str:
+    """The text of a Google Doc, read the way an uploaded Word file is read (the same export, the same parsing), so a link
+    and an upload of the same paper give the same sections and the same score. Only if that export cannot be had does it
+    fall back to Google's plain-text export."""
+    try:
+        if os.getenv("GDOC_AS_DOCX", "on").strip().lower() in ("off", "false", "0", "no"):
+            raise RuntimeError("switched off")
+        data, filename = await download_google_docx(DocumentIngestionService.extract_google_doc_id(doc_url))
+        text = await DocumentIngestionService.extract_plaintext_from_upload(data, filename)
+        if text and text.strip():
+            return text
+    except Exception as error:
+        logger.warning("Google Doc %s could not be read as a Word file (%s); using its text export", doc_url[:60], error)
+    return await DocumentIngestionService.fetch_plaintext_from_gdoc(doc_url)
+
+
 @app.post(
     "/api/manuscripts/google-docx",
     summary="Download a public Google Doc as a Word file",
@@ -1756,41 +1823,9 @@ async def google_doc_as_docx(
     doc_url: str = Form(...),
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ):
-    import httpx
     from fastapi.responses import Response
-    from urllib.parse import unquote
-    doc_id = DocumentIngestionService.extract_google_doc_id(doc_url)
-    cached = _gdoc_docx_cache.get(doc_id)
-    if cached and time.time() - cached[0] < GDOC_DOCX_CACHE_SECONDS:
-        data, filename = cached[1], cached[2]
-    else:
-        export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=40.0, headers=headers) as client:
-                response = await client.get(export_url)
-        except httpx.HTTPError as exc:
-            logger.error("Google Doc download failed for %s: %s", doc_id, exc)
-            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
-        if response.status_code == 404:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google Doc not found. Please verify the document URL exists.")
-        content_type = response.headers.get("content-type", "")
-        if response.status_code != 200 or "html" in content_type or not response.content.startswith(b"PK"):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
-        if len(response.content) > 25 * 1024 * 1024:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB.")
-        data = slim_docx_bytes(response.content)
-        match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", response.headers.get("content-disposition", ""))
-        filename = unquote(match.group(1) or match.group(2)) if match else "Google Doc.docx"
-        if not filename.lower().endswith(".docx"):
-            filename += ".docx"
-        _gdoc_docx_cache[doc_id] = (time.time(), data, filename)
-        for key in [key for key, entry in _gdoc_docx_cache.items() if time.time() - entry[0] > GDOC_DOCX_CACHE_SECONDS][:20]:
-            _gdoc_docx_cache.pop(key, None)
-        while len(_gdoc_docx_cache) > 8:
-            _gdoc_docx_cache.pop(next(iter(_gdoc_docx_cache)), None)
     from urllib.parse import quote
+    data, filename = await download_google_docx(DocumentIngestionService.extract_google_doc_id(doc_url))
     return Response(content=data, media_type=DOCX_MEDIA_TYPE,
                     headers={"X-Doc-Filename": quote(filename), "Access-Control-Expose-Headers": "X-Doc-Filename"})
 

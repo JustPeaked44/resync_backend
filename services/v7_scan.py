@@ -456,6 +456,9 @@ async def explain_flow(sections, flow, roles=None):
         decided = [pair for pair in to_explain if pair["explanation"] and (pair in to_review or pair in loose)]
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
         apply_figure_conflicts(flow, sections)
+        # The pair review sees where sections meet; this reads every section in full and compares all of it (full_check).
+        from services.full_check import apply_full_check
+        await apply_full_check(flow, sections, roles)
         for pair in flow:
             overall = pair["scores"]["overall_coherence"]
             if overall is None:
