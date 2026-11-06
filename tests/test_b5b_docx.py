@@ -66,3 +66,27 @@ def test_picture_heavy_docx_matches_old_output():
     assert len(data) >= 20_000_000
     actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
     assert actual == old_output(data)
+
+
+def test_docx_without_tables_matches_old_output():
+    doc = Document()
+    doc.add_heading("Title", 1)
+    doc.add_paragraph("List item", style="List Number")
+    doc.add_paragraph("Text with\ttabs and\nline breaks.")
+    out = io.BytesIO()
+    doc.save(out)
+    data = out.getvalue()
+    actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
+    assert actual == old_output(data)
+
+
+def test_docx_above_character_cap_is_refused():
+    from fastapi import HTTPException
+    import pytest
+    doc = Document()
+    doc.add_paragraph("x" * 500_001)
+    out = io.BytesIO()
+    doc.save(out)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx"))
+    assert error.value.status_code == 413
