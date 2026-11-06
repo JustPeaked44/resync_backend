@@ -36,6 +36,7 @@ from services.v7_scan import (comparable_sections, merge_repeated_sections, asse
                               four_part_score, manuscript_score, band, MIN_SECTION_WORDS)
 from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
+from services.gemini import scan_user
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
 
@@ -893,6 +894,7 @@ async def _run_scan_job(
     The FIFO worker owns SCAN_SLOT for this job.
     """
     scan_context.set(analysis_run_id)
+    scan_user.set(req.user_id)
     try:
         result = await _execute_scan_pipeline(
             req, analysis_run_id, manuscript_id, credits_remaining,

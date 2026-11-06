@@ -355,7 +355,7 @@ def apply_figure_conflicts(flow, sections):
 async def explain_flow(sections, flow, roles=None, full_check_task=None):
     from services import gemini
     from services.v7_explain import (FLOW_SUGGESTION_BELOW, explain_batch, explain_pair, explain_summary, pair_cache_key,
-                                     suggest_bridges_batch)
+                                     suggest_bridges_batch, valid_cached_explanation)
     from services.verdict_cache import VerdictCache
 
     from services import full_check
@@ -417,8 +417,9 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
                                            sections[pair["index_b"]]["text"], scores_of(pair), pair["adjacent"]) for pair in to_explain}
     remembered = await VerdictCache.get_many(keys.values())
     for pair in to_explain:
-        if keys[pair["order"]] in remembered:
-            pair["explanation"] = remembered[keys[pair["order"]]]
+        cached = remembered.get(keys[pair["order"]])
+        if valid_cached_explanation(cached, (pair["section_a"], pair["section_b"])):
+            pair["explanation"] = cached
     to_review = [pair for pair in to_explain if pair["explanation"] is None]
     batches = severity_batches(to_review)
     gemini.expect_calls(len(batches) + 1)  # one call per severity group plus the summary, so scan polls can say when the AI is busy
@@ -550,8 +551,8 @@ def flatten_explanations(flow, sections=None):
                                     "section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
                                     "original_sentence": item["original_sentence"],
                                     "issue": item.get("issue", ""),
-                                    "kind": item.get("kind", "edit"),
-                                    **({"placement": item["placement"]} if item.get("placement") else {}),
+                                    "kind": item.get("kind") if item.get("kind") in ("edit", "add") else "edit",
+                                    **({"placement": item["placement"]} if item.get("placement") in ("start", "end") else {}),
                                     "section": item["section"],
                                     "category": item.get("category") if item.get("category") in ("objectives", "methodology", "claims", "numeric") else fallback_category,
                                     "recommended_revision": revision, "recommendation_text": revision,

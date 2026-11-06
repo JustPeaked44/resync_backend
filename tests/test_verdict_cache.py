@@ -5,9 +5,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from services import v7_explain, v7_scan, verdict_cache
+from services import gemini, v7_explain, v7_scan, verdict_cache
 from services.v7_scan import assemble_flow, explain_flow, manuscript_score
 from services.verdict_cache import VerdictCache
+
+
+@pytest.fixture(autouse=True)
+def cache_user():
+    token = gemini.scan_user.set("user-one")
+    yield
+    gemini.scan_user.reset(token)
 
 
 @pytest.fixture
@@ -118,7 +125,7 @@ def ai(monkeypatch, on):
     async def batch(items):
         asked.append(sorted(item["id"] for item in items))
         return {item["id"]: verdict("Moderate" if "bad" in item["text_a"] + item["text_b"] else "None",
-                                    bridges=[{"section": "x", "placement": "end", "sentence": "x"}] * 2) for item in items}
+                                    bridges=[{"section": item["role_a"], "placement": "end", "sentence": "x"}] * 2) for item in items}
 
     async def none(*_, **__):
         return {}
@@ -207,7 +214,7 @@ def test_a_contradiction_only_counts_when_a_second_review_agrees(monkeypatch, ai
         calls["n"] += 1
         first_look = calls["n"] <= 3                            # the three severity groups; later calls are second looks
         return {item["id"]: verdict("Moderate" if first_look or item["id"] == 2 else "None",
-                                    bridges=[{"section": "x", "placement": "end", "sentence": "x"}] * 2) for item in items}
+                                    bridges=[{"section": item["role_a"], "placement": "end", "sentence": "x"}] * 2) for item in items}
 
     monkeypatch.setattr(v7_explain, "explain_batch", flips)
     asyncio.run(explain_flow(sections, flow))
@@ -246,3 +253,101 @@ def test_pairs_missing_linking_sentences_are_asked_again_until_they_have_both(mo
     asyncio.run(explain_flow(sections, flow))
     assert rounds == [[1, 2], [1, 2], [2]]                     # each round asks only for the pairs still short
     assert [len(p["explanation"]["bridges"]) for p in flow[:2]] == [2, 2]
+
+
+def test_user_scoped_keys_and_cache_layers(monkeypatch, on):
+    client = FakeClient()
+    monkeypatch.setattr(verdict_cache.DatabasePersistenceService, "get_client", lambda: client)
+    key_a = v7_explain.pair_cache_key("A", "same", "B", "same", {"overall_coherence": .5, "objectives_alignment": .5, "methodology_fit": .5, "numeric_consistency": .5, "claim_support": .5}, True)
+    asyncio.run(VerdictCache.save_many({key_a: verdict()}))
+    gemini.scan_user.set("user-two")
+    key_b = v7_explain.pair_cache_key("A", "same", "B", "same", {"overall_coherence": .5, "objectives_alignment": .5, "methodology_fit": .5, "numeric_consistency": .5, "claim_support": .5}, True)
+    assert key_a != key_b and len(key_a) == 64 and "user-one" not in key_a
+    assert asyncio.run(VerdictCache.get_many([key_b])) == {}
+    VerdictCache.forget_everything_in_memory()
+    assert asyncio.run(VerdictCache.get_many([key_b])) == {}
+    gemini.scan_user.set("user-one")
+    assert asyncio.run(VerdictCache.get_many([key_a]))[key_a] == verdict()
+    monkeypatch.setattr(verdict_cache, "KEY_VERSION", "next")
+    assert VerdictCache.fingerprint("same") != key_a
+
+
+def test_key_version_changes_fingerprint(monkeypatch):
+    before = VerdictCache.fingerprint("same")
+    monkeypatch.setattr(verdict_cache, "KEY_VERSION", "next")
+    assert VerdictCache.fingerprint("same") != before
+
+
+def test_unknown_user_never_reads_or_writes(monkeypatch, on):
+    client = FakeClient()
+    monkeypatch.setattr(verdict_cache.DatabasePersistenceService, "get_client", lambda: client)
+    asyncio.run(VerdictCache.save_many({"key": verdict()}))
+    gemini.scan_user.set(None)
+    assert asyncio.run(VerdictCache.get_many(["key"])) == {}
+    asyncio.run(VerdictCache.save_many({"other": verdict()}))
+    assert len(client.rows) == 1 and "other" not in verdict_cache._memory
+
+
+@pytest.mark.parametrize("mutation", ["kind", "placement", "category", "recommendations", "section", "severity"])
+def test_invalid_cached_verdict_is_recomputed_and_overwritten(monkeypatch, ai, mutation):
+    texts = ["alpha words here", "beta words here", "gamma words here", "delta words here"]
+    sections, flow = paper(texts)
+    asyncio.run(explain_flow(sections, flow))
+    key = next(iter(verdict_cache._memory))
+    bad = verdict("Minor", recommendations=[{"section": "A", "original_sentence": "alpha", "issue": "issue", "recommended_revision": "revision"}])
+    if mutation == "recommendations":
+        bad["recommendations"] = None
+    elif mutation == "severity":
+        bad["severity"] = "surprise"
+    elif mutation == "section":
+        del bad["recommendations"][0]["section"]
+    else:
+        bad["recommendations"][0][mutation] = {"kind": "surprise", "placement": "middle", "category": "evidence"}[mutation]
+    verdict_cache._memory[key] = bad
+    ai.asked.clear()
+    sections, flow = paper(texts)
+    findings, recommendations, _ = asyncio.run(explain_flow(sections, flow))
+    assert ai.asked and verdict_cache._memory[key] != bad
+    from main import RecommendationReport, InconsistencyReport
+    for item in recommendations:
+        RecommendationReport(**item)
+    for item in findings:
+        InconsistencyReport(**item)
+
+
+def test_flatten_normalizes_kind_and_placement():
+    sections, flow = paper(["alpha", "beta", "gamma", "delta"])
+    for pair in flow:
+        pair["explanation"] = verdict()
+    flow[0]["explanation"]["recommendations"] = [{"section": "A", "original_sentence": "alpha", "issue": "", "recommended_revision": "new", "kind": "surprise", "placement": "middle", "category": "evidence"}]
+    _, recommendations = v7_scan.flatten_explanations(flow, sections)
+    from main import RecommendationReport
+    result = RecommendationReport(**recommendations[0])
+    assert result.kind == "edit" and result.placement is None and result.category != "evidence"
+
+
+def test_unknown_user_recomputes_each_scan(ai):
+    gemini.scan_user.set(None)
+    texts = ["alpha words here", "beta words here", "gamma words here", "delta words here"]
+    sections, flow = paper(texts)
+    asyncio.run(explain_flow(sections, flow))
+    first = len(ai.asked)
+    sections, flow = paper(texts)
+    asyncio.run(explain_flow(sections, flow))
+    assert first and len(ai.asked) == first * 2
+    assert not verdict_cache._memory
+
+
+def test_invalid_database_entry_is_overwritten(monkeypatch, ai):
+    client = FakeClient()
+    monkeypatch.setattr(verdict_cache.DatabasePersistenceService, "get_client", lambda: client)
+    texts = ["alpha words here", "beta words here", "gamma words here", "delta words here"]
+    sections, flow = paper(texts)
+    asyncio.run(explain_flow(sections, flow))
+    client.rows[0]["explanation"]["severity"] = "surprise"
+    key = client.rows[0]["cache_key"]
+    VerdictCache.forget_everything_in_memory()
+    ai.asked.clear()
+    sections, flow = paper(texts)
+    asyncio.run(explain_flow(sections, flow))
+    assert ai.asked and next(row for row in client.rows if row["cache_key"] == key)["explanation"]["severity"] == "None"
