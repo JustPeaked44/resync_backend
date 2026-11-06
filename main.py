@@ -1103,7 +1103,7 @@ async def run_scan(
     of a silent timeout."""
     _assert_owner(authenticated_user_id, req.user_id)
     _check_base64_size(req)
-    reservation = _reserve_scan(req.user_id, 0, queued=False)
+    reservation = _reserve_scan(req.user_id, len(req.file_content_base64 or ""))
     try:
         analysis_run_id, manuscript_id, credits_remaining = await _provision_analysis_run(req)
         _active_scans.add(analysis_run_id)
@@ -1121,6 +1121,8 @@ async def run_scan(
             await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
             _active_scans.discard(analysis_run_id)
             raise
+        _scan_reservations[reservation]["queued"] = False
+        _scan_reservations[reservation]["bytes"] = 0
         _log_scan_memory(analysis_run_id, "start")
         scan_context.set(analysis_run_id)
         scan_user.set(req.user_id)
@@ -1332,7 +1334,7 @@ async def upload_and_run_scan(
         style_reference_url=style_reference_url,
     )
 
-    reservation = _reserve_scan(req.user_id, 0, queued=False)
+    reservation = _reserve_scan(req.user_id, len(file_bytes))
     try:
         analysis_run_id, resolved_manuscript_id, credits_remaining = await _provision_analysis_run(
             req, default_source_name=file.filename
@@ -1352,6 +1354,8 @@ async def upload_and_run_scan(
             await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
             _active_scans.discard(analysis_run_id)
             raise
+        _scan_reservations[reservation]["queued"] = False
+        _scan_reservations[reservation]["bytes"] = 0
         _log_scan_memory(analysis_run_id, "start")
         scan_context.set(analysis_run_id)
         scan_user.set(req.user_id)
