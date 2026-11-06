@@ -121,6 +121,20 @@ def test_element_stream_stops_early_on_oversized_text():
     assert stream.tell() < len(xml)
 
 
+def test_table_stream_stops_early_on_oversized_text():
+    import pytest
+    from fastapi import HTTPException
+    from services.ingestion import _check_element_text, DOCX_COMPLEX_MESSAGE
+    xml = (b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           b'<w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>' + b'x' * 600_000
+           + b'</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>' + b' ' * 200_000)
+    stream = io.BytesIO(xml)
+    with pytest.raises(HTTPException) as error:
+        _check_element_text(stream)
+    assert (error.value.status_code, error.value.detail) == (413, DOCX_COMPLEX_MESSAGE)
+    assert stream.tell() < len(xml)
+
+
 def test_bytearray_input_is_viewed_without_full_copy(monkeypatch):
     import services.ingestion as ingestion
     data = bytearray(make_document())
