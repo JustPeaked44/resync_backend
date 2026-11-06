@@ -143,3 +143,17 @@ def test_a_google_link_falls_back_to_the_text_export(monkeypatch):
     monkeypatch.setattr(main, "download_google_docx", download)
     monkeypatch.setattr(main.DocumentIngestionService, "fetch_plaintext_from_gdoc", staticmethod(plain))
     assert asyncio.run(main.google_doc_text("https://docs.google.com/document/d/abcDEF123456/edit")) == "Introduction" + chr(10) + "Fallback text."
+
+
+def test_google_download_stops_at_stream_limit(monkeypatch):
+    class LimitedStream(_Stream):
+        async def aiter_bytes(self, size):
+            yield b"PK12"
+            yield b"3456"
+            pytest.fail("read beyond overflow")
+    monkeypatch.setattr(main, "GDOC_MAX_DOWNLOAD", 7)
+    _fake_google(monkeypatch, LimitedStream(200, {"content-type": "application/octet-stream"}, b""))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(main.download_google_docx("limit"))
+    assert error.value.status_code == 413
+    assert error.value.detail == "This Google Doc is too large to open (over 120 MB)."

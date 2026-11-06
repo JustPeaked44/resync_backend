@@ -2070,40 +2070,73 @@ def slim_docx_bytes(data: bytes) -> bytes:
         return data
 
 
+def _slim_download(source, size):
+    import shutil
+    import tempfile
+    import zipfile
+    if size < 1_000_000:
+        return None
+    try:
+        source.seek(0)
+        with zipfile.ZipFile(source) as archive:
+            if not any(item.filename.lower().startswith("word/media/") and not item.filename.endswith("/") for item in archive.infolist()):
+                return None
+            with tempfile.TemporaryFile() as output:
+                with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as target:
+                    for item in archive.infolist():
+                        if item.filename.lower().startswith("word/media/") and not item.filename.endswith("/"):
+                            target.writestr(item.filename, _PLACEHOLDER_PNG)
+                        else:
+                            with archive.open(item) as reader, target.open(item.filename, "w") as writer:
+                                shutil.copyfileobj(reader, writer, length=READ_CHUNK_BYTES)
+                length = output.tell()
+                if length >= size or length > MAX_UPLOAD_BYTES:
+                    return None
+                output.seek(0)
+                return output.read()
+    except Exception as exc:
+        logger.warning("Could not shrink the Google Doc download: %s", exc)
+        return None
+
+
 async def download_google_docx(doc_id: str):
-    """(docx bytes, file name) of a public Google Doc, pictures removed. Raises HTTPException with a plain message."""
+    """Download a public Google Doc with bounded temporary storage."""
     import httpx
+    import tempfile
     from urllib.parse import unquote
     cached = _gdoc_docx_cache.get(doc_id)
     if cached and time.time() - cached[0] < GDOC_DOCX_CACHE_SECONDS:
         return cached[1], cached[2]
     export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    raw = bytearray()
-    too_big = False
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(90.0, connect=15.0), headers=headers) as client:
-            async with client.stream("GET", export_url) as response:
-                code, content_type = response.status_code, response.headers.get("content-type", "")
-                disposition = response.headers.get("content-disposition", "")
-                if code == 200 and "html" not in content_type:
-                    # Read in pieces: a Google Doc full of pictures can be far bigger than the 25 MB limit, and the
-                    # pictures are removed below, so only a truly huge download is refused.
-                    raw = await bounded_download(response, GDOC_MAX_DOWNLOAD)
-    except httpx.HTTPError as exc:
-        logger.error("Google Doc download failed for %s: %s", doc_id, exc)
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
-    if code == 404:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google Doc not found. Please verify the document URL exists.")
-    if code != 200 or "html" in content_type or not raw.startswith(b"PK"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
-    if too_big:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is too large to open (over 120 MB).")
-    data = await asyncio.to_thread(slim_docx_bytes, raw)
-    del raw
-    if len(data) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB even without its pictures.")
+    with tempfile.TemporaryFile() as raw:
+        size = 0
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(90.0, connect=15.0), headers=headers) as client:
+                async with client.stream("GET", export_url) as response:
+                    code, content_type = response.status_code, response.headers.get("content-type", "")
+                    disposition = response.headers.get("content-disposition", "")
+                    if code == 200 and "html" not in content_type:
+                        async for chunk in response.aiter_bytes(READ_CHUNK_BYTES):
+                            size += len(chunk)
+                            if size > GDOC_MAX_DOWNLOAD:
+                                raise HTTPException(status_code=413, detail="This Google Doc is too large to open (over 120 MB).")
+                            raw.write(chunk)
+        except httpx.HTTPError as exc:
+            logger.error("Google Doc download failed for %s: %s", doc_id, exc)
+            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Google Docs is taking too long to answer. Try again in a moment.")
+        if code == 404:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Google Doc not found. Please verify the document URL exists.")
+        raw.seek(0)
+        if code != 200 or "html" in content_type or raw.read(2) != b"PK":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="Unable to open the document. Make sure sharing is set to 'Anyone with the link can view'.")
+        data = await asyncio.to_thread(_slim_download, raw, size)
+        if data is None:
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="This Google Doc is larger than 25 MB even without its pictures.")
+            raw.seek(0)
+            data = raw.read()
     match = re.search(r"filename\*=UTF-8''([^;]+)|filename=\"([^\"]+)\"", disposition)
     filename = unquote(match.group(1) or match.group(2)) if match else "Google Doc.docx"
     if not filename.lower().endswith(".docx"):
