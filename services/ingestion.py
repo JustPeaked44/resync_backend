@@ -296,15 +296,19 @@ class DocumentIngestionService:
                 )
 
     @classmethod
-    async def extract_plaintext_from_upload(cls, file_bytes: bytes, filename: str) -> str:
+    async def extract_plaintext_from_upload(cls, file_bytes: bytes, filename: str, include_metadata=False):
         """
         Extracts plaintext from an uploaded .pdf or .docx file.
         """
         filename_lower = filename.lower()
         
         try:
+            records = None
             if filename_lower.endswith(".docx"):
-                raw_text = extract_docx_text(file_bytes)
+                if include_metadata:
+                    raw_text, records = extract_docx_with_metadata(file_bytes)
+                else:
+                    raw_text = extract_docx_text(file_bytes)
             elif filename_lower.endswith(".pdf"):
                 import pypdf
                 pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
@@ -328,7 +332,8 @@ class DocumentIngestionService:
                 
             # Clean non-text noise
             cleaned_text = cls.strip_document_noise(raw_text)
-            return cls.enforce_size_limits(cleaned_text)
+            cleaned_text = cls.enforce_size_limits(cleaned_text)
+            return (cleaned_text, records) if include_metadata else cleaned_text
         except HTTPException:
             raise
         except Exception as exc:

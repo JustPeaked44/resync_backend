@@ -53,9 +53,9 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
                 return SimpleNamespace(data=[{}])
             return SimpleNamespace(data={})
 
-    async def ingest(*_):
+    async def ingest(*_, **kwargs):
         captured["ingested"] += 1
-        return "raw manuscript"
+        return ("raw manuscript", None) if kwargs.get("include_metadata") else "raw manuscript"
 
     def parse(*_):
         captured["parsed"] += 1

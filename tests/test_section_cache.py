@@ -88,6 +88,17 @@ def test_a_saved_parse_is_found_again_for_the_same_user_and_file(database):
     assert asyncio.run(SectionCache.find(USER, SectionCache.content_hash(b"changed thesis"))) is None
 
 
+def test_preview_metadata_round_trips_and_old_rows_still_load(database):
+    parsed = dict(PARSE, display_names={"introduction": "Introduction"}, section_blocks={"introduction": [
+        {"type": "table", "rows": [["one", ""]]}]})
+    asyncio.run(SectionCache.save(MS_ID, USER, "hash", parsed, "text"))
+    found = asyncio.run(SectionCache.find(USER, "hash"))["parse_result"]
+    assert found["display_names"] == parsed["display_names"]
+    assert found["section_blocks"] == parsed["section_blocks"]
+    database.rows[0]["parsed"] = dict(PARSE)
+    assert asyncio.run(SectionCache.find(USER, "hash"))["parse_result"]["parsed_sections"] == PARSE["parsed_sections"]
+
+
 def test_saving_the_same_manuscript_twice_keeps_one_row_and_a_rescan_gets_its_own_row(database):
     digest = SectionCache.content_hash(b"my thesis")
     asyncio.run(SectionCache.save(MS_ID, USER, digest, PARSE, "text"))

@@ -745,13 +745,14 @@ async def _execute_scan_pipeline(
     content_hash = SectionCache.content_hash(payload, req.template_toc) if payload else None
     cached = await SectionCache.find(req.user_id, content_hash) if content_hash else None
     parse_result: Optional[Dict[str, Any]] = None
+    source_records = None
     found = None
     if cached:
         raw_text, parse_result = cached["raw_text"], cached["parse_result"]
         logger.info("Scan %s reused the saved sections of manuscript %s", analysis_run_id, cached["manuscript_id"])
     elif payload:
         fname = filename or req.filename or req.doc_url or "document.docx"
-        raw_text: str = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname)
+        raw_text, source_records = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname, include_metadata=True)
     elif req.doc_url and ("docs.google.com" in req.doc_url or req.doc_url.startswith("http")):
         raw_text = await google_doc_text(req.doc_url)
         # The link had to be fetched, but if its text is unchanged it can still skip the parser.
@@ -777,7 +778,7 @@ async def _execute_scan_pipeline(
     # block the event loop, stalling concurrent status-poll requests.
     if parse_result is None:
         parse_result = await asyncio.to_thread(
-            ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc
+            ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc, source_records
         )
     paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
     if not paper["ok"]:

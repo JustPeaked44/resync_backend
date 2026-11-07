@@ -131,6 +131,27 @@ def test_docx_metadata_keeps_source_cells_without_changing_text():
     assert records[0]["cells"] is None
 
 
+def test_parser_retains_tables_and_original_headings():
+    from services.parser import ManuscriptParserService
+
+    doc = Document()
+    for heading in ("Introduction", "Methodology", "Results"):
+        doc.add_heading(heading, 1)
+        doc.add_paragraph("This section has enough words to be considered useful.")
+        table = doc.add_table(rows=1, cols=3)
+        table.cell(0, 0).text = heading + " cell"
+        table.cell(0, 2).text = "end"
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx", include_metadata=True))
+    result = ManuscriptParserService.parse_manuscript_sections(text, None, records)
+    assert result["display_names"]["introduction"] == "Introduction"
+    assert result["section_blocks"]["introduction"][1]["rows"] == [["Introduction cell", "", "end"]]
+    assert result["section_blocks"]["results"][1]["rows"] == [["Results cell", "", "end"]]
+    template = ManuscriptParserService.parse_manuscript_sections(text, ["INTRODUCTION", "Methodology", "Results"], records)
+    assert template["display_names"]["INTRODUCTION"] == "INTRODUCTION"
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest

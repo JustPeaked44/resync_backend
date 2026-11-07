@@ -161,7 +161,8 @@ class ManuscriptParserService:
     def parse_manuscript_sections(
         cls,
         text: str,
-        template_toc: List[str] = None
+        template_toc: List[str] = None,
+        source_records: List[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Segments raw manuscript text into structured section blocks.
@@ -188,6 +189,77 @@ class ManuscriptParserService:
             "section_roles", "auto_detected", "detection_confidence",
             "section_order".
         """
+        result = cls._parse_manuscript_sections(text, template_toc)
+        if source_records:
+            cls._attach_preview(result, source_records, template_toc is not None)
+        return result
+
+    @classmethod
+    def _attach_preview(cls, result, records, has_template):
+        """Align source records with parsed body lines; omit blocks when alignment is uncertain."""
+        from services.ingestion import DocumentIngestionService
+
+        lines = []
+        for record in records:
+            cleaned = DocumentIngestionService.strip_document_noise(record["text"])
+            for index, line in enumerate(cleaned.splitlines()):
+                if line.strip():
+                    lines.append((line.strip(), record if index == 0 else None))
+        joined = "\n" + "\n".join(line for line, _ in lines) + "\n"
+        offsets, offset = {}, 0
+        for index, (line, _) in enumerate(lines):
+            offsets[offset] = index
+            offset += len(line) + 1
+        line_offsets = list(offsets)
+        cursor = 0
+        display_names, blocks_by_section = {}, {}
+        prefix = re.compile(r"(?i)^(chapter\s+[ivxlcdm\d]+[\:\.-]?|section\s+[\d\.]+|[\d\.]+)\s*")
+        for name in result.get("section_order", []):
+            body = result["parsed_sections"].get(name, "")
+            body_lines = [line.strip() for line in body.splitlines() if line.strip()]
+            if not body_lines:
+                continue
+            # Sections containing skipped lines or artificial split fragments are left unstructured.
+            position = joined.find("\n" + "\n".join(body_lines) + "\n", line_offsets[cursor]) if cursor < len(lines) else -1
+            start = offsets.get(position)
+            if start is None:
+                continue
+            display = name
+            if not has_template:
+                base = re.sub(r" \(\d+\)$", "", name).lower()
+                for heading, record in reversed(lines[cursor:start]):
+                    if record and record.get("cells") is None and prefix.sub("", heading).strip().lower() == base:
+                        display = heading
+                        break
+            display_names[name] = display
+            selected = lines[start:start + len(body_lines)]
+            cursor = start + len(body_lines)
+            if not any(record and record.get("cells") is not None for _, record in selected):
+                continue
+            blocks = []
+            table_id = None
+            for line, record in selected:
+                if record and record.get("cells") is not None:
+                    if not blocks or table_id != record["table"]:
+                        blocks.append({"type": "table", "rows": []})
+                    blocks[-1]["rows"].append(record["cells"])
+                    table_id = record["table"]
+                elif record is None:
+                    if blocks and blocks[-1]["type"] == "paragraph":
+                        blocks[-1]["text"] += "\n" + line
+                    continue
+                else:
+                    table_id = None
+                    if blocks and blocks[-1]["type"] == "paragraph":
+                        blocks[-1]["text"] += "\n" + line
+                    else:
+                        blocks.append({"type": "paragraph", "text": line})
+            blocks_by_section[name] = blocks
+        result["display_names"] = display_names
+        result["section_blocks"] = blocks_by_section
+
+    @classmethod
+    def _parse_manuscript_sections(cls, text, template_toc=None):
         # Remember whether the caller omitted the TOC entirely, before the
         # junk-filtering step below reassigns template_toc. Only a genuine
         # omission routes to auto-detection; a TOC that filters down to

@@ -19,9 +19,9 @@ logger = logging.getLogger("resync.section_cache")
 
 TABLE = "manuscript_section_cache"
 # Bump this when the parser changes what it finds, so rows saved by the old parser stop matching.
-CACHE_VERSION = "1"
+CACHE_VERSION = "2"
 # Only these parts of a parse result are kept; they are everything a scan reads from it.
-PARSE_KEYS = ("parsed_sections", "section_order", "section_roles", "structure")
+PARSE_KEYS = ("parsed_sections", "section_order", "section_roles", "structure", "display_names", "section_blocks")
 
 _pending: set = set()   # background saves, kept referenced until they finish
 
