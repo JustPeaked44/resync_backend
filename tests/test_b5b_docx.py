@@ -185,6 +185,20 @@ def test_preview_alignment_handles_skipped_table_of_contents_lines():
     assert result["section_blocks"]["Introduction"][1]["rows"] == [["cell a", "cell b"]]
 
 
+def test_ambiguous_repeated_section_uses_text_fallback():
+    from services.parser import ManuscriptParserService
+    repeated = "same content " * 15
+    doc = Document()
+    doc.add_paragraph(repeated)
+    doc.add_heading("Introduction", 1)
+    doc.add_table(rows=1, cols=1).cell(0, 0).text = repeated
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx", include_metadata=True))
+    result = ManuscriptParserService.parse_manuscript_sections(text, ["Introduction"], records)
+    assert result["section_blocks"] == {}
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest

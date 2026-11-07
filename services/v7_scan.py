@@ -176,7 +176,8 @@ def manuscript_preview_sections(sections, parse_result):
     result, total_bytes, budget_exhausted = [], 2 + 5 * len(sections), False
     for section in sections:
         name = section["name"]
-        parts = [key for key in order if re.sub(r" \(\d+\)$", "", key) == name]
+        base = re.sub(r" \(\d+\)$", "", name)
+        parts = [key for key in order if re.sub(r" \(\d+\)$", "", key) == base]
         preview = {**section, "display_name": names.get(name), "blocks": None}
         if not budget_exhausted and any(source_blocks.get(key) for key in parts):
             blocks, table_count, drop_tables = [], 0, False

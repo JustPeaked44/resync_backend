@@ -206,12 +206,23 @@ class ManuscriptParserService:
             for index, line in enumerate(cleaned.splitlines()):
                 if line.strip():
                     lines.append((line.strip(), record if index == 0 else None))
-        headings, positions = {}, {}
-        for index, (line, _) in enumerate(lines):
+        headings, positions, variants = {}, {}, {}
+        for index, (line, record) in enumerate(lines):
             headings.setdefault(line.casefold(), []).append(index)
             positions.setdefault(line, []).append(index)
+            cells = tuple(record["cells"]) if record and record.get("cells") is not None else None
+            variants.setdefault(line, []).append(cells)
+        ambiguous_suffix = {}
+        for line, values in variants.items():
+            seen = set()
+            flags = [False] * len(values)
+            for index in range(len(values) - 1, -1, -1):
+                if len(seen) < 2:
+                    seen.add(values[index])
+                flags[index] = len(seen) > 1
+            ambiguous_suffix[line] = flags
         cursor = 0
-        display_names, blocks_by_section = dict(result.get("display_names") or {}), {}
+        display_names, blocks_by_section, ambiguous_bases = dict(result.get("display_names") or {}), {}, set()
         for name in result.get("section_order", []):
             body = result["parsed_sections"].get(name, "")
             body_lines = [line.strip() for line in body.splitlines() if line.strip()]
@@ -222,11 +233,14 @@ class ManuscriptParserService:
             heading_index = bisect_left(matches, cursor)
             search_cursor = matches[heading_index] + 1 if heading_index < len(matches) else cursor
             selected_indices = []
+            ambiguous = False
             for body_line in body_lines:
                 candidates = positions.get(body_line, [])
                 found = bisect_left(candidates, search_cursor)
                 if found == len(candidates):
                     break
+                if ambiguous_suffix[body_line][found]:
+                    ambiguous = True
                 selected_indices.append(candidates[found])
                 search_cursor = candidates[found] + 1
             if len(selected_indices) != len(body_lines):
@@ -234,6 +248,9 @@ class ManuscriptParserService:
             display_names.setdefault(name, name)
             selected = [lines[index] for index in selected_indices]
             cursor = search_cursor
+            if ambiguous:
+                ambiguous_bases.add(re.sub(r" \(\d+\)$", "", name))
+                continue
             if not any(record and record.get("cells") is not None for _, record in selected):
                 continue
             blocks = []
@@ -255,6 +272,8 @@ class ManuscriptParserService:
                     else:
                         blocks.append({"type": "paragraph", "text": line})
             blocks_by_section[name] = blocks
+        blocks_by_section = {name: blocks for name, blocks in blocks_by_section.items()
+                             if re.sub(r" \(\d+\)$", "", name) not in ambiguous_bases}
         result["display_names"] = display_names
         result["section_blocks"] = blocks_by_section
 
