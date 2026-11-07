@@ -1577,6 +1577,8 @@ async def get_manuscript_preview(
     if result_json.get("manuscript_sections"):
         sections = locked_scan_view(result_json).get("manuscript_sections") or []
         return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
+    if not (result_json.get("access") or {}).get("unlocked"):
+        return {"available": False, "reason": "locked"}
     doc_url = result_json.get("doc_url")
     
     if not doc_url or "docs.google.com" not in doc_url:

@@ -164,3 +164,45 @@ def test_get_and_manuscript_routes_use_locked_view(monkeypatch):
     result.pop("access")
     result["doc_url"] = "legacy.docx"
     assert asyncio.run(main.get_manuscript_preview("run", authenticated_user_id="owner"))["text"] == "Visible first.\n\nSECRET SECOND."
+
+
+def test_blocks_are_withheld_in_serialized_locked_view():
+    result = {"access": {"unlocked": False}, "manuscript_sections": [
+        {"name": "First", "text": "Visible", "blocks": [{"type": "table", "rows": [["visible cell"]]}]},
+        {"name": "Second", "text": "secret paragraph", "display_name": "Second",
+         "blocks": [{"type": "paragraph", "text": "secret paragraph"},
+                    {"type": "table", "rows": [["secret cell"]]}]},
+        {"name": "Legacy", "text": "legacy secret"}],
+        "recommendations": [], "citations": [], "inconsistencies": [],
+        "ai_synthesis": {"summary": None}, "manuscript_flow": []}
+    locked = locked_scan_view(result)
+    raw = json.dumps(locked)
+    assert "visible cell" in raw
+    assert all(secret not in raw for secret in ("secret paragraph", "secret cell", "legacy secret"))
+    assert "blocks" not in locked["manuscript_sections"][1]
+    result["access"]["unlocked"] = True
+    assert "secret cell" in json.dumps(locked_scan_view(result))
+
+
+def test_legacy_google_preview_requires_owner_and_unlock_before_cache(monkeypatch):
+    result = {"access": {"unlocked": False}, "doc_url": "https://docs.google.com/document/d/example/edit"}
+
+    class DB:
+        def table(self, *_): return self
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def execute(self): return SimpleNamespace(data=[{"user_id": "owner", "result_json": result}])
+
+    monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
+    monkeypatch.setitem(main._manuscript_cache, "legacy-test", {
+        "text": "cached secret", "expires_at": main.time.time() + 60, "fetched_at": main.time.time()})
+    preview = lambda user: asyncio.run(main.get_manuscript_preview("legacy-test", authenticated_user_id=user))
+    assert preview("other") == {"available": False, "reason": "unreachable"}
+    assert preview("owner") == {"available": False, "reason": "locked"}
+    assert asyncio.run(main.get_manuscript_preview("legacy-test", nocache=True, authenticated_user_id="owner")) == {
+        "available": False, "reason": "locked"}
+    result.pop("access")
+    assert preview("owner") == {"available": False, "reason": "locked"}
+    result["access"] = {"unlocked": True}
+    assert preview("owner")["text"] == "cached secret"
+    assert preview("other") == {"available": False, "reason": "unreachable"}

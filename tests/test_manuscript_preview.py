@@ -20,6 +20,7 @@ def test_preview_keeps_literal_html_text_and_explains_fetch_failure(monkeypatch)
         def eq(self, *_): return self
         def execute(self):
             return SimpleNamespace(data=[{"user_id": "owner", "result_json": {
+                "access": {"unlocked": True},
                 "doc_url": "https://docs.google.com/document/d/example/edit"}}])
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: DB())

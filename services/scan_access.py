@@ -53,6 +53,7 @@ def locked_scan_view(result):
         section["placeholder"] = {"heading": heading, "paragraphs": paragraphs}
         remaining -= sum(map(len, paragraphs))
         section["text"] = None
+        section.pop("blocks", None)
     view["citations"] = []
     view["inconsistencies"] = []
     view["ai_synthesis"]["summary"] = None
