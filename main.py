@@ -9,12 +9,12 @@ from html import unescape
 from collections import defaultdict, deque
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header, File, UploadFile, Form, Request
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import BaseModel, Field, WithJsonSchema, field_serializer, model_validator
 from dotenv import load_dotenv
 
 # Load .env FIRST — must happen before service imports
@@ -543,12 +543,13 @@ class AITextIndicatorReport(BaseModel):
 _scanned_manuscripts: Dict[Any, bool] = {}   # (user, text fingerprint) of scans that finished, so a repeat can say nothing changed
 
 
-class ManuscriptSection(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    name: str
-    text: Optional[str] = None
-    display_name: Optional[str] = None
-    blocks: Optional[List[Dict[str, Any]]] = None
+ManuscriptSection = Annotated[Dict[str, Any], WithJsonSchema({
+    "type": "object", "additionalProperties": True,
+    "properties": {
+        "display_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "blocks": {"anyOf": [{"type": "array", "items": {"type": "object", "additionalProperties": True}}, {"type": "null"}]},
+    },
+})]
 
 
 class ScanResponse(BaseModel):

@@ -1,0 +1,39 @@
+{
+  "status": "completed",
+  "analysis_run_id": "run",
+  "user_id": "owner",
+  "manuscript_id": "ms",
+  "doc_url": "",
+  "manuscript_title": null,
+  "result_version": null,
+  "overall_coherence_score": 1.0,
+  "sections_analyzed": [
+    "Introduction"
+  ],
+  "manuscript_sections": [
+    {
+      "name": "introduction",
+      "text": "Some table-free manuscript text."
+    }
+  ],
+  "access": {
+    "unlocked": true
+  },
+  "manuscript_flow": [],
+  "inconsistencies_found": 0,
+  "inconsistencies": [],
+  "recommendations": [],
+  "ai_synthesis": {
+    "summary": null
+  },
+  "citations_audited": 0,
+  "citations": [],
+  "score_breakdown": null,
+  "dimension_breakdown": null,
+  "rescan_unchanged": false,
+  "structure_note": null,
+  "ai_text_indicator": null,
+  "db_save_status": "saved",
+  "notification_dispatched": false,
+  "credits_remaining": null
+}
