@@ -206,3 +206,29 @@ def test_legacy_google_preview_requires_owner_and_unlock_before_cache(monkeypatc
     result["access"] = {"unlocked": True}
     assert preview("owner")["text"] == "cached secret"
     assert preview("other") == {"available": False, "reason": "unreachable"}
+
+
+def test_real_scan_response_serializes_current_and_legacy_locked_sections():
+    for current in (False, True):
+        sections = [{"name": "First", "text": "visible paragraph"},
+                    {"name": "Second", "text": "withheld paragraph"}]
+        if current:
+            sections[0]["blocks"] = [{"type": "table", "rows": [["visible cell"]]}]
+            sections[1]["blocks"] = [{"type": "paragraph", "text": "withheld paragraph"},
+                                      {"type": "table", "rows": [["withheld cell"]]}]
+            sections[1]["display_name"] = "Second"
+        response = main.ScanResponse(status="completed", analysis_run_id="run", user_id="owner", manuscript_id="ms",
+                                     doc_url="", overall_coherence_score=1, sections_analyzed=["First", "Second"],
+                                     manuscript_sections=sections, access={"unlocked": False}, manuscript_flow=[],
+                                     inconsistencies_found=0, inconsistencies=[], recommendations=[],
+                                     ai_synthesis={"summary": None}, citations_audited=0, citations=[],
+                                     db_save_status="saved", notification_dispatched=False)
+        full = response.model_dump(mode="json")
+        locked = main.ScanResponse.model_validate(locked_scan_view(full)).model_dump_json()
+        assert "visible paragraph" in locked and "withheld paragraph" not in locked and "withheld cell" not in locked
+        if current:
+            assert "visible cell" in locked
+        full["access"]["unlocked"] = True
+        unlocked = main.ScanResponse.model_validate(locked_scan_view(full)).model_dump_json()
+        assert "withheld paragraph" in unlocked
+        assert ("withheld cell" in unlocked) is current
