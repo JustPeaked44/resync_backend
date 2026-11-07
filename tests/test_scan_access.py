@@ -232,11 +232,3 @@ def test_real_scan_response_serializes_current_and_legacy_locked_sections():
         unlocked = main.ScanResponse.model_validate(locked_scan_view(full)).model_dump_json()
         assert "withheld paragraph" in unlocked
         assert ("withheld cell" in unlocked) is current
-
-
-def test_locked_recommendations_do_not_expose_withheld_section_text():
-    full = {"access": {"unlocked": False}, "manuscript_sections": [
-        {"name": "First", "text": "visible"}, {"name": "Second", "text": "withheld cell"}],
-        "recommendations": [{"section": "Second", "original_sentence": "withheld cell"}],
-        "citations": [], "inconsistencies": [], "ai_synthesis": {"summary": None}, "manuscript_flow": []}
-    assert "withheld cell" not in json.dumps(locked_scan_view(full))

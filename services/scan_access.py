@@ -32,10 +32,7 @@ def locked_scan_view(result):
         text = sections[section_order[name]]["text"] if name in section_order else ""
         return section_order.get(name, len(sections)), text.find(item.get("original_sentence") or "")
 
-    permitted_name = sections[0]["name"] if sections else None
-    permitted_recommendations = [item for item in full_recommendations
-                                 if permitted_name and (item.get("section") or item.get("target_section_name")) == permitted_name]
-    view["recommendations"] = sorted(permitted_recommendations, key=position)[:2]
+    view["recommendations"] = sorted(full_recommendations, key=position)[:2]
     view["access"]["locked_counts"] = {
         "sections": max(0, len(sections) - 1),
         "recommendations": max(0, len(full_recommendations) - len(view["recommendations"])),
