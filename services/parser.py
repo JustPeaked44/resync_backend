@@ -206,13 +206,10 @@ class ManuscriptParserService:
             for index, line in enumerate(cleaned.splitlines()):
                 if line.strip():
                     lines.append((line.strip(), record if index == 0 else None))
-        joined = "\n" + "\n".join(line for line, _ in lines) + "\n"
-        offsets, headings, offset = {}, {}, 0
+        headings, positions = {}, {}
         for index, (line, _) in enumerate(lines):
-            offsets[offset] = index
             headings.setdefault(line.casefold(), []).append(index)
-            offset += len(line) + 1
-        line_offsets = list(offsets)
+            positions.setdefault(line, []).append(index)
         cursor = 0
         display_names, blocks_by_section = dict(result.get("display_names") or {}), {}
         for name in result.get("section_order", []):
@@ -224,14 +221,19 @@ class ManuscriptParserService:
             matches = headings.get(heading, [])
             heading_index = bisect_left(matches, cursor)
             search_cursor = matches[heading_index] + 1 if heading_index < len(matches) else cursor
-            # Sections containing skipped lines or artificial split fragments are left unstructured.
-            position = joined.find("\n" + "\n".join(body_lines) + "\n", line_offsets[search_cursor]) if search_cursor < len(lines) else -1
-            start = offsets.get(position)
-            if start is None:
+            selected_indices = []
+            for body_line in body_lines:
+                candidates = positions.get(body_line, [])
+                found = bisect_left(candidates, search_cursor)
+                if found == len(candidates):
+                    break
+                selected_indices.append(candidates[found])
+                search_cursor = candidates[found] + 1
+            if len(selected_indices) != len(body_lines):
                 continue
             display_names.setdefault(name, name)
-            selected = lines[start:start + len(body_lines)]
-            cursor = start + len(body_lines)
+            selected = [lines[index] for index in selected_indices]
+            cursor = search_cursor
             if not any(record and record.get("cells") is not None for _, record in selected):
                 continue
             blocks = []

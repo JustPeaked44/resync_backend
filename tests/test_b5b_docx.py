@@ -170,6 +170,21 @@ def test_preview_alignment_starts_after_the_heading_when_text_repeats():
     assert result["section_blocks"]["Introduction"][0]["rows"] == [["same", "cells"]]
 
 
+def test_preview_alignment_handles_skipped_table_of_contents_lines():
+    from services.parser import ManuscriptParserService
+    doc = Document()
+    doc.add_heading("Introduction", 1)
+    doc.add_paragraph("An ordinary paragraph.")
+    doc.add_paragraph("Some entry ........ 4")
+    table = doc.add_table(rows=1, cols=2)
+    table.cell(0, 0).text, table.cell(0, 1).text = "cell a", "cell b"
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx", include_metadata=True))
+    result = ManuscriptParserService.parse_manuscript_sections(text, ["Introduction"], records)
+    assert result["section_blocks"]["Introduction"][1]["rows"] == [["cell a", "cell b"]]
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest
