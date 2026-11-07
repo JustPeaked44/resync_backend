@@ -133,26 +133,27 @@ def validate_docx_archive(file_bytes: bytes) -> None:
 
 
 def extract_docx_text(file_bytes) -> str:
-    """Extract top-level paragraphs first, then tables, without loading pictures or the whole XML tree."""
+    """Extract top-level paragraphs and tables in document order, without loading pictures or the whole XML tree."""
     from lxml import etree
     from docx.oxml import parse_xml
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
     ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    groups = [[], []]
-    counts = [0, 0]
+    lines = []
+    count = 0
 
-    def append(group, text):
+    def append(text):
+        nonlocal count, lines
         if not text:
             return
-        groups[group].append(text)
-        counts[group] += len(text) + 1
-        if counts[group] > 500_002:
-            cleaned = DocumentIngestionService.strip_document_noise("\n".join(groups[group]))
+        lines.append(text)
+        count += len(text) + 1
+        if count > 500_002:
+            cleaned = DocumentIngestionService.strip_document_noise("\n".join(lines))
             DocumentIngestionService.enforce_size_limits(cleaned)
-            groups[group] = [cleaned] if cleaned else []
-            counts[group] = len(cleaned)
+            lines = [cleaned] if cleaned else []
+            count = len(cleaned)
 
     validate_docx_archive(file_bytes)
     with zipfile.ZipFile(BufferReader(file_bytes)) as archive:
@@ -166,7 +167,7 @@ def extract_docx_text(file_bytes) -> str:
                 if depth == 3 and element.tag in (ns + "p", ns + "tbl"):
                     node = parse_xml(etree.tostring(element))
                     if element.tag == ns + "p":
-                        append(0, Paragraph(node, None).text.strip())
+                        append(Paragraph(node, None).text.strip())
                     else:
                         table_chars = 0
                         for row in Table(node, None).rows:
@@ -179,12 +180,12 @@ def extract_docx_text(file_bytes) -> str:
                             table_chars += len(row_text) + 1
                             if table_chars > MAX_ELEMENT_TEXT_CHARS + 1:
                                 raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
-                            append(1, row_text)
+                            append(row_text)
                     element.clear()
                     while element.getprevious() is not None:
                         del element.getparent()[0]
                 depth -= 1
-    return "\n".join(groups[0] + groups[1])
+    return "\n".join(lines)
 
 
 def looks_like_html_document(text: str) -> bool:

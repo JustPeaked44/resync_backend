@@ -26,6 +26,10 @@ def old_output(data):
     return DocumentIngestionService.strip_document_noise("\n".join(lines))
 
 
+def source_order_output(data):
+    return old_output(data).replace("\nAfter table\nfirst | second\nmerged", "\nfirst | second\nmerged\nAfter table")
+
+
 def make_document(picture=False):
     doc = Document()
     doc.add_heading("Heading", 1)
@@ -54,18 +58,17 @@ def make_document(picture=False):
     return out.getvalue()
 
 
-def test_docx_output_matches_old_paragraphs_tables_and_hyperlinks():
+def test_docx_output_places_tables_in_source_order():
     data = make_document()
     actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
-    assert actual == old_output(data)
-    assert actual.index("After table") < actual.index("first")
+    assert actual == source_order_output(data)
 
 
 def test_picture_heavy_docx_matches_old_output():
     data = make_document(picture=True)
     assert len(data) >= 20_000_000
     actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
-    assert actual == old_output(data)
+    assert actual == source_order_output(data)
 
 
 def test_docx_without_tables_matches_old_output():
@@ -78,6 +81,33 @@ def test_docx_without_tables_matches_old_output():
     data = out.getvalue()
     actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
     assert actual == old_output(data)
+
+
+def test_tables_follow_their_headings_in_template_sections():
+    from services.parser import ManuscriptParserService
+
+    doc = Document()
+    doc.add_heading("Introduction", 1)
+    doc.add_paragraph("Opening text gives enough context for this section.")
+    table = doc.add_table(rows=2, cols=3)
+    table.cell(0, 0).text = "40"
+    table.cell(0, 1).text = "3"
+    table.cell(0, 2).text = "Agile Sprint Plan"
+    table.cell(1, 0).text = "same"
+    table.cell(1, 1).text = "same"
+    doc.add_heading("Methodology", 1)
+    doc.add_paragraph("A second section contains its own description.")
+    last = doc.add_table(rows=1, cols=21)
+    for index, cell in enumerate(last.rows[0].cells):
+        cell.text = f"column {index}"
+    output = io.BytesIO()
+    doc.save(output)
+    text = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(output.getvalue(), "test.docx"))
+    sections = ManuscriptParserService.parse_manuscript_sections(text, ["Introduction", "Methodology"])["parsed_sections"]
+    assert "40 | 3 | Agile Sprint Plan" in sections["Introduction"]
+    assert "same" in sections["Introduction"]
+    assert "column 20" in sections["Methodology"]
+    assert "column 20" not in sections["Introduction"]
 
 
 def test_docx_above_character_cap_is_refused():
@@ -146,7 +176,7 @@ def test_bytearray_input_is_viewed_without_full_copy(monkeypatch):
             seen.append(self.data.obj is source)
     monkeypatch.setattr(ingestion, "BufferReader", InspectReader)
     actual = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(data, "test.docx"))
-    assert actual == old_output(data)
+    assert actual == source_order_output(data)
     assert seen == [True, True]
 
 
