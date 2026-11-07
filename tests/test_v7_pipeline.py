@@ -186,7 +186,8 @@ def test_scan_contract_and_persistence_with_fakes(assembled_scan):
     assert [{"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]] == [
         {"name": "Related Studies", "text": sections["Related Studies"] + "\n" + sections["Related Studies (2)"]},
         {"name": "Results", "text": sections["Results"]}]
-    assert payload["manuscript_sections"] == [{"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]]
+    assert [{"name": s["name"], "text": s["text"]} for s in payload["manuscript_sections"]] == [
+        {"name": s["name"], "text": s["text"]} for s in captured["ml_sections"]]
     assert payload["result_version"] == "v7" and payload["overall_coherence_score"] == 75.0  # the one pair has a Moderate Logical Support contradiction (keeps 25%); Numeric is N/A: (100 + 100 + 25) / 3, rounded up
     assert payload["score_breakdown"]["band"] == "Solid"   # 75: a Moderate contradiction keeps part of its credit, so it lands above the Solid line (70)
     assert payload["score_breakdown"]["dimensions"] == {

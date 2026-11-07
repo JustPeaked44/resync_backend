@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Body, status, Header
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 from dotenv import load_dotenv
 
 # Load .env FIRST — must happen before service imports
@@ -32,7 +32,7 @@ from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
 from services.section_cache import SectionCache
-from services.v7_scan import (comparable_sections, merge_repeated_sections, assemble_flow, explain_flow,
+from services.v7_scan import (comparable_sections, merge_repeated_sections, manuscript_preview_sections, assemble_flow, explain_flow,
                               four_part_score, manuscript_score, band, MIN_SECTION_WORDS)
 from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
@@ -543,6 +543,14 @@ class AITextIndicatorReport(BaseModel):
 _scanned_manuscripts: Dict[Any, bool] = {}   # (user, text fingerprint) of scans that finished, so a repeat can say nothing changed
 
 
+class ManuscriptSection(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    name: str
+    text: Optional[str] = None
+    display_name: Optional[str] = None
+    blocks: Optional[List[Dict[str, Any]]] = None
+
+
 class ScanResponse(BaseModel):
     """Consolidated report returned by the master production scan endpoint."""
     status: str
@@ -554,7 +562,7 @@ class ScanResponse(BaseModel):
     result_version: Optional[str] = None
     overall_coherence_score: float
     sections_analyzed: List[str]
-    manuscript_sections: Optional[List[Dict[str, Any]]] = None
+    manuscript_sections: Optional[List[ManuscriptSection]] = None
     access: Optional[Dict[str, Any]] = None
     manuscript_flow: List[Dict[str, Any]]
     inconsistencies_found: int
@@ -868,7 +876,7 @@ async def _execute_scan_pipeline(
         result_version="v7",
         overall_coherence_score=overall_score,
         sections_analyzed=[section["name"] for section in sections],
-        manuscript_sections=sections,
+        manuscript_sections=manuscript_preview_sections(sections, parse_result),
         access={"unlocked": False, "unlock_cost": 1, "locked_counts": {
             "sections": max(0, len(sections) - 1),
             "recommendations": max(0, len(recommendations) - 2),

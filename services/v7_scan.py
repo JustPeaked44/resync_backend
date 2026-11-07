@@ -6,6 +6,7 @@ import os
 import re
 import asyncio
 import uuid
+import json
 
 
 DIMENSIONS = ("objectives_alignment", "methodology_fit", "numeric_consistency", "claim_support")
@@ -164,6 +165,43 @@ def comparable_sections(parsed_sections, section_order, section_roles):
     """The sections a scan compares, in reading order: repeated headings merged, reference lists and empty headings left out."""
     return [section for section in merge_repeated_sections(parsed_sections, section_order)
             if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS]
+
+
+def manuscript_preview_sections(sections, parse_result):
+    """Add bounded display-only blocks after scoring; legacy text remains authoritative."""
+    names = parse_result.get("display_names") or {}
+    source_blocks = parse_result.get("section_blocks") or {}
+    source_text = parse_result.get("parsed_sections") or {}
+    order = parse_result.get("section_order") or list(source_text)
+    result, total_bytes, budget_exhausted = [], 2 + 5 * len(sections), False
+    for section in sections:
+        name = section["name"]
+        parts = [key for key in order if re.sub(r" \(\d+\)$", "", key) == name]
+        preview = {**section, "display_name": names.get(name), "blocks": None}
+        if not budget_exhausted and any(source_blocks.get(key) for key in parts):
+            blocks, table_count, drop_tables = [], 0, False
+            for key in parts:
+                for block in source_blocks.get(key) or ([{"type": "paragraph", "text": source_text[key]}] if source_text.get(key) else []):
+                    if block["type"] == "paragraph":
+                        blocks.append({"type": "paragraph", "text": block["text"]})
+                    elif not drop_tables:
+                        if table_count >= 40:
+                            drop_tables = True
+                            continue
+                        rows = block["rows"]
+                        limited = [[cell if len(cell) <= 500 else cell[:499] + "…" for cell in row[:20]] for row in rows[:200]]
+                        blocks.append({"type": "table", "rows": limited})
+                        table_count += 1
+                        if len(rows) > 200 or any(len(row) > 20 or any(len(cell) > 500 for cell in row) for row in rows):
+                            drop_tables = True
+            size = len(json.dumps(blocks).encode("utf-8")) + 1
+            if total_bytes + size <= 400 * 1024:
+                preview["blocks"] = blocks
+                total_bytes += size
+            else:
+                budget_exhausted = True
+        result.append(preview)
+    return result
 
 
 def select_worst_pairs(pairs, limit=12):   # limit=None keeps every pair
