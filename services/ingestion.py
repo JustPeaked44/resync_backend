@@ -133,6 +133,10 @@ def validate_docx_archive(file_bytes: bytes) -> None:
 
 
 def extract_docx_text(file_bytes) -> str:
+    return extract_docx_with_metadata(file_bytes, include_metadata=False)[0]
+
+
+def extract_docx_with_metadata(file_bytes, include_metadata=True):
     """Extract top-level paragraphs and tables in document order, without loading pictures or the whole XML tree."""
     from lxml import etree
     from docx.oxml import parse_xml
@@ -141,19 +145,33 @@ def extract_docx_text(file_bytes) -> str:
 
     ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     lines = []
+    records = []
     count = 0
+    table_id = 0
 
-    def append(text):
-        nonlocal count, lines
+    def append(text, cells=None, table=None):
+        nonlocal count, lines, records
         if not text:
             return
         lines.append(text)
+        if include_metadata:
+            records.append({"text": text, "cells": cells, "table": table})
         count += len(text) + 1
         if count > 500_002:
             cleaned = DocumentIngestionService.strip_document_noise("\n".join(lines))
             DocumentIngestionService.enforce_size_limits(cleaned)
             lines = [cleaned] if cleaned else []
             count = len(cleaned)
+            kept = []
+            offset = 0
+            for record in records:
+                piece = DocumentIngestionService.strip_document_noise(record["text"])
+                if piece:
+                    position = cleaned.find(piece, offset)
+                    if position >= 0:
+                        kept.append({**record, "text": piece})
+                        offset = position + len(piece)
+            records = kept
 
     validate_docx_archive(file_bytes)
     with zipfile.ZipFile(BufferReader(file_bytes)) as archive:
@@ -169,9 +187,11 @@ def extract_docx_text(file_bytes) -> str:
                     if element.tag == ns + "p":
                         append(Paragraph(node, None).text.strip())
                     else:
+                        table_id += 1
                         table_chars = 0
                         for row in Table(node, None).rows:
-                            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                            all_cells = [cell.text.strip() for cell in row.cells]
+                            cells = [cell for cell in all_cells if cell]
                             unique = []
                             for cell in cells:
                                 if not unique or cell != unique[-1]:
@@ -180,12 +200,12 @@ def extract_docx_text(file_bytes) -> str:
                             table_chars += len(row_text) + 1
                             if table_chars > MAX_ELEMENT_TEXT_CHARS + 1:
                                 raise HTTPException(status_code=413, detail=DOCX_COMPLEX_MESSAGE)
-                            append(row_text)
+                            append(row_text, all_cells, table_id)
                     element.clear()
                     while element.getprevious() is not None:
                         del element.getparent()[0]
                 depth -= 1
-    return "\n".join(lines)
+    return "\n".join(lines), records
 
 
 def looks_like_html_document(text: str) -> bool:

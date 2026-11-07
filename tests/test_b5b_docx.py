@@ -110,6 +110,27 @@ def test_tables_follow_their_headings_in_template_sections():
     assert "column 20" not in sections["Introduction"]
 
 
+def test_docx_metadata_keeps_source_cells_without_changing_text():
+    from services.ingestion import extract_docx_text, extract_docx_with_metadata
+
+    doc = Document()
+    doc.add_paragraph("Before")
+    table = doc.add_table(rows=2, cols=3)
+    for cell, value in zip(table.rows[0].cells, ["same", "same", ""]):
+        cell.text = value
+    table.rows[1].cells[1].text = "second"
+    doc.add_paragraph("After")
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = extract_docx_with_metadata(out.getvalue())
+    assert text == extract_docx_text(out.getvalue()) == "Before\nsame\nsecond\nAfter"
+    assert [record["text"] for record in records] == ["Before", "same", "second", "After"]
+    assert records[1]["cells"] == ["same", "same", ""]
+    assert records[2]["cells"] == ["", "second", ""]
+    assert records[1]["table"] == records[2]["table"]
+    assert records[0]["cells"] is None
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest
