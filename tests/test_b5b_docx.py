@@ -150,6 +150,8 @@ def test_parser_retains_tables_and_original_headings():
     assert result["section_blocks"]["results"][1]["rows"] == [["Results cell", "", "end"]]
     template = ManuscriptParserService.parse_manuscript_sections(text, ["INTRODUCTION", "Methodology", "Results"], records)
     assert template["display_names"]["INTRODUCTION"] == "INTRODUCTION"
+    without_metadata = ManuscriptParserService.parse_manuscript_sections(text)
+    assert without_metadata["display_names"]["introduction"] == "Introduction"
 
 
 def test_docx_above_character_cap_is_refused():

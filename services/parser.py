@@ -191,11 +191,11 @@ class ManuscriptParserService:
         """
         result = cls._parse_manuscript_sections(text, template_toc)
         if source_records:
-            cls._attach_preview(result, source_records, template_toc is not None)
+            cls._attach_preview(result, source_records)
         return result
 
     @classmethod
-    def _attach_preview(cls, result, records, has_template):
+    def _attach_preview(cls, result, records):
         """Align source records with parsed body lines; omit blocks when alignment is uncertain."""
         from services.ingestion import DocumentIngestionService
 
@@ -212,8 +212,7 @@ class ManuscriptParserService:
             offset += len(line) + 1
         line_offsets = list(offsets)
         cursor = 0
-        display_names, blocks_by_section = {}, {}
-        prefix = re.compile(r"(?i)^(chapter\s+[ivxlcdm\d]+[\:\.-]?|section\s+[\d\.]+|[\d\.]+)\s*")
+        display_names, blocks_by_section = dict(result.get("display_names") or {}), {}
         for name in result.get("section_order", []):
             body = result["parsed_sections"].get(name, "")
             body_lines = [line.strip() for line in body.splitlines() if line.strip()]
@@ -224,14 +223,7 @@ class ManuscriptParserService:
             start = offsets.get(position)
             if start is None:
                 continue
-            display = name
-            if not has_template:
-                base = re.sub(r" \(\d+\)$", "", name).lower()
-                for heading, record in reversed(lines[cursor:start]):
-                    if record and record.get("cells") is None and prefix.sub("", heading).strip().lower() == base:
-                        display = heading
-                        break
-            display_names[name] = display
+            display_names.setdefault(name, name)
             selected = lines[start:start + len(body_lines)]
             cursor = start + len(body_lines)
             if not any(record and record.get("cells") is not None for _, record in selected):
@@ -293,6 +285,7 @@ class ManuscriptParserService:
                 "structure": detection.get("structure", "headings"),
                 "detection_confidence": detection["confidence"],
                 "section_order": detection.get("section_order", list(parsed_sections)),
+                "display_names": detection.get("display_names", {}),
             }
 
         # Fallback to default TOC template if list is empty or invalid
@@ -364,6 +357,7 @@ class ManuscriptParserService:
             "structure": "template",
             "detection_confidence": 1.0,
             "section_order": list(parsed_sections),
+            "display_names": {name: name for name in parsed_sections},
         }
 
     @classmethod
@@ -415,6 +409,7 @@ class ManuscriptParserService:
         sections_lines: Dict[str, List[str]] = {}
         heading_keys: Dict[str, List[str]] = {}
         section_roles: Dict[str, str] = {}
+        display_names: Dict[str, str] = {}
         detected_headings: List[str] = []
         detected_roles_in_order: List[str] = []
         current_section_key: Optional[str] = None
@@ -454,6 +449,7 @@ class ManuscriptParserService:
                     heading_keys.setdefault(heading, []).append(section_key)
                     sections_lines[section_key] = []
                 section_roles[section_key] = role
+                display_names[section_key] = line
                 current_section_key = section_key
                 if role == "references":
                     references_key = section_key
@@ -504,6 +500,7 @@ class ManuscriptParserService:
             "detected_headings": detected_headings,
             "section_roles": section_roles,
             "section_order": list(sections),
+            "display_names": display_names,
         }
 
     # ------------------------------------------------------------------
@@ -614,21 +611,23 @@ class ManuscriptParserService:
 
         sections_lines: Dict[str, List[str]] = {}
         roles: Dict[str, str] = {}
+        display_names: Dict[str, str] = {}
         seen: Dict[str, int] = {}
-        for position, (_, end, name) in enumerate(found):
+        for position, (heading_start, end, name) in enumerate(found):
             body_end = found[position + 1][0] if position + 1 < len(found) else len(lines)   # up to the next heading's first line
             key = re.sub(r"^[^A-Za-z]+", "", name).strip().lower() or name.lower()
             seen[key] = seen.get(key, 0) + 1
             if seen[key] > 1:
                 key = f"{key} ({seen[key]})"
             sections_lines[key] = lines[end + 1:body_end]
+            display_names[key] = "\n".join(lines[heading_start:end + 1])
             roles[key] = cls._role_for(key)
             if roles[key] == "references":
                 sections_lines[key] = lines[end + 1:]        # everything after the reference list stays with it
                 break
         sections = {key: "\n".join(body).strip() for key, body in sections_lines.items()}
         return {"sections": sections, "confidence": 0.5, "detected_headings": [item[2] for item in found],
-                "section_roles": roles, "section_order": list(sections)}
+                "section_roles": roles, "section_order": list(sections), "display_names": display_names}
 
     @classmethod
     def _split_into_parts(cls, text: str) -> Dict[str, Any]:
