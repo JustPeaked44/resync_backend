@@ -154,6 +154,22 @@ def test_parser_retains_tables_and_original_headings():
     assert without_metadata["display_names"]["introduction"] == "Introduction"
 
 
+def test_preview_alignment_starts_after_the_heading_when_text_repeats():
+    from services.parser import ManuscriptParserService
+    doc = Document()
+    doc.add_paragraph("same | cells")
+    doc.add_heading("Introduction", 1)
+    table = doc.add_table(rows=1, cols=2)
+    table.cell(0, 0).text, table.cell(0, 1).text = "same", "cells"
+    doc.add_heading("Methodology", 1)
+    doc.add_paragraph("A different section with several words in it.")
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx", include_metadata=True))
+    result = ManuscriptParserService.parse_manuscript_sections(text, ["Introduction", "Methodology"], records)
+    assert result["section_blocks"]["Introduction"][0]["rows"] == [["same", "cells"]]
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest

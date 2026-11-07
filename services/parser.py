@@ -197,6 +197,7 @@ class ManuscriptParserService:
     @classmethod
     def _attach_preview(cls, result, records):
         """Align source records with parsed body lines; omit blocks when alignment is uncertain."""
+        from bisect import bisect_left
         from services.ingestion import DocumentIngestionService
 
         lines = []
@@ -206,9 +207,10 @@ class ManuscriptParserService:
                 if line.strip():
                     lines.append((line.strip(), record if index == 0 else None))
         joined = "\n" + "\n".join(line for line, _ in lines) + "\n"
-        offsets, offset = {}, 0
+        offsets, headings, offset = {}, {}, 0
         for index, (line, _) in enumerate(lines):
             offsets[offset] = index
+            headings.setdefault(line.casefold(), []).append(index)
             offset += len(line) + 1
         line_offsets = list(offsets)
         cursor = 0
@@ -218,8 +220,12 @@ class ManuscriptParserService:
             body_lines = [line.strip() for line in body.splitlines() if line.strip()]
             if not body_lines:
                 continue
+            heading = (display_names.get(name) or name).splitlines()[0].casefold()
+            matches = headings.get(heading, [])
+            heading_index = bisect_left(matches, cursor)
+            search_cursor = matches[heading_index] + 1 if heading_index < len(matches) else cursor
             # Sections containing skipped lines or artificial split fragments are left unstructured.
-            position = joined.find("\n" + "\n".join(body_lines) + "\n", line_offsets[cursor]) if cursor < len(lines) else -1
+            position = joined.find("\n" + "\n".join(body_lines) + "\n", line_offsets[search_cursor]) if search_cursor < len(lines) else -1
             start = offsets.get(position)
             if start is None:
                 continue

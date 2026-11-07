@@ -789,6 +789,7 @@ async def _execute_scan_pipeline(
         parse_result = await asyncio.to_thread(
             ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc, source_records
         )
+    source_records = None
     paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
     if not paper["ok"]:
         logger.info("Scan %s refused: not a research paper (%s)", analysis_run_id, paper["reason"])
