@@ -208,7 +208,8 @@ class ManuscriptParserService:
                     lines.append((line.strip(), record if index == 0 else None))
         headings, positions, variants = {}, {}, {}
         for index, (line, record) in enumerate(lines):
-            headings.setdefault(line.casefold(), []).append(index)
+            if record and record.get("cells") is None:
+                headings.setdefault(line.casefold(), []).append(index)
             positions.setdefault(line, []).append(index)
             cells = tuple(record["cells"]) if record and record.get("cells") is not None else None
             variants.setdefault(line, []).append(cells)
@@ -228,12 +229,17 @@ class ManuscriptParserService:
             body_lines = [line.strip() for line in body.splitlines() if line.strip()]
             if not body_lines:
                 continue
-            heading = (display_names.get(name) or name).splitlines()[0].casefold()
+            base = re.sub(r" \(\d+\)$", "", name)
+            heading = re.sub(r" \(\d+\)$", "", (display_names.get(name) or name).splitlines()[0]).casefold()
             matches = headings.get(heading, [])
-            heading_index = bisect_left(matches, cursor)
-            search_cursor = matches[heading_index] + 1 if heading_index < len(matches) else cursor
+            if len(matches) != 1 or matches[0] < cursor:
+                ambiguous_bases.add(base)
+                continue
+            search_cursor = matches[0] + 1
             selected_indices = []
             ambiguous = False
+            previous = matches[0]
+            toc_line_re = re.compile(r"\.{3,}|\.{2,}\s*\d+\s*$|\s{3,}\d{1,3}\s*$")
             for body_line in body_lines:
                 candidates = positions.get(body_line, [])
                 found = bisect_left(candidates, search_cursor)
@@ -241,15 +247,21 @@ class ManuscriptParserService:
                     break
                 if ambiguous_suffix[body_line][found]:
                     ambiguous = True
-                selected_indices.append(candidates[found])
-                search_cursor = candidates[found] + 1
+                selected = candidates[found]
+                for skipped, record in lines[previous + 1:selected]:
+                    if result.get("structure") != "template" or not record or record.get("cells") is not None or not toc_line_re.search(skipped):
+                        ambiguous = True
+                selected_indices.append(selected)
+                previous = selected
+                search_cursor = selected + 1
             if len(selected_indices) != len(body_lines):
+                ambiguous_bases.add(base)
                 continue
             display_names.setdefault(name, name)
             selected = [lines[index] for index in selected_indices]
             cursor = search_cursor
             if ambiguous:
-                ambiguous_bases.add(re.sub(r" \(\d+\)$", "", name))
+                ambiguous_bases.add(base)
                 continue
             if not any(record and record.get("cells") is not None for _, record in selected):
                 continue

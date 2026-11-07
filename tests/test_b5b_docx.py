@@ -199,6 +199,31 @@ def test_ambiguous_repeated_section_uses_text_fallback():
     assert result["section_blocks"] == {}
 
 
+def test_repeated_heading_never_swaps_tables_between_sections():
+    from services.parser import ManuscriptParserService
+    from services.v7_scan import comparable_sections, manuscript_preview_sections
+
+    doc = Document()
+    for label in ("FIRST_TABLE", "SECOND_TABLE"):
+        doc.add_heading("Introduction", 1)
+        doc.add_paragraph((label + " sentence with several words. ") * 8)
+        table = doc.add_table(rows=1, cols=2)
+        table.cell(0, 0).text, table.cell(0, 1).text = label, "value"
+    out = io.BytesIO()
+    doc.save(out)
+    text, records = asyncio.run(DocumentIngestionService.extract_plaintext_from_upload(out.getvalue(), "test.docx", include_metadata=True))
+    parsed = ManuscriptParserService.parse_manuscript_sections(text, ["Introduction"], records)
+    sections = comparable_sections(parsed["parsed_sections"], parsed["section_order"], parsed["section_roles"])
+    preview = manuscript_preview_sections(sections, parsed)
+    assert preview
+    for section in preview:
+        if section["blocks"] is not None:
+            cells = [row[0] for block in section["blocks"] if block["type"] == "table" for row in block["rows"]]
+            assert cells == ["FIRST_TABLE", "SECOND_TABLE"]
+        else:
+            assert "FIRST_TABLE" in section["text"] and "SECOND_TABLE" in section["text"]
+
+
 def test_docx_above_character_cap_is_refused():
     from fastapi import HTTPException
     import pytest
