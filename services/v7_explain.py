@@ -21,7 +21,9 @@ STRICT_RULES = """STRICT RULES:
 2. Do not demand specific structural changes or missing chapters.
 3. Do not use outside knowledge; use only supplied text and model scores.
 4. Only assess whether Section B logically correlates with Section A.
-5. Never change model scores; they come from the PyTorch model."""
+5. Never change model scores; they come from the PyTorch model.
+6. Numbers: if a difference in numbers can be explained by legitimate research reasons (for example attrition or dropouts, missing responses, exclusion criteria, or a smaller group analysed than recruited), do NOT flag it as a contradiction. Only flag numeric inconsistencies if they are physically impossible (for example more people analysed than were ever recruited, percentages that cannot add up, or a total smaller than one of its parts).
+7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section. If you cannot give the exact quote, do not report it."""
 PAIR_PROMPT = """You are an objective logic auditor. Analyze Section A and Section B, two sections of the same manuscript.
 If the provided Overall Coherence score is below 0.85, determine whether there is a REAL logical inconsistency between them. A low score alone is not an inconsistency.
 {rules}
@@ -170,14 +172,18 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
         match = re.search(pattern, source[section], flags=re.I)
         return match.group() if match else None
 
-    issues = []
+    issues, unverified = [], []
     for item in raw.get("highlighted_inconsistencies", []) if isinstance(raw.get("highlighted_inconsistencies"), list) else []:
         if isinstance(item, dict):
             section = section_name(item.get("section"))
             if (section and item.get("what") != "No major inconsistencies found."
                     and all(isinstance(item.get(k), str) and item[k].strip() for k in ("what", "why"))):
-                issues.append({"section": section, "quote": verified(section, item.get("quote")),
-                               "what": friendly(item["what"]), "why": friendly(item["why"])})
+                quote = verified(section, item.get("quote"))
+                if quote:   # strict traceability: a finding whose exact words are not in the manuscript is never scored
+                    issues.append({"section": section, "quote": quote,
+                                   "what": friendly(item["what"]), "why": friendly(item["why"])})
+                else:       # ...but it is remembered as unverified, so a real problem is not lost because one answer slipped
+                    unverified.append({"section": section, "what": friendly(item["what"]), "why": friendly(item["why"])})
     recommendations = []
     for item in raw.get("recommendations", []) if isinstance(raw.get("recommendations"), list) else []:
         if not isinstance(item, dict):
@@ -210,7 +216,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
                 and not META_PHRASE.search(sentence) and not already_there(sentence, source.get(section), item["placement"])):
             bridges.append({"section": section, "placement": item["placement"], "sentence": friendly(sentence)})
     severity = raw.get("severity").strip().capitalize() if isinstance(raw.get("severity"), str) else None
-    quoted = any(item["quote"] for item in issues) or bool(recommendations)   # verified lines from the paper
+    quoted = bool(issues) or bool(recommendations)   # verified lines from the paper
     if severity not in SEVERITIES:  # no valid label: a quoted issue or recommendation means a real problem was found
         severity = "Moderate" if quoted else "None"
     if severity != "None" and not quoted:  # strict rule: no issue without a quotable contradiction
@@ -231,7 +237,8 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             "comparison": {key: friendly(comparison[key]) if isinstance(comparison.get(key), str) else ""
                            for key in ("a_says", "b_says")},
             "highlighted_inconsistencies": issues,
-            "recommendations": recommendations, "reference_list": references, "bridges": bridges}
+            "recommendations": recommendations, "reference_list": references, "bridges": bridges,
+            "unverified": unverified[:5] if severity == "None" else []}
 
 
 async def _generate(prompt, max_tokens=None):
@@ -316,7 +323,10 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
     result = None
     for attempt in range(1, EXPLAIN_ATTEMPTS + 1):  # Gemini often returns a transient 429/503 under load
         try:
-            result = normalize_explanation(await _generate(prompt), scores, role_a, text_a, role_b, text_b, adjacent)
+            raw = await _generate(prompt)
+            if not isinstance(raw, dict):   # an answer that is not an object says nothing: it must not read as "reviewed, no issue"
+                raise ValueError("the answer is not a JSON object")
+            result = normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent)
             break
         except gemini.GeminiQuotaExhausted:
             logger.warning("v7 Gemini quota exhausted; %s -> %s left unreviewed", role_a, role_b)

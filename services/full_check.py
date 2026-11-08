@@ -58,7 +58,7 @@ TEXT:
 
 CROSS_PROMPT = """Below are statements taken from every part of one student's thesis. Each has an id, the section it came from and its kind.
 Find statements from DIFFERENT sections that contradict each other or do not match, so that a reader would not know which is true. Examples: two different numbers for the same thing (people, items, dates, percentages, versions); a method, tool, design or framework named differently in two places; an objective or research question that changed between sections; a conclusion that claims more than the findings support (for example a causal claim from correlational results); the same term used for two different things.
-Do NOT report: different wording of the same idea, one statement being more detailed than another, a statement with no counterpart, or statements about different things.
+Do NOT report: different wording of the same idea, one statement being more detailed than another, a statement with no counterpart, or statements about different things. Also do NOT report a difference in numbers that legitimate research reasons can explain (attrition or dropouts, missing responses, exclusion criteria, a smaller group analysed than recruited); report numbers only when they are physically impossible (for example more people analysed than recruited, or parts larger than their total).
 Be strict: report a pair only when you can explain the mismatch in one clear sentence that names both. At most {max} pairs, most serious first. For each pair also name the ONE statement that should be corrected ("fix_id").
 Severity: Critical = the sections directly contradict each other; Moderate = a claim, method, goal or number does not match; Minor = a small term, figure or name differs.
 Return JSON: {{"conflicts":[{{"fact_a":"F1","fact_b":"F2","severity":"Critical|Moderate|Minor","category":"objectives|methodology|claims|numeric","what":"short title","why":"one or two plain sentences","fix_id":"F2"}}]}}
@@ -66,7 +66,7 @@ STATEMENTS:
 {ledger}"""
 
 CONFIRM_PROMPT = """A tool suspects that the pairs of statements below, taken from one student's thesis, contradict each other. For each pair you see the sentence and the paragraph around it.
-Decide whether a thesis adviser reading both paragraphs would agree they conflict. Answer genuine=false when it is only different wording, one being more detailed, or two statements about different things.
+Decide whether a thesis adviser reading both paragraphs would agree they conflict. Answer genuine=false when it is only different wording, one being more detailed, two statements about different things, or a difference in numbers that attrition, dropouts, missing responses or exclusion criteria can explain (only physically impossible numbers are genuine).
 For a genuine pair, also rewrite the sentence marked CORRECT so it agrees with the other one: copy that sentence and change only what is needed, in the same style, at most 60 words, without mentioning sections or the other statement.
 Return JSON: {{"results":[{{"id":1,"genuine":true,"severity":"Critical|Moderate|Minor","fixed_sentence":"..."}}]}}
 {items}"""

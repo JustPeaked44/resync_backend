@@ -3,6 +3,7 @@ from services import v7_explain, gemini
 from services.v7_scan import (manuscript_score, assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs)
 import pytest
+from services.v7_scan import apply_figure_conflicts, flatten_explanations
 from services import v7_scan
 
 @pytest.fixture(autouse=True)
@@ -128,9 +129,12 @@ def test_unfinished_rate_limited_review_is_partial(monkeypatch):
     monkeypatch.setattr(v7_explain, "explain_summary", unavailable)
     monkeypatch.setattr(gemini, "rate_limited", lambda: True)
     _, _, synthesis = asyncio.run(explain_flow(sections, flow))
-    assert synthesis["review_status"] == {
-        "status": "partial", "unreviewed": 1, "reason": "rate_limited",
-        "message": "Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later."}
+    status = synthesis["review_status"]
+    assert (status["status"], status["unreviewed"], status["reason"]) == ("partial", 1, "rate_limited")
+    assert status["message"] == "Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later."
+    # nothing was reviewed, so the score is an ML-only estimate and says so
+    assert (status["analysis"], status["basis"], status["reviewed"], status["needs_review"]) == ("incomplete", "ml_estimate", 0, 1)
+    assert status["unverified"] == 0
 
 
 def pair_for_score(severity=None, dimension=None, numeric=True, order=1, overall=0.5):
@@ -369,16 +373,127 @@ def test_many_easy_far_apart_pairs_cannot_hide_weak_flow_between_neighbors():
     easy_far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in range(4, 14)]   # ten far pairs that pass
     score, breakdown = manuscript_score(weak_flow + easy_far)
     context = breakdown["context_alignment"]
-    assert (context["flow"], context["cross"]) == ({"items": 3, "passed": 0}, {"items": 10, "passed": 10})
+    assert (context["flow"], context["cross"]) == ({"items": 3, "passed": 0, "credit": 1.2}, {"items": 10, "passed": 10, "credit": 10.0})
     assert context["halves"] is True and (context["items"], context["passed"]) == (13, 10)
     assert context["score"] == 70.0 and score == 70.0      # flow keeps only its weak ratings and cross is 100%; the two halves are averaged, not pooled
     only_cross = [dict(pair_for_score("None", "none", order=1, overall=0.6), adjacent=False)]
     assert manuscript_score(only_cross)[1]["context_alignment"]["score"] == 100.0                    # a single kind of check stands alone
 
 
-def test_a_kind_with_too_few_checks_is_pooled_instead_of_swinging_the_category():
+def test_a_kind_with_too_few_checks_stays_balanced_but_is_marked_limited():
+    """Changed rule: a kind with fewer than MIN_HALF_CHECKS is no longer pooled (pooling let the many chapter checks hide weak
+    flow). It still counts for half, and the category says its evidence is limited."""
     one_miss_of_two = [pair_for_score("None", "none", order=1, overall=0.4), pair_for_score("None", "none", order=2, overall=0.6)]
     far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in (3, 4, 5)]
     category = manuscript_score(one_miss_of_two + far)[1]["context_alignment"]
-    assert (category["flow"]["items"], category["cross"]["items"]) == (2, 3) and category["halves"] is False
-    assert category["score"] == 88.0      # 4 of 5 checks passed and the miss keeps part of its credit by severity; split in halves it would have read lower
+    assert (category["flow"]["items"], category["cross"]["items"]) == (2, 3) and category["halves"] is True
+    assert category["limited"] is True and category["basis"] == "balanced"
+    assert category["score"] == 85.0      # flow: (0.4 + 1) / 2 = 0.7, chapters: 3 / 3 = 1; the average of the two rates
+
+
+def test_a_category_with_only_one_kind_of_check_uses_that_kind_alone():
+    flow_only = [pair_for_score("None", "none", order=n, overall=0.9) for n in (1, 2)]
+    category = manuscript_score(flow_only)[1]["context_alignment"]
+    assert category["basis"] == "flow_only" and category["halves"] is False and category["score"] == 100.0
+    chapters_only = [dict(pair_for_score("None", "none", order=n, overall=0.9), adjacent=False) for n in (1, 2, 3)]
+    assert manuscript_score(chapters_only)[1]["context_alignment"]["basis"] == "chapters_only"
+
+
+def test_a_category_with_no_checks_is_not_applicable_and_the_overall_ignores_it():
+    score, breakdown = manuscript_score([])
+    assert score == 0.0 and all(entry["score"] == "N/A" for entry in breakdown.values())
+
+
+def test_the_same_quoted_sentence_in_two_pairs_is_scored_once():
+    def pair(order, quote):
+        p = pair_for_score("Moderate", "objectives_alignment", order=order, overall=0.9)
+        p["explanation"] = {"highlighted_inconsistencies": [{"section": "b", "quote": quote, "what": "w", "why": "y"}]}
+        return p
+    twice = manuscript_score([pair(1, "B says Y."), pair(2, "B  says y."), pair(3, "Another sentence.")])[1]["context_alignment"]
+    assert twice["items"] == 2 and twice["issues"] == 2   # the repeated sentence is one issue; the other sentence is a second one
+    once = manuscript_score([pair(1, "B says Y.")])[1]["context_alignment"]
+    assert once["issues"] == 1
+
+
+def test_the_overall_power_mean_lets_a_weak_category_pull_the_overall_down():
+    from services.v7_scan import overall_from
+    values = [87.86, 34.95, 81.25, 87.91]
+    assert overall_from(values, 1) == 73.0                      # plain average: the strong categories hide the weak one
+    assert overall_from(values, 0) < 73.0 and overall_from(values, -1) < overall_from(values, 0)
+    assert overall_from([60.0, 60.0, 60.0, 60.0], -1) == 60.0   # equal categories: every rule agrees
+    assert overall_from([80.0, 0.0], -1) == 0.0 and overall_from([], -1) == 0.0
+
+
+# ---- context-aware headcounts, merged duplicates ----------------------------------------------------------------------
+def _headcount_flow(text_a, text_b):
+    sections = [{"name": "methodology", "text": text_a}, {"name": "results", "text": text_b}]
+    flow = assemble_flow(sections, [{"scores": {"overall_coherence": 0.7, "objectives_alignment": 0.7, "methodology_fit": 0.7,
+                                                 "numeric_consistency": 0.7, "claim_support": 0.7, "pair_weight": 1}}])
+    return sections, flow
+
+
+def test_a_smaller_count_explained_by_dropouts_is_not_flagged():
+    sections, flow = _headcount_flow("We recruited 120 students. ", "Because of dropouts, 96 students were analysed.")
+    apply_figure_conflicts(flow, sections)
+    assert flow[0]["explanation"] is None
+
+
+def test_an_unexplained_or_impossible_count_is_still_flagged():
+    sections, flow = _headcount_flow("We recruited 96 students.", "A total of 120 students were analysed, with dropouts.")
+    apply_figure_conflicts(flow, sections)
+    assert flow[0]["explanation"]["highlighted_inconsistencies"]
+
+
+def test_the_same_sentence_reported_by_two_pairs_gives_one_finding_and_one_recommendation():
+    sections = [{"name": "a", "text": "A says X."}, {"name": "b", "text": "B says Y."}, {"name": "c", "text": "C says Z."}]
+    scores = {"overall_coherence": 0.3, "objectives_alignment": 0.3, "methodology_fit": 0.3, "numeric_consistency": 0.3,
+              "claim_support": 0.3, "pair_weight": 1}
+    flow = assemble_flow(sections, [{"scores": dict(scores)}, {"scores": dict(scores)}])
+    for pair, other in zip(flow, ("a", "c")):
+        pair["explanation"] = {
+            "severity": "Moderate", "failed_dimension": "claim_support", "coherence_scores": {}, "link_summary": "", "comparison": {},
+            "highlighted_inconsistencies": [{"section": "b", "quote": "B says Y.", "what": "w", "why": "y"}],
+            "recommendations": [{"section": "b", "original_sentence": "B says Y.", "recommended_revision": "B says Y, carefully.",
+                                 "issue": "i", "category": "claims"}],
+            "reference_list": [{"section": other, "sentence": f"{other.upper()} says."}], "bridges": []}
+    findings, recommendations = flatten_explanations(flow, sections)
+    assert len(findings) == 1 and len(recommendations) == 1
+    assert len(findings[0]["evidence_quotes"]) >= 2
+
+
+def test_the_points_shown_add_up_to_the_score():
+    """Every check is worth one point; a pass earns 1 and a failed check earns its credit. The score is made of exactly those points."""
+    def pair(order, adjacent, severity, rating):
+        scores = {k: rating for k in ("overall_coherence", "objectives_alignment", "methodology_fit", "numeric_consistency", "claim_support")}
+        return {"order": order, "section_a": "a", "section_b": "b", "adjacent": adjacent, "numeric_applicable": False, "scores": scores,
+                "severity": severity, "failed_dimension": "objectives_alignment" if severity else None}
+    flow = [pair(1, True, None, 0.9), pair(2, True, "Critical", 0.9), pair(3, True, "Minor", 0.9), pair(4, True, "Moderate", 0.9),
+            pair(5, False, None, 0.9), pair(6, False, None, 0.9), pair(7, False, "Minor", 0.9)]
+    _, breakdown = manuscript_score(flow)
+    entry = breakdown["context_alignment"]
+    assert entry["points"] == {"perfect": 3, "partial": 3, "zero": 1, "earned": 1.75 + 2.5, "total": 7}
+    assert entry["flow"]["credit"] == 1 + 0 + 0.5 + 0.25 and entry["cross"]["credit"] == 2.5
+    # two halves of 4 and 3 checks: the score is the average of the two rates, not points / checks
+    assert entry["halves"] is True and entry["score"] == round((1.75 / 4 + 2.5 / 3) / 2 * 100, 2)
+
+
+# ---- how complete the analysis was --------------------------------------------------------------------------------------
+def test_analysis_quality_tells_complete_degraded_and_incomplete_scans_apart():
+    from services.v7_scan import analysis_quality
+    done = {"explanation": {"severity": "None"}}
+    missing = {"explanation": None}
+    assert analysis_quality([done, done], 0, True)["analysis"] == "complete"
+    assert analysis_quality([done, done, missing], 1, True)["analysis"] == "degraded"
+    incomplete = analysis_quality([done, missing, missing], 2, False)
+    assert incomplete["analysis"] == "incomplete" and incomplete["basis"] == "ml_estimate" and incomplete["whole_paper_check"] == "skipped"
+    assert analysis_quality([], 0, True)["analysis"] == "complete"
+
+
+def test_an_unverified_finding_is_kept_apart_and_never_lowers_the_score():
+    from services import v7_explain
+    raw = {"severity": "Critical", "highlighted_inconsistencies": [
+        {"section": "B", "quote": "text that is not in the paper", "what": "Conflict", "why": "They disagree."}]}
+    scores = {"overall_coherence": 0.4, "objectives_alignment": 0.8, "methodology_fit": 0.7, "numeric_consistency": 0.6, "claim_support": 0.5}
+    result = v7_explain.normalize_explanation(raw, scores, "A", "A text.", "B", "B text.")
+    assert result["severity"] == "None" and result["highlighted_inconsistencies"] == []
+    assert [item["what"] for item in result["unverified"]] == ["Conflict"]

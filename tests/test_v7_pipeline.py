@@ -238,7 +238,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                    "claim_support", "overall_coherence"}
     assert set(pair["culprit_sentences"]) == {"section_a", "section_b"}
     assert set(pair["explanation"]) == {"severity", "failed_dimension", "coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies",
-                                        "recommendations", "reference_list", "bridges"}
+                                        "recommendations", "reference_list", "bridges", "unverified"}
     assert set(pair["explanation"]["coherence_scores"]) == {"overall", "objectives", "methodology", "numeric", "claims"}
     assert set(pair["explanation"]["highlighted_inconsistencies"][0]) == {"section", "quote", "what", "why"}
     assert set(pair["explanation"]["recommendations"][0]) == {"section", "original_sentence", "issue", "recommended_revision", "category"}
@@ -254,7 +254,7 @@ def test_full_v7_response_contract_and_legacy_deserialization(assembled_scan):
                                                 "recommendation_text", "recommendation_priority", "issue", "kind"}
     assert payload["recommendations"][0]["recommendation_id"]
     assert payload["recommendations"][0]["id"] == "r-1-1"
-    assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair", "review_status"}
+    assert set(payload["ai_synthesis"]) == {"summary", "strongest_pair", "weakest_pair", "review_status", "unverified_findings"}
     for key in ("strongest_pair", "weakest_pair"):
         assert set(payload["ai_synthesis"][key]) == {"order", "section_a", "section_b", "overall_coherence", "score"}
     assert set(payload["score_breakdown"]) == {"overall_score", "band", "cross_chapter_coherence_score",

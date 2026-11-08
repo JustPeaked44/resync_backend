@@ -22,10 +22,11 @@ def test_normalize_verifies_quotes_and_preserves_model_scores():
            "reference_list": [{"section": "A", "sentence": "A  curly 'quote'."},
                               {"section": "B", "sentence": "fabricated"}]}
     result = v7_explain.normalize_explanation(raw, SCORES, "A", 'A curly ‘quote’.', "B", "B text.")
-    assert set(result) == {"severity", "failed_dimension", "coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies", "recommendations", "reference_list", "bridges"}
+    assert set(result) == {"severity", "failed_dimension", "coherence_scores", "link_summary", "comparison", "highlighted_inconsistencies", "recommendations", "reference_list", "bridges", "unverified"}
     assert result["coherence_scores"]["overall"] == 0.4
-    assert len(result["highlighted_inconsistencies"]) == 2
-    assert result["highlighted_inconsistencies"][1]["quote"] is None
+    # strict traceability: the finding whose quote is not in the manuscript is rejected
+    assert len(result["highlighted_inconsistencies"]) == 1
+    assert result["highlighted_inconsistencies"][0]["quote"] == 'A curly ‘quote’.'
     assert result["recommendations"] == []
     assert result["reference_list"] == [{"section": "A", "sentence": 'A curly ‘quote’.'}]
 
@@ -278,7 +279,7 @@ def test_one_fake_gemini_call_returns_only_verified_recommendations(monkeypatch)
     assert "STRICT TRIAGE RULES" in calls[0]["contents"][0]["parts"][0]["text"]
     assert result["severity"] == "Moderate"
     assert [(r["section"], r["original_sentence"]) for r in result["recommendations"]] == [("A", "A says improvement.")]
-    assert result["highlighted_inconsistencies"][1]["quote"] is None
+    assert [i["quote"] for i in result["highlighted_inconsistencies"]] == ["B says no effect."]   # the invented quote is rejected
     sections = [{"name": "A", "text": "A says improvement. A has another culprit."},
                 {"name": "B", "text": "B says no effect."}]
     flow = assemble_flow(sections, [{"scores": dict(SCORES, pair_weight=1)}])
@@ -515,3 +516,16 @@ def test_a_bridge_batch_drops_sentences_that_are_already_in_the_paper(monkeypatc
     items = [{"id": 1, "role_a": "A", "text_a": f"Intro here. {ADDED}", "role_b": "B", "text_b": "Start of B."},
              {"id": 2, "role_a": "C", "text_a": "Text of C here.", "role_b": "D", "text_b": "Text of D here."}]
     assert set(asyncio.run(v7_explain.suggest_bridges_batch(items))) == {2}                          # pair 1 repeated the sentence the student added
+
+
+def test_malformed_gemini_answers_leave_pairs_unreviewed_instead_of_crashing(monkeypatch):
+    async def not_a_dict(*_, **__):
+        return ["not", "an", "object"]
+
+    monkeypatch.setattr(v7_explain, "_generate", not_a_dict)
+    monkeypatch.setattr(v7_explain, "EXPLAIN_RETRY_PAUSE", 0)
+    batch = asyncio.run(v7_explain.explain_batch([{"id": 1, "role_a": "A", "text_a": "A text.", "role_b": "B", "text_b": "B text.",
+                                                   "scores": SCORES, "culprits_a": [], "culprits_b": [], "adjacent": True}]))
+    assert batch == {}   # no pair is answered, so the caller reviews it one by one or leaves it unreviewed
+    single = asyncio.run(v7_explain.explain_pair("A", "A text.", "B", "B text.", SCORES, [], []))
+    assert single["severity"] is None and single["failed_dimension"] is None   # unknown: neither cleared nor penalized

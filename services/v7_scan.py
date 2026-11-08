@@ -20,7 +20,8 @@ CALIBRATION = ((0.15, 0.0), (0.45, 0.60), (0.65, 0.86), (0.82, 1.0))
 # for display: below 0.40 Critical, 0.40 to 0.65 Moderate, 0.65 to 0.85 Minor. Grades do not change the score.
 SEVERITY_PENALTY = {"Critical": 10, "Moderate": 5, "Minor": 1, "None": 0}
 START_SCORE = 100
-MIN_HALF_CHECKS = 3  # a kind of check with fewer than this is too small to weigh as its own half: one miss would swing the category
+MIN_HALF_CHECKS = 3  # a kind of check with fewer than this is still weighed as half, but the category is marked limited: one miss swings it a lot
+OVERALL_POWER = float(os.getenv("OVERALL_POWER", "1"))  # 1 = plain average of the four categories (see overall_from for lower values)
 # A failed check still earns part of a point so the four categories do not all drop by the same step when one pair is weak:
 # a contradiction keeps this share of the point by severity; a loose link keeps its own rating for that category (under 0.5).
 CONTRADICTION_CREDIT = {"Critical": 0.0, "Moderate": 0.25, "Minor": 0.5}
@@ -85,26 +86,78 @@ def four_part_score(pairs):
     return score, averages, weights
 
 
+def _norm_quote(value):
+    return " ".join((value or "").lower().split())
+
+
+def duplicate_issue_orders(scored):
+    """Orders of the pairs whose contradiction is the same underlying issue as one an earlier pair already counted.
+
+    An issue is identified by the sentence the review quoted for it. Several pairs quoting the same sentence are one problem
+    seen from several sides, so only the first of them is scored; the others are left out of the checks (neither passed nor
+    failed), which keeps a single bad sentence from being charged once per neighbouring section."""
+    seen, duplicate = set(), set()
+    for p in sorted(scored, key=lambda item: item.get("order") or 0):
+        explanation = p.get("explanation") or {}
+        if p.get("severity") not in ("Critical", "Moderate", "Minor"):
+            continue
+        keys = {(item.get("section"), _norm_quote(item.get("quote"))) for item in explanation.get("highlighted_inconsistencies") or []
+                if item.get("quote")}
+        if not keys:
+            continue
+        if keys <= seen:
+            duplicate.add(p.get("order"))
+        seen |= keys
+    return duplicate
+
+
+def overall_from(values, power=None):
+    """The overall score from the category percentages: a power mean, M_p = (sum(v^p) / n) ^ (1 / p).
+
+    p = 1 is the plain average (every category counts the same and a strong category can hide a weak one). A lower p lets a weak
+    category pull the overall down: p = 0 is the geometric mean and p = -1 the harmonic mean. Equal categories give the same result
+    for every p. A category at 0 gives 0 for any p <= 0."""
+    power = OVERALL_POWER if power is None else power
+    if not values:
+        return 0.0
+    if power == 1:
+        mean = sum(values) / len(values)
+    elif power == 0:
+        mean = 0.0 if min(values) <= 0 else math.exp(sum(math.log(v) for v in values) / len(values))
+    elif power < 0 and min(values) <= 0:
+        mean = 0.0
+    else:
+        mean = (sum(v ** power for v in values) / len(values)) ** (1 / power)
+    return float(math.ceil(round(mean, 6)))
+
+
 def manuscript_score(pairs, transitions=None):
-    """(overall score, dimension breakdown), counted as checks passed.
+    """(overall score, dimension breakdown), counted as points earned over checks.
 
     A check is one pair of sections judged for one of the four categories (Evidence Consistency only for pairs where both
-    sections hold figures). A check fails when the AI review quoted a real contradiction in that category, or when two
-    neighboring sections are rated below CHECK_PASS_AT for it (a loose link, which gets linking-sentence suggestions).
-    Far-apart pairs fail only on a quoted contradiction, since unrelated chapters are meant to differ; a pair the AI
-    review could not judge falls back to the model's rating.
+    sections hold figures). Each check is worth 1 point. A pass earns 1; a failed check earns partial credit (a Minor
+    contradiction 0.5, Moderate 0.25, Critical 0, a loose link its own rating up to 0.5). A check fails when the AI review
+    quoted a real contradiction in that category, or when two neighboring sections are rated below CHECK_PASS_AT for it (a
+    loose link). Far-apart pairs fail only on a quoted contradiction, since unrelated chapters are meant to differ. A pair the
+    AI review could not judge falls back to the model's rating and is counted in `estimated`, so the score can say how much of
+    it was not AI-checked. A pair whose contradiction is the same issue as an earlier pair's is not scored twice.
 
-    A category has two kinds of checks: the flow between neighboring sections, and the cross-chapter pairs that should
-    agree. When both kinds have at least MIN_HALF_CHECKS checks, each gets its own pass rate and the category's score is the
-    average of the two, so the many far-apart pairs that almost always pass can never hide weak flow. With fewer checks than
-    that the two are pooled, since one miss would swing the category by a quarter. "N/A" when a category has none. The overall score is the average of the applicable categories' percentages, rounded up, so every category carries
-    equal weight. `failures` lists exactly which checks failed and why, so every score can be traced. `transitions` is
+    A category has two kinds of checks: the flow between neighboring sections and the cross-chapter pairs that should agree.
+    Each kind gets its own rate (points earned / checks) and the category is the AVERAGE OF THE TWO RATES, so the many far-apart
+    pairs that almost always pass can never hide weak flow. This never changes to a pooled count. When a kind has fewer than
+    MIN_HALF_CHECKS checks it is still weighed as half (balance is kept) but the category is marked `limited`, because one
+    check then moves it a lot; when a kind has no checks at all the category is that one kind's rate alone (`basis`). "N/A" when
+    a category has no checks. The overall score combines the applicable categories with `overall_from` (see OVERALL_POWER) and is
+    rounded up. `failures` lists exactly which checks lost points and why, so every score can be traced. `transitions` is
     accepted for older callers and no longer used.
     """
     scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
+    duplicates = duplicate_issue_orders(scored)
+    scored = [p for p in scored if p.get("order") not in duplicates]
     breakdown = {}
     for key, name in DIMENSION_NAMES.items():
         failures = []
+        estimated = 0
         counts = {"flow": [0, 0, 0.0], "cross": [0, 0, 0.0]}   # kind -> [checks, passed, credit]
         for p in scored:
             rating = p["scores"].get(key)
@@ -113,37 +166,50 @@ def manuscript_score(pairs, transitions=None):
             severity, neighbors = p.get("severity"), p.get("adjacent", True) is not False
             kind = counts["flow" if neighbors else "cross"]
             kind[0] += 1
+            estimated += severity is None   # no AI verdict: this check rests on the model's rating alone
             if severity in ("Critical", "Moderate", "Minor") and p.get("failed_dimension") == key:
                 reason = "contradiction"
-                kind[2] += CONTRADICTION_CREDIT.get(severity, 0.0)
+                earned = CONTRADICTION_CREDIT.get(severity, 0.0)
+                kind[2] += earned
             elif rating < CHECK_PASS_AT and (neighbors or severity is None):
                 reason = "loose_link"
-                kind[2] += max(0.0, min(CHECK_PASS_AT, rating))
+                earned = max(0.0, min(CHECK_PASS_AT, rating))
+                kind[2] += earned
             else:
                 kind[1] += 1
                 kind[2] += 1
                 continue
             failures.append({"order": p.get("order"), "section_a": p.get("section_a", ""), "section_b": p.get("section_b", ""),
                              "reason": reason, "severity": severity if reason == "contradiction" else None,
-                             "rating": round(rating, 4)})
+                             "rating": round(rating, 4), "credit": round(earned, 4), "kind": "flow" if neighbors else "cross"})
         total = counts["flow"][0] + counts["cross"][0]
         if not total:
             breakdown[name] = {"score": "N/A", "halves": False, "items": 0, "passed": 0, "issues": 0, "pairs": 0, "failures": [],
                                "flow": {"items": 0, "passed": 0}, "cross": {"items": 0, "passed": 0},
+                               "basis": None, "limited": False, "estimated": 0,
                                "baseline": None, "penalty": 0, "deductions": []}
             continue
-        halves = counts["flow"][0] >= MIN_HALF_CHECKS and counts["cross"][0] >= MIN_HALF_CHECKS
-        rates = [credit / items for items, _, credit in counts.values() if items]
-        score = sum(rates) / len(rates) if halves else (counts["flow"][2] + counts["cross"][2]) / total   # small samples are pooled, not split
+        rates = {kind: credit / items for kind, (items, _, credit) in counts.items() if items}
+        halves = len(rates) == 2
+        score = sum(rates.values()) / len(rates)
+        basis = "balanced" if halves else ("flow_only" if "flow" in rates else "chapters_only")
+        limited = any(counts[kind][0] < MIN_HALF_CHECKS for kind in rates)
         breakdown[name] = {"score": round(score * 100, 2), "halves": halves, "items": total,
                            "passed": counts["flow"][1] + counts["cross"][1],
                            "issues": sum(f["reason"] == "contradiction" for f in failures), "pairs": total,
                            "failures": failures,
-                           "flow": {"items": counts["flow"][0], "passed": counts["flow"][1]},
-                           "cross": {"items": counts["cross"][0], "passed": counts["cross"][1]},
+                           "flow": {"items": counts["flow"][0], "passed": counts["flow"][1], "credit": round(counts["flow"][2], 2)},
+                           "cross": {"items": counts["cross"][0], "passed": counts["cross"][1], "credit": round(counts["cross"][2], 2)},
+                           # Every check is worth 1 point: a pass earns 1, a failed check earns its partial credit (0 for a
+                           # Critical contradiction), so the points earned are exactly what the score is made of.
+                           "points": {"perfect": counts["flow"][1] + counts["cross"][1],
+                                      "partial": sum(f["credit"] > 0 for f in failures),
+                                      "zero": sum(f["credit"] == 0 for f in failures),
+                                      "earned": round(counts["flow"][2] + counts["cross"][2], 2), "total": total},
+                           "basis": basis, "limited": limited, "estimated": estimated,
                            "baseline": None, "penalty": 0, "deductions": []}
     values = [entry["score"] for entry in breakdown.values() if entry["score"] != "N/A"]
-    return (float(math.ceil(round(sum(values) / len(values), 6))) if values else 0.0), breakdown
+    return overall_from(values), breakdown
 
 
 def merge_repeated_sections(parsed_sections, section_order):
@@ -326,6 +392,9 @@ _COUNT_GROUPS = {"respondent": "respondents", "participant": "respondents", "sub
 _COUNT_RE = re.compile(r"(?<![\w.,/-])(\d{1,3}(?:,\d{3})+|\d{2,5})(?!\s*%|\d|[.,]\d)\s+(?:[A-Za-z-]+\s+){0,2}?(respondent|participant|subject|student|"
                        r"sample|user|expert|panelist|teacher|employee|patient|people|person)s?\b", re.I)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_EXPLAINED_RE = re.compile(r"\b(attrition|drop(?:ped)?[- ]?outs?|withdr(?:ew|awn|awal)|excluded|exclusion|did not complete|incomplete|"
+                           r"missing (?:data|responses|answers)|non-?respon\w+|unusable|invalid|discarded|lost to follow|declined|"
+                           r"valid (?:responses|questionnaires|cases))\b", re.I)
 _SIDE_GROUP_RE = re.compile(r"\b(pilot|preliminary|pre-?test|pre-?survey|trial|focus group|initial)\b", re.I)
 
 
@@ -368,6 +437,10 @@ def apply_figure_conflicts(flow, sections):
             continue
         group, number_a, sentence_a, number_b, sentence_b = conflict
         if sentence_a not in a["text"] or sentence_b not in b["text"]:
+            continue
+        # A smaller later count is normal when the paper explains it (dropouts, missing answers, exclusions). Only a count
+        # that cannot be explained, such as more people analysed than recruited, or a drop nobody mentions, is flagged.
+        if number_b < number_a and (_EXPLAINED_RE.search(a["text"]) or _EXPLAINED_RE.search(b["text"])):
             continue
         written_b = f"{number_b:,}" if f"{number_b:,}" in sentence_b else str(number_b)
         written_a = f"{number_a:,}" if "," in written_b else str(number_a)
@@ -525,12 +598,16 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         unreviewed = sum(1 for p in flow if p["scores"]["overall_coherence"] is not None and p["severity"] is None)
         # Tell the report why pairs are missing, so "no recommendations" is never mistaken for "nothing wrong".
         review_status = {"status": "complete" if not unreviewed else "partial", "unreviewed": unreviewed}
+        review_status.update(analysis_quality(to_explain, unreviewed, full_check.enabled() and not gemini.quota_blocked()))
+        unverified = [{"pair_order": p["order"], "section_a": p["section_a"], "section_b": p["section_b"], **item}
+                      for p in flow for item in ((p["explanation"] or {}).get("unverified") or [])]
+        review_status["unverified"] = len(unverified)
         if unreviewed and gemini.rate_limited():
             review_status.update(reason="rate_limited", message="Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later.")
         synthesis = {"summary": await explain_summary(flow, findings),
                      "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
                      "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None,
-                     "review_status": review_status}
+                     "review_status": review_status, "unverified_findings": unverified[:20]}
     finally:
         if full_check_task is not None:   # the scan stopped early: do not leave the paper check running
             full_check_task.cancel()
@@ -538,11 +615,33 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
     return findings, recommendations, synthesis
 
 
+def analysis_quality(to_explain, unreviewed, whole_paper_check_ran):
+    """How much of the score rests on a real AI review. complete: every weak pair was reviewed. degraded: some were not, so their
+    checks use the model's rating alone. incomplete: fewer than half were reviewed, so the score is an ML-only estimate and must not
+    be shown as if it were AI-verified. `basis` names what the number is made of."""
+    needs = len(to_explain)
+    reviewed = sum(1 for p in to_explain if p.get("explanation") and p["explanation"].get("severity") is not None)
+    if not unreviewed:
+        status = "complete"
+    elif needs and reviewed * 2 < needs:
+        status = "incomplete"
+    else:
+        status = "degraded"
+    return {"analysis": status, "needs_review": needs, "reviewed": reviewed,
+            "basis": {"complete": "ai_verified", "degraded": "mixed", "incomplete": "ml_estimate"}[status],
+            "whole_paper_check": "ran" if whole_paper_check_ran else "skipped"}
+
+
 def flatten_explanations(flow, sections=None):
     from services.v7_explain import recommendation_category
 
     findings, recommendations = [], []
     highlighted = set()
+    seen_findings = {}   # the same quoted sentence reported again by another pair is the same issue: merged, not repeated
+
+    def norm(value):
+        return " ".join((value or "").lower().split())
+
     for pair in flow:
         explanation = pair["explanation"]
         overall = pair["scores"]["overall_coherence"]
@@ -568,6 +667,11 @@ def flatten_explanations(flow, sections=None):
                           (ref["section"], ref["sentence"]) != (item["section"], item["quote"]))
             matching_revision = next((r["recommended_revision"] for r in pair_recommendations
                                       if r["section"] == item["section"]), "")
+            first = seen_findings.get((item["section"], norm(item["quote"])))
+            if first is not None:   # same sentence already reported: keep one finding, add any new evidence to it
+                known = {(q["section"], norm(q["text"])) for q in first["evidence_quotes"]}
+                first["evidence_quotes"].extend(q for q in quotes if (q["section"], norm(q["text"])) not in known)
+                continue
             findings.append({"section_a": names[0], "section_b": names[1], "pair_order": pair["order"],
                              "coherence_score": score, "explanation_what": item["what"],
                              "explanation_why": item["why"], "suggested_fix": matching_revision,
@@ -576,11 +680,12 @@ def flatten_explanations(flow, sections=None):
                              "evidence_b": next((q["text"] for q in quotes if q["section"] == names[1]), ""),
                              "evidence_quotes": quotes, "evidence_verified": bool(quotes),
                              "finding_status": "material_issue"})
+            seen_findings[(item["section"], norm(item["quote"]))] = findings[-1]
         number = 0
         for item in bridges + pair_recommendations:
-            key = (item["section"], item["original_sentence"])
+            key = (item["section"], norm(item["original_sentence"]))
             if item["original_sentence"] is not None:  # the default advice has no sentence to dedupe on
-                if key in highlighted:
+                if key in highlighted:   # one recommendation per sentence, however many pairs raise it
                     continue
                 highlighted.add(key)
             revision = item["recommended_revision"]
