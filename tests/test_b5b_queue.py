@@ -124,3 +124,31 @@ async def test_concurrent_requests_reserve_before_provision(monkeypatch):
     with pytest.raises(RuntimeError):
         await task
     assert not main._scan_reservations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url,expected", [
+    ("https://docs.google.com/document/d/abc/edit", "https://docs.google.com/document/d/abc/edit"),
+    ("http://docs.google.com/document/d/abc/edit", "test.docx"),
+    ("https://docs.google.com.evil.example/document/d/abc/edit", "test.docx"),
+    (None, "test.docx"),
+])
+async def test_upload_keeps_only_google_source_url(monkeypatch, url, expected):
+    import io
+    from starlette.datastructures import UploadFile
+    captured = []
+    async def provision(req, **kwargs):
+        captured.append(req)
+        return "id", "manuscript", 0
+    jobs = []
+    monkeypatch.setattr(main, "_provision_analysis_run", provision)
+    monkeypatch.setattr(main, "_enqueue_scan", lambda *args: jobs.append(args))
+    monkeypatch.setattr(main, "_queue_state", lambda _: (None, None, "info", ""))
+    file = UploadFile(file=io.BytesIO(b"file bytes"), filename="test.docx")
+    await main.upload_and_start_scan(file=file, user_id="user", manuscript_id=None,
+        manuscript_title="Title", doc_url=url, template_toc=None, style_reference_url=None,
+        authenticated_user_id="user")
+    assert captured[0].doc_url == expected
+    assert captured[0].manuscript_title == "Title"
+    assert jobs[0][-2] == b"file bytes"
+    assert jobs[0][-1] == "test.docx"
