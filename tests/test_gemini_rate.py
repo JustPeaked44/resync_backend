@@ -25,6 +25,8 @@ class FakeClock:
 @pytest.fixture
 def clock(monkeypatch):
     monkeypatch.delenv("GEMINI_RPM", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-primary")
+    monkeypatch.delenv("GEMINI_API_KEY_FALLBACK", raising=False)
     fake = FakeClock()
     limiter = gemini.CallLimiter()
     limiter.clock, limiter.sleep = fake.now, fake.sleep

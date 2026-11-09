@@ -3,6 +3,7 @@
 import asyncio
 import collections
 import contextvars
+import hashlib
 import math
 import os
 import re
@@ -23,11 +24,30 @@ class GeminiQuotaExhausted(Exception):
     """A confirmed per-day provider quota cannot be fixed by retrying now."""
 
 
-_quota_blocked_until = 0.0
+_quota_blocked_until = {}
+
+
+def _configured_keys():
+    first = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    second = os.getenv("GEMINI_API_KEY_FALLBACK")
+    keys = [first] if first or not second else []
+    if second and second != first:
+        keys.append(second)
+    return keys
+
+
+def _key_id(key):
+    return hashlib.sha256(key.encode()).digest() if key else None
+
+
+def _available_key():
+    now = time.monotonic()
+    return next(((index, key) for index, key in enumerate(_configured_keys())
+                 if now >= _quota_blocked_until.get(_key_id(key), 0.0)), None)
 
 
 def quota_blocked():
-    return time.monotonic() < _quota_blocked_until
+    return _available_key() is None
 
 # Set per scan job (see main._run_scan_job) so the limiter can report status to that scan's poller.
 scan_context = contextvars.ContextVar("gemini_scan_id", default=None)
@@ -189,8 +209,6 @@ async def _send(payload, key):
 
 
 async def post_gemini_with_retry(payload):
-    global _quota_blocked_until
-    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     scan_id = scan_context.get()
     if quota_blocked():  # already known to be out of quota: fail at once instead of sending more doomed requests
         LIMITER.rate_limited.add(scan_id)
@@ -203,6 +221,11 @@ async def post_gemini_with_retry(payload):
             spent = await LIMITER.acquire(scan_id, spent)
             if spent is None:
                 break
+            available = _available_key()
+            if available is None:
+                LIMITER.rate_limited.add(scan_id)
+                raise GeminiQuotaExhausted("The AI's temporary limit was reached")
+            _, key = available
             try:
                 response = await _send(payload, key)
             except httpx.TransportError:  # timeout or dropped connection
@@ -213,12 +236,17 @@ async def post_gemini_with_retry(payload):
                 spent += 2.0 * transport_failures
                 continue
             if response.status_code == 429:
-                LIMITER.rate_limited.add(scan_id)
-                LIMITER.retrying_429.add(scan_id)
                 if _is_daily_quota(response):
-                    _quota_blocked_until = time.monotonic() + QUOTA_RECHECK_SECONDS
+                    _quota_blocked_until[_key_id(key)] = time.monotonic() + QUOTA_RECHECK_SECONDS
+                    available = _available_key()
+                    if available is not None:
+                        logging.getLogger("resync.gemini").warning("Gemini switching to the %s key", "first" if available[0] == 0 else "second")
+                        continue
+                    LIMITER.rate_limited.add(scan_id)
                     logging.getLogger("resync.gemini").warning("Gemini quota exhausted; pausing AI reviews for %ss", QUOTA_RECHECK_SECONDS)
                     raise GeminiQuotaExhausted("The AI's temporary limit was reached")
+                LIMITER.rate_limited.add(scan_id)
+                LIMITER.retrying_429.add(scan_id)
             if not _is_retryable(response):
                 return response
             logging.getLogger("resync.gemini").warning("Gemini returned %s", response.status_code)

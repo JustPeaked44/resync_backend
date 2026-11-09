@@ -10,6 +10,8 @@ services:
         value: "8000"
       - key: GEMINI_API_KEY
         sync: false
+      - key: GEMINI_API_KEY_FALLBACK
+        sync: false
       # GEMINI_RPM defaults to 14; set it in Render to pin a deployment override.
       - key: ML_BACKEND
         value: modal
