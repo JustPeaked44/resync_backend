@@ -189,6 +189,35 @@ class ManuscriptParserService:
             "section_roles", "auto_detected", "detection_confidence",
             "section_order".
         """
+        lines = text.splitlines()
+        page_entry = re.compile(r"\S.*\s+(?:\d+|[ivxlcdm]+)\s*$", re.I)
+        table_entry = re.compile(r"\S.*(?:\||\t)\s*(?:\d+|[ivxlcdm]+)\s*$", re.I)
+        skip = {i for i, line in enumerate(lines) if table_entry.search(line) or re.search(r"\.{2,}\s*(?:\d+|[ivxlcdm]+)\s*$", line, re.I)}
+        for i, line in enumerate(lines[:-3]):
+            if re.match(r"(?i)^chapter\s+(?:[ivxlcdm]+|\d+)\b", line.strip()) and all(table_entry.search(entry) for entry in lines[i + 1:i + 4]):
+                skip.add(i)
+        if source_records:
+            contents = next((i for i, record in enumerate(source_records)
+                             if record['text'].strip().casefold() == 'table of contents' and record.get('cells') is None), None)
+            if contents is not None:
+                chapter_index = next((i for i in range(contents + 1, len(source_records))
+                                      if source_records[i].get('cells') is None and re.match(r'(?i)^chapter\s+(?:[ivxlcdm]+|\d+)\b', source_records[i]['text'].strip())), None)
+                chapter = source_records[chapter_index]['text'].strip() if chapter_index is not None else None
+                beginning = next((i for i, line in enumerate(lines) if line.strip().casefold() == 'table of contents'), None)
+                occurrences = sum(record['text'].strip() == chapter for record in source_records[:chapter_index]) if chapter else 0
+                matches = [i for i, line in enumerate(lines) if line.strip() == chapter] if chapter else []
+                ending = matches[occurrences] if len(matches) > occurrences else None
+                if beginning is not None and ending is not None and beginning < ending:
+                    skip.update(range(beginning, ending))
+        start = 0
+        while start < len(lines):
+            end = start
+            while end < len(lines) and page_entry.fullmatch(lines[end].strip()):
+                end += 1
+            if end - start >= 3:
+                skip.update(range(start, end))
+            start = max(end, start + 1)
+        text = "\n".join(line for i, line in enumerate(lines) if i not in skip)
         result = cls._parse_manuscript_sections(text, template_toc)
         if source_records:
             cls._attach_preview(result, source_records)
