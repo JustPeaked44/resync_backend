@@ -190,35 +190,42 @@ class ManuscriptParserService:
             "section_order".
         """
         lines = text.splitlines()
-        page_entry = re.compile(r"\S.*\s+(?:\d+|[ivxlcdm]+)\s*$", re.I)
-        table_entry = re.compile(r"\S.*(?:\||\t)\s*(?:\d+|[ivxlcdm]+)\s*$", re.I)
-        skip = {i for i, line in enumerate(lines) if table_entry.search(line) or re.search(r"\.{2,}\s*(?:\d+|[ivxlcdm]+)\s*$", line, re.I)}
-        for i, line in enumerate(lines[:-3]):
-            if re.match(r"(?i)^chapter\s+(?:[ivxlcdm]+|\d+)\b", line.strip()) and all(table_entry.search(entry) for entry in lines[i + 1:i + 4]):
-                skip.add(i)
-        if source_records:
-            contents = next((i for i, record in enumerate(source_records)
-                             if record['text'].strip().casefold() == 'table of contents' and record.get('cells') is None), None)
-            if contents is not None:
-                chapter_index = next((i for i in range(contents + 1, len(source_records))
-                                      if source_records[i].get('cells') is None and re.match(r'(?i)^chapter\s+(?:[ivxlcdm]+|\d+)\b', source_records[i]['text'].strip())), None)
-                chapter = source_records[chapter_index]['text'].strip() if chapter_index is not None else None
-                beginning = next((i for i, line in enumerate(lines) if line.strip().casefold() == 'table of contents'), None)
-                occurrences = sum(record['text'].strip() == chapter for record in source_records[:chapter_index]) if chapter else 0
-                matches = [i for i, line in enumerate(lines) if line.strip() == chapter] if chapter else []
-                ending = matches[occurrences] if len(matches) > occurrences else None
-                if beginning is not None and ending is not None and beginning < ending:
-                    skip.update(range(beginning, ending))
+        page_entry = re.compile(r'^\s*([^|]*[a-zA-Z][^|]*)\s*\|\s*(\d{1,3}|[ivxlcdm]+)\s*$', re.I)
+        def page_number(line):
+            match = page_entry.fullmatch(line)
+            if not match:
+                return None
+            page = match.group(2).lower()
+            if page.isdecimal():
+                number = int(page)
+            else:
+                if not re.fullmatch(r'(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})', page):
+                    return None
+                values = {'i': 1, 'v': 5, 'x': 10, 'l': 50, 'c': 100, 'd': 500, 'm': 1000}
+                number = sum(-values[c] if i + 1 < len(page) and values[c] < values[page[i + 1]] else values[c] for i, c in enumerate(page))
+            return number if 0 < number <= 999 else None
+
+        skip = set()
         start = 0
         while start < len(lines):
             end = start
-            while end < len(lines) and page_entry.fullmatch(lines[end].strip()):
+            previous = 0
+            while end < len(lines):
+                number = page_number(lines[end])
+                if number is None or number < previous:
+                    break
+                previous = number
                 end += 1
-            if end - start >= 3:
+            # shortcut: five page-shaped data rows also match, upgrade when contents can be identified reliably.
+            if end - start >= 5:
                 skip.update(range(start, end))
+                heading = start - 1
+                while heading >= 0 and re.fullmatch(r'(?i)\s*(?:table of contents|contents|list of .+|chapter\s+(?:[ivxlcdm]+|\d+)\b.*)\s*', lines[heading]):
+                    skip.add(heading)
+                    heading -= 1
             start = max(end, start + 1)
         text = "\n".join(line for i, line in enumerate(lines) if i not in skip)
-        result = cls._parse_manuscript_sections(text, template_toc)
+        result = cls._parse_manuscript_sections(text, template_toc, bool(skip))
         if source_records:
             cls._attach_preview(result, source_records)
         return result
@@ -319,7 +326,7 @@ class ManuscriptParserService:
         result["section_blocks"] = blocks_by_section
 
     @classmethod
-    def _parse_manuscript_sections(cls, text, template_toc=None):
+    def _parse_manuscript_sections(cls, text, template_toc=None, has_contents=False):
         # Remember whether the caller omitted the TOC entirely, before the
         # junk-filtering step below reassigns template_toc. Only a genuine
         # omission routes to auto-detection; a TOC that filters down to
@@ -364,7 +371,7 @@ class ManuscriptParserService:
         lines = [line.strip() for line in text.split("\n") if line.strip()]
 
         parsed_sections_lines: Dict[str, List[str]] = {section: [] for section in template_toc}
-        current_section = template_toc[0]  # Dynamically set initial section
+        current_section = None if has_contents else template_toc[0]
         matched_section_keys: List[str] = []
 
 
