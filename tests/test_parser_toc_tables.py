@@ -41,7 +41,7 @@ def test_page_number_blocks_dot_leaders_and_digit_heading(template):
 
 
 def test_page_runs_require_five_nondecreasing_entries():
-    lines = ['Introduction', 'Body words.'] + [f'Keep {n} | {n}' for n in range(1, 5)] + ['Body break.'] + [f'Drop {n} | {n}' for n in range(1, 6)] + ['Preface | iv', 'Preface | v', 'Preface | vi', 'Preface | vii', 'Preface | viii', 'Body break.', 'Evidence | 42']
+    lines = ['Introduction', 'Body words.'] + [f'Keep {n} | {n}' for n in range(1, 5)] + ['Body break.'] + [f'Drop {n} | {n}' for n in range(1, 6)] + ['Preface | iv', 'Preface | v', 'Preface | vi', 'Preface | vii', 'Preface | viii', 'Body break.', 'Evidence | 42', 'Body text. ' * 300]
     result = ManuscriptParserService.parse_manuscript_sections('\n'.join(lines), ['Introduction'])
     body = result['parsed_sections']['Introduction']
     assert all(f'Keep {n} | {n}' in body for n in range(1, 5))
@@ -55,6 +55,23 @@ def test_descending_large_and_numeric_labels_do_not_form_a_run():
             'Label | 1000', '1 | 1', '2 | 2', '3 | 3', '4 | 4', '5 | 5']
     result = ManuscriptParserService.parse_manuscript_sections('\n'.join(['Introduction', *rows]), ['Introduction'])
     assert all(row in result['parsed_sections']['Introduction'] for row in rows)
+
+
+def test_contents_run_across_chapter_label():
+    rows = [f'Entry {n} | {n}' for n in range(1, 5)] + ['CHAPTER II REVIEW OF RELATED LITERATURE'] + [f'Entry {n} | {n}' for n in range(5, 9)]
+    text = '\n'.join(['TABLE OF CONTENTS', *rows, 'INTRODUCTION', 'Body text. ' * 300])
+    result = ManuscriptParserService.parse_manuscript_sections(text, ['Introduction'])
+    assert not any(row in '\n'.join(result['parsed_sections'].values()) for row in rows)
+
+
+@pytest.mark.parametrize('template', [None, ['Introduction', 'Research Methodology', 'Results']])
+def test_six_page_shaped_body_rows_in_last_third_are_preserved(template):
+    rows = [f'Evidence {n} | {n}' for n in range(1, 7)]
+    text = '\n'.join(['INTRODUCTION', 'Introduction body. ' * 300, 'RESEARCH METHODOLOGY', 'Methods body. ' * 300,
+                      'RESULTS', 'Results body. ' * 300, *rows])
+    result = ManuscriptParserService.parse_manuscript_sections(text, template)
+    body = '\n'.join(result['parsed_sections'].values())
+    assert all(row in body for row in rows)
 
 
 def test_normal_document_keeps_heading_and_word_counts():

@@ -206,18 +206,33 @@ class ManuscriptParserService:
             return number if 0 < number <= 999 else None
 
         skip = set()
+        offsets = []
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            offsets.append(offset)
+            offset += len(line)
         start = 0
-        while start < len(lines):
+        while start < len(lines) and offsets[start] * 4 < len(text):
             end = start
             previous = 0
+            count = 0
             while end < len(lines):
                 number = page_number(lines[end])
-                if number is None or number < previous:
+                if number is not None and number >= previous:
+                    previous = number
+                    count += 1
+                    end += 1
+                    continue
+                if count and re.match(r'(?i)^\s*chapter\s+(?:[ivxlcdm]+|\d+)\b', lines[end]) and end + 1 < len(lines):
+                    following = page_number(lines[end + 1])
+                    if following is not None and following >= previous:
+                        end += 1
+                        continue
+                else:
                     break
-                previous = number
-                end += 1
-            # shortcut: five page-shaped data rows also match, upgrade when contents can be identified reliably.
-            if end - start >= 5:
+                break
+            # shortcut: early page-shaped data tables can match, upgrade when contents can be identified reliably.
+            if count >= 5:
                 skip.update(range(start, end))
                 heading = start - 1
                 while heading >= 0 and re.fullmatch(r'(?i)\s*(?:table of contents|contents|list of .+|chapter\s+(?:[ivxlcdm]+|\d+)\b.*)\s*', lines[heading]):
