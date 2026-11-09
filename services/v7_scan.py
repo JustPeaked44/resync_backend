@@ -309,6 +309,28 @@ def main_far_pairs(pairs, sections, roles=None):
     return chosen[:FAR_REVIEW_LIMIT]
 
 
+_NEGATION = re.compile(r"\b(?:not|no|never|neither|nor|without|cannot|fail(?:s|ed)? to|lack(?:s|ed)?)\b|n't\b", re.I)
+_STOP = frozenset("this that with from have were been which their there these those they them than then also into such more most some what when where while will would could should about over under between after before".split())
+NEGATION_REVIEW_LIMIT = int(os.getenv("NEGATION_REVIEW_LIMIT", "6"))   # extra high-rated pairs reviewed because of a possible reversal
+
+
+def polarity_conflict(text_a, text_b, limit=60):
+    """True when a sentence in one section and a very similar sentence in the other differ in negation: two statements about the
+    same thing, one affirmed and one denied. The model rates such sentences as alike, so this is a cheap signal to ask the AI."""
+    def prepared(text):
+        out = []
+        for sentence in _SENTENCE_RE.split(text or "")[:limit]:
+            words = {w for w in re.findall(r"[a-z]{4,}", _NEGATION.sub(" ", sentence.lower())) if w not in _STOP}
+            if len(words) >= 4:
+                out.append((words, bool(_NEGATION.search(sentence))))
+        return out
+    for words_a, negated_a in prepared(text_a):
+        for words_b, negated_b in prepared(text_b):
+            if negated_a != negated_b and len(words_a & words_b) / len(words_a | words_b) >= 0.5:
+                return True
+    return False
+
+
 def select_pairs_to_explain(pairs, sections=None, roles=None):
     """Every pair that is below the recommendation threshold gets a real explanation, weakest first, so
     advice is equally specific across the whole manuscript. A cap applies only if EXPLAIN_LIMIT is set.
@@ -319,6 +341,11 @@ def select_pairs_to_explain(pairs, sections=None, roles=None):
     always = {id(p) for p in main_far_pairs(pairs, sections, roles)}
     weak = [p for p in pairs if p["scores"]["overall_coherence"] is not None
             and (p["scores"]["overall_coherence"] < RECOMMENDATION_THRESHOLD or id(p) in always)]
+    chosen = {id(p) for p in weak}
+    if sections:   # the 0.85 threshold must not be the only way a serious contradiction can be found
+        extra = [p for p in pairs if p["scores"]["overall_coherence"] is not None and id(p) not in chosen
+                 and "index_a" in p and polarity_conflict(sections[p["index_a"]]["text"], sections[p["index_b"]]["text"])]
+        weak += sorted(extra, key=lambda p: p["scores"]["overall_coherence"])[:NEGATION_REVIEW_LIMIT]
     return select_worst_pairs(weak, EXPLAIN_LIMIT)
 
 
@@ -392,6 +419,8 @@ _COUNT_GROUPS = {"respondent": "respondents", "participant": "respondents", "sub
 _COUNT_RE = re.compile(r"(?<![\w.,/-])(\d{1,3}(?:,\d{3})+|\d{2,5})(?!\s*%|\d|[.,]\d)\s+(?:[A-Za-z-]+\s+){0,2}?(respondent|participant|subject|student|"
                        r"sample|user|expert|panelist|teacher|employee|patient|people|person)s?\b", re.I)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_STAGE_RE = re.compile(r"\b(pre-?test|post-?test|baseline|follow-?up|wave|phase|stage|round|time ?point|week|month|cohort|per group|each group|control group|"
+                       r"experimental group|treatment group|male|female|boys|girls|sections?|schools?|classes|class)\b", re.I)
 _EXPLAINED_RE = re.compile(r"\b(attrition|drop(?:ped)?[- ]?outs?|withdr(?:ew|awn|awal)|excluded|exclusion|did not complete|incomplete|"
                            r"missing (?:data|responses|answers)|non-?respon\w+|unusable|invalid|discarded|lost to follow|declined|"
                            r"valid (?:responses|questionnaires|cases))\b", re.I)
@@ -410,6 +439,26 @@ def _counts_in(text):
                 continue
             found.setdefault(_COUNT_GROUPS[match.group(2).lower()], {}).setdefault(number, sentence.strip())
     return found
+
+
+def figure_verdict(text_a, sentence_a, number_a, text_b, sentence_b, number_b):
+    """How to treat two different headcounts for the same kind of people.
+
+    explained: one sentence names a cause (dropout, withdrawal, exclusion...) together with the gap or one of the two figures, so the
+    difference is accounted for. A cause mentioned elsewhere that does not account for the gap does not excuse it.
+    needs_context: the two sentences describe different stages, groups or periods, so the figures may not be comparable.
+    impossible: the later section reports MORE people than the earlier one. unexplained: fewer, with nothing accounting for it."""
+    gap = abs(number_a - number_b)
+    forms = {str(gap), f"{gap:,}", str(number_a), f"{number_a:,}", str(number_b), f"{number_b:,}"}   # the cause must sit next to one of the figures
+    for text in ((text_a, text_b) if number_b < number_a else ()):   # a loss of people can be explained; an increase cannot be explained by dropouts
+        for sentence in _SENTENCE_RE.split(text or ""):
+            if _EXPLAINED_RE.search(sentence) and any(re.search(rf"(?<![\d,.]){re.escape(form)}(?![\d])", sentence) for form in forms):
+                return "explained"
+    stage_a = {m.lower() for m in _STAGE_RE.findall(sentence_a)}
+    stage_b = {m.lower() for m in _STAGE_RE.findall(sentence_b)}
+    if stage_a != stage_b:
+        return "needs_context"
+    return "impossible" if number_b > number_a else "unexplained"
 
 
 def figure_conflict(text_a, text_b):
@@ -438,9 +487,8 @@ def apply_figure_conflicts(flow, sections):
         group, number_a, sentence_a, number_b, sentence_b = conflict
         if sentence_a not in a["text"] or sentence_b not in b["text"]:
             continue
-        # A smaller later count is normal when the paper explains it (dropouts, missing answers, exclusions). Only a count
-        # that cannot be explained, such as more people analysed than recruited, or a drop nobody mentions, is flagged.
-        if number_b < number_a and (_EXPLAINED_RE.search(a["text"]) or _EXPLAINED_RE.search(b["text"])):
+        verdict = figure_verdict(a["text"], sentence_a, number_a, b["text"], sentence_b, number_b)
+        if verdict == "explained":
             continue
         written_b = f"{number_b:,}" if f"{number_b:,}" in sentence_b else str(number_b)
         written_a = f"{number_a:,}" if "," in written_b else str(number_a)
@@ -449,6 +497,12 @@ def apply_figure_conflicts(flow, sections):
             "severity": "None", "failed_dimension": "none", "coherence_scores": {}, "link_summary": "",
             "comparison": {"a_says": "", "b_says": ""}, "highlighted_inconsistencies": [], "recommendations": [],
             "reference_list": [], "bridges": []}
+        if verdict == "needs_context":   # shown to the student to check, never scored: the figures may describe different groups or stages
+            explanation.setdefault("unverified", []).append({
+                "section": b["name"], "quote": sentence_b, "reason": "needs_context", "what": f"Check the number of {group}",
+                "why": f"{a['name'].title()} says {number_a:,} {group} and {b['name'].title()} says {number_b:,}, but they may describe different groups or stages."})
+            pair["explanation"] = explanation
+            continue
         explanation["highlighted_inconsistencies"].append({
             "section": b["name"], "quote": sentence_b, "what": f"Different number of {group}",
             "why": f"{a['name'].title()} says {number_a:,} {group}, but {b['name'].title()} says {number_b:,}."})
@@ -457,8 +511,9 @@ def apply_figure_conflicts(flow, sections):
             "section": b["name"], "original_sentence": sentence_b, "recommended_revision": fixed, "kind": "edit",
             "issue": f"This section reports {number_b:,} {group} but {a['name']} reports {number_a:,}. Use the correct number in both places.",
             "category": "numeric"})
-        if rank.get(explanation.get("severity"), 0) < rank["Moderate"]:
-            explanation["severity"] = "Moderate"
+        level = "Moderate" if verdict == "impossible" else "Minor"   # an unexplained drop is a real but smaller flaw than more people analysed than recruited
+        if rank.get(explanation.get("severity"), 0) < rank[level]:
+            explanation["severity"] = level
         explanation["failed_dimension"] = "numeric_consistency"
         pair["numeric_applicable"] = True
         pair["explanation"] = explanation

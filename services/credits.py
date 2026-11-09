@@ -58,8 +58,41 @@ class CreditsService:
         return await asyncio.to_thread(_fetch)
 
     @classmethod
-    async def unlock_report(cls, user_id: str, analysis_run_id: str) -> Dict[str, Any]:
-        """Run the database's atomic report unlock transaction."""
+    async def is_first_scan(cls, user_id: str, analysis_run_id: str) -> bool:
+        """True when this is the user's first scan, which is free. Failed scans do not use it up, and the oldest scan is the free one,
+        so scans started together cannot all be free. A lookup problem never grants the free scan."""
+        import asyncio
+        client = cls._client()
+
+        def _call():
+            return (client.table("analysis_run").select("analysis_run_id").eq("user_id", user_id).neq("status", "failed")
+                    .order("created_at").limit(1).execute().data)
+
+        try:
+            oldest = await asyncio.to_thread(_call)
+        except Exception as exc:
+            logger.warning("Could not check whether scan %s is the first one: %s", analysis_run_id, type(exc).__name__)
+            return False
+        return bool(oldest) and str(oldest[0].get("analysis_run_id")) == str(analysis_run_id)
+
+    @classmethod
+    async def has_free_scan(cls, user_id: str) -> bool:
+        """True while the user has never had a scan that did not fail, so their first scan is still free."""
+        import asyncio
+        client = cls._client()
+
+        def _call():
+            return client.table("analysis_run").select("analysis_run_id").eq("user_id", user_id).neq("status", "failed").limit(1).execute().data
+
+        try:
+            return not await asyncio.to_thread(_call)
+        except Exception as exc:
+            logger.warning("Could not check the free scan for a user: %s", type(exc).__name__)
+            return False
+
+    @classmethod
+    async def unlock_report(cls, user_id: str, analysis_run_id: str, free: bool = False) -> Dict[str, Any]:
+        """Run the database's atomic report unlock transaction. `free` unlocks without charging a credit (the first scan)."""
         import asyncio
         client = cls._client()
 
@@ -67,7 +100,7 @@ class CreditsService:
             return client.rpc("unlock_scan_report", {
                 "p_user_id": user_id,
                 "p_analysis_run_id": analysis_run_id,
-                "p_charge": CREDITS_ENABLED,
+                "p_charge": CREDITS_ENABLED and not free,
             }).execute().data
 
         return await asyncio.to_thread(_call)

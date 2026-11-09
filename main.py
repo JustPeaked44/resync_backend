@@ -39,6 +39,7 @@ from services.gemini import scan_context, scan_status_message
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
+from services import source_files
 
 logger = logging.getLogger("resync.main")
 PROCESS_START = datetime.now(timezone.utc)
@@ -73,11 +74,29 @@ async def application_lifespan(app):
         await asyncio.sleep(INTERRUPTED_GRACE_SECONDS)
         await _sweep_interrupted()
     sweep = asyncio.create_task(sweep_later())
+
+    async def warm_up_model():
+        """Load the local ML model while the server is idle, so the first scan does not wait ~30 seconds for it (the Modal worker
+        has its own warm-up). Best effort: a failure here only means the first scan loads it as before."""
+        if ml_client.backend != "local":
+            return
+        try:
+            def load():
+                import torch
+                from services import v7_logic
+                torch.set_num_threads(max(1, int(os.getenv("ML_THREADS", "1"))))
+                v7_logic.get_model()
+            await asyncio.to_thread(load)
+            logger.info("Local ML model is warm")
+        except Exception as exc:
+            logger.warning("Could not warm up the local ML model: %s", type(exc).__name__)
+    warm = asyncio.create_task(warm_up_model())
     try:
         yield
     finally:
         sweep.cancel()
-        await asyncio.gather(sweep, return_exceptions=True)
+        warm.cancel()
+        await asyncio.gather(sweep, warm, return_exceptions=True)
         executor.shutdown(wait=True)
 
 
@@ -868,6 +887,7 @@ async def _execute_scan_pipeline(
         },
     }
 
+    first_free = await credits_service.is_first_scan(req.user_id, analysis_run_id)   # a user's first scan is free
     result = ScanResponse(
         status="completed",
         analysis_run_id=analysis_run_id,
@@ -879,7 +899,7 @@ async def _execute_scan_pipeline(
         overall_coherence_score=overall_score,
         sections_analyzed=[section["name"] for section in sections],
         manuscript_sections=manuscript_preview_sections(sections, parse_result),
-        access={"unlocked": False, "unlock_cost": 1, "locked_counts": {
+        access={"unlocked": False, "unlock_cost": 0 if first_free else 1, "first_free": first_free, "locked_counts": {
             "sections": max(0, len(sections) - 1),
             "recommendations": max(0, len(recommendations) - 2),
             "citations": len(citations)}},
@@ -1488,7 +1508,9 @@ async def get_scan_status(
 @app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])
 async def unlock_scan(scan_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
     try:
-        return await credits_service.unlock_report(authenticated_user_id, scan_id)
+        free = await credits_service.is_first_scan(authenticated_user_id, scan_id)   # decided here, never by the browser
+        outcome = await credits_service.unlock_report(authenticated_user_id, scan_id, free=free)
+        return {**outcome, "free": True} if free and isinstance(outcome, dict) else outcome
     except Exception as exc:
         message = str(exc)
         if "INSUFFICIENT_CREDITS" in message:
@@ -1670,6 +1692,44 @@ async def get_manuscript_preview(
 # Issue Feedback Endpoint
 # ---------------------------------------------------------------------------
 
+async def _owned_scan(scan_id: str, user_id: str) -> bool:
+    """True when this scan exists and belongs to the signed-in user."""
+    client = DatabasePersistenceService.get_client()
+    try:
+        response = await asyncio.to_thread(lambda: client.table("analysis_run").select("user_id").eq("analysis_run_id", scan_id).execute())
+    except Exception as exc:
+        logger.error("Could not check the owner of scan %s: %s", scan_id, exc)
+        return False
+    return bool(response.data) and response.data[0].get("user_id") == user_id
+
+
+@app.put("/api/scans/{scan_id}/source-file", response_model=None, tags=["Scans"], summary="Keep the original Word file of a scan")
+async def put_source_file(scan_id: str, file: UploadFile = File(...), authenticated_user_id: str = Depends(get_authenticated_user_id)) -> dict:
+    """Stores the student's original .docx (pictures and all) so the report can show it exactly as written on any device."""
+    if not source_files.enabled():
+        return {"stored": False, "reason": "disabled"}
+    if not await _owned_scan(scan_id, authenticated_user_id):
+        raise HTTPException(status_code=404, detail="Scan not found.")
+    if not (file.filename or "").lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Only Word (.docx) files can be kept.")
+    data = await _read_upload(file, "File exceeds maximum allowed size of 25 MB.")
+    if not source_files.looks_like_docx(data):
+        raise HTTPException(status_code=400, detail="That file is not a Word document.")
+    stored = await source_files.save(DatabasePersistenceService.get_client(), authenticated_user_id, scan_id, data)
+    return {"stored": stored}
+
+
+@app.get("/api/scans/{scan_id}/source-file", response_model=None, tags=["Scans"], summary="The original Word file of a scan")
+async def get_source_file(scan_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    from fastapi.responses import Response
+    if not source_files.enabled() or not await _owned_scan(scan_id, authenticated_user_id):
+        raise HTTPException(status_code=404, detail="No stored file.")
+    data = await source_files.load(DatabasePersistenceService.get_client(), authenticated_user_id, scan_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No stored file.")
+    return Response(content=data, media_type=source_files.DOCX_TYPE, headers={"Cache-Control": "private, no-store"})
+
+
 @app.post(
     "/api/issues/{issue_id}/feedback",
     response_model=IssueFeedbackResponse,
@@ -1772,6 +1832,7 @@ async def submit_issue_feedback(
 class CreditBalanceResponse(BaseModel):
     user_id: str
     balance: int
+    first_scan_free: bool = False   # the user's first scan is free
 
 
 class CheckoutRequest(BaseModel):
@@ -1823,7 +1884,7 @@ async def get_credit_balance(
 ) -> CreditBalanceResponse:
     _assert_owner(authenticated_user_id, x_user_id)
     balance = await credits_service.get_balance(x_user_id)
-    return CreditBalanceResponse(user_id=x_user_id, balance=balance)
+    return CreditBalanceResponse(user_id=x_user_id, balance=balance, first_scan_free=await credits_service.has_free_scan(x_user_id))
 
 
 @app.post(

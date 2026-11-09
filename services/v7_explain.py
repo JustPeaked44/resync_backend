@@ -22,8 +22,11 @@ STRICT_RULES = """STRICT RULES:
 3. Do not use outside knowledge; use only supplied text and model scores.
 4. Only assess whether Section B logically correlates with Section A.
 5. Never change model scores; they come from the PyTorch model.
-6. Numbers: if a difference in numbers can be explained by legitimate research reasons (for example attrition or dropouts, missing responses, exclusion criteria, or a smaller group analysed than recruited), do NOT flag it as a contradiction. Only flag numeric inconsistencies if they are physically impossible (for example more people analysed than were ever recruited, percentages that cannot add up, or a total smaller than one of its parts).
-7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section. If you cannot give the exact quote, do not report it."""
+6. Numbers are judged with context, never mechanically. Compare two figures only when they describe the same population, measure, time period and stage of the analysis, and check units and denominators first. (a) If the manuscript itself explains the difference and the explanation accounts for it (for example it says how many withdrew or were excluded and that matches the gap), do NOT flag it; merely mentioning dropouts, exclusions or missing responses somewhere does not excuse a difference unless it accounts for it. (b) If the figures describe the same population, measure, period and analysis but do not reconcile and nothing explains it, flag it as an inconsistency. (c) If the figures are incompatible and cannot be reconciled (for example more people analysed than were ever recruited, or percentages that cannot add up), flag it. (d) If you cannot tell which population, denominator, measure or period a figure refers to, do not make a definitive claim: report the item with "confidence": "needs_verification".
+7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section, with the same capitalization and punctuation. If you cannot give the exact quote, do not report it.
+8. Read both sections yourself first. The model scores and culprit sentences are supporting hints only, never proof: a low score alone is not an inconsistency, and a high score does not prove consistency, because similar sentences can contradict each other through negation or changed values.
+9. Never invent explanations, data, citations, results or methods. If a fix needs a fact that is not in the text (a count, a result, a step), make recommended_revision ask the researcher to verify or clarify that fact instead of inventing it. A linking (bridge) sentence connects sections; it never replaces correcting a real contradiction, and it may only use topics and numbers already in the text.
+10. Severity: Critical = a major, clearly evidenced contradiction or alignment failure that materially undermines the manuscript's claims. Moderate = a meaningful inconsistency, unsupported conclusion or misalignment that needs substantive revision. Minor = a limited issue of clarity, qualification, or a weak but possibly valid connection. None = no sufficiently supported inconsistency."""
 PAIR_PROMPT = """You are an objective logic auditor. Analyze Section A and Section B, two sections of the same manuscript.
 If the provided Overall Coherence score is below 0.85, determine whether there is a REAL logical inconsistency between them. A low score alone is not an inconsistency.
 {rules}
@@ -41,7 +44,7 @@ highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, issue, recommended_revision, category),
 reference_list (array of objects with section, sentence),
 bridges (array of objects with section, placement, sentence).
-severity: assign "None" whenever the text flows logically and the second section addresses the goals the first one sets up. Assign "Critical", "Moderate" or "Minor" ONLY when there is a direct, undeniable contradiction or mismatch that you can quote from the supplied text, and you MUST quote it in highlighted_inconsistencies. "Critical" means the two sections directly contradict each other (quote both sides). "Moderate" means a specific claim, method, goal, or number in one section is clearly inconsistent with what the other section says or promises. "Minor" means a small but real discrepancy in a specific figure, term, or name between the two sections. A different topic, a missing transition, loose wording, or a low score is NOT an inconsistency and must be "None".
+severity: assign "None" whenever the text flows logically and the second section addresses the goals the first one sets up. Assign "Critical", "Moderate" or "Minor" ONLY when there is a direct, undeniable contradiction or mismatch that you can quote from the supplied text, and you MUST quote it in highlighted_inconsistencies. Use the severity definitions in the strict rules, and quote both sides of a contradiction. A different topic, a missing transition, loose wording, or a low score is NOT an inconsistency and must be "None". An item in highlighted_inconsistencies may carry an optional "confidence" field; use "needs_verification" when the manuscript does not give enough context to be sure, and leave it out otherwise.
 failed_dimension says which part of the paper this issue belongs to, so pick the single best fit: "objectives_alignment" (the text drifts from the purpose or aims the paper sets up), "methodology_fit" (how the work was done does not match how it is described elsewhere), "numeric_consistency" (numbers, data, or figures conflict or are missing), "claim_support" (a statement is not backed up by the surrounding text). Use "none" when severity is "None".
 STRICT TRIAGE RULES: If you cannot quote a direct contradiction or mismatch, you MUST set severity to "None" and deduct nothing: return ["No major inconsistencies found."] for highlighted_inconsistencies and empty arrays for recommendations and reference_list (bridges follow their own rule below). A low score alone is not an issue: sections about different parts of a paper naturally score low. FALSE ALARM OVERRIDE: If the provided score is low, but the text actually aligns logically, you MUST return severity "None", output "No major inconsistencies found." in highlighted_inconsistencies, and set recommendations to []. Do not hallucinate issues just because the score is low. You are the ultimate judge of logic. If it makes sense, pass it.
 Do not generate generic advice. Only give a recommendation that directly fixes an exact quote you found, and use that exact quote as its original_sentence. The culprit sentences below are only hints: use one only if it is part of a real issue.
@@ -141,6 +144,26 @@ def recommendation_category(value, scores):
     return min(applicable, key=lambda key: scores[CATEGORY_SCORES[key]])
 
 
+ANSWER_KEYS = ("highlighted_inconsistencies", "recommendations", "link_summary", "comparison", "bridges", "reference_list")
+NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def valid_answer(raw):
+    """A usable AI answer is an object with a valid severity label, or at least answer-shaped content. Anything else (a list, an empty
+    object, an object with unrelated keys, a made-up label) says nothing about the pair and must never read as "reviewed, no issue"."""
+    if not isinstance(raw, dict):
+        return False
+    if "severity" in raw:
+        return isinstance(raw["severity"], str) and raw["severity"].strip().capitalize() in SEVERITIES
+    return any(key in raw for key in ANSWER_KEYS)   # no label: the content must at least be shaped like an answer (severity is then derived from the quotes)
+
+
+def grounded(sentence, *texts):
+    """A linking sentence may only use numbers that already appear in the two sections it connects."""
+    known = {n.replace(",", "") for text in texts for n in NUMBER.findall(text or "")}
+    return all(n.replace(",", "") in known for n in NUMBER.findall(sentence))
+
+
 def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=True):
     raw = raw if isinstance(raw, dict) else {}
     source = {role_a: text_a, role_b: text_b}
@@ -169,7 +192,7 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             return None
         pattern = re.sub(r"(?:\\ )+", lambda _: r"\s+", re.escape(cleaned))
         pattern = pattern.replace("'", "['‘’]").replace('"', '["“”]')
-        match = re.search(pattern, source[section], flags=re.I)
+        match = re.search(pattern, source[section])   # case-sensitive: the quote must be the manuscript's own words
         return match.group() if match else None
 
     issues, unverified = [], []
@@ -179,11 +202,15 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             if (section and item.get("what") != "No major inconsistencies found."
                     and all(isinstance(item.get(k), str) and item[k].strip() for k in ("what", "why"))):
                 quote = verified(section, item.get("quote"))
-                if quote:   # strict traceability: a finding whose exact words are not in the manuscript is never scored
+                if item.get("confidence") == "needs_verification":   # the manuscript lacks the context to be sure: shown, never scored
+                    unverified.append({"section": section, "what": friendly(item["what"]), "why": friendly(item["why"]),
+                                       "reason": "needs_context", **({"quote": quote} if quote else {})})
+                elif quote:   # strict traceability: a finding whose exact words are not in the manuscript is never scored
                     issues.append({"section": section, "quote": quote,
                                    "what": friendly(item["what"]), "why": friendly(item["why"])})
                 else:       # ...but it is remembered as unverified, so a real problem is not lost because one answer slipped
-                    unverified.append({"section": section, "what": friendly(item["what"]), "why": friendly(item["why"])})
+                    unverified.append({"section": section, "what": friendly(item["what"]), "why": friendly(item["why"]),
+                                       "reason": "quote_not_found"})
     recommendations = []
     for item in raw.get("recommendations", []) if isinstance(raw.get("recommendations"), list) else []:
         if not isinstance(item, dict):
@@ -213,7 +240,8 @@ def normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent=
             continue
         section, sentence = section_name(item.get("section")), item.get("sentence")
         if (section and item.get("placement") in ("start", "end") and isinstance(sentence, str) and sentence.strip()
-                and not META_PHRASE.search(sentence) and not already_there(sentence, source.get(section), item["placement"])):
+                and not META_PHRASE.search(sentence) and not already_there(sentence, source.get(section), item["placement"])
+                and grounded(sentence, text_a, text_b)):
             bridges.append({"section": section, "placement": item["placement"], "sentence": friendly(sentence)})
     severity = raw.get("severity").strip().capitalize() if isinstance(raw.get("severity"), str) else None
     quoted = bool(issues) or bool(recommendations)   # verified lines from the paper
@@ -324,8 +352,8 @@ async def explain_pair(role_a, text_a, role_b, text_b, scores, culprits_a, culpr
     for attempt in range(1, EXPLAIN_ATTEMPTS + 1):  # Gemini often returns a transient 429/503 under load
         try:
             raw = await _generate(prompt)
-            if not isinstance(raw, dict):   # an answer that is not an object says nothing: it must not read as "reviewed, no issue"
-                raise ValueError("the answer is not a JSON object")
+            if not valid_answer(raw):   # an answer without a severity says nothing: it must not read as "reviewed, no issue"
+                raise ValueError("the answer has no valid severity")
             result = normalize_explanation(raw, scores, role_a, text_a, role_b, text_b, adjacent)
             break
         except gemini.GeminiQuotaExhausted:
@@ -377,7 +405,7 @@ async def explain_batch(items):
             found = {}
             for entry in answered:
                 item = by_id.get(str(entry.get("pair_id"))) if isinstance(entry, dict) else None
-                if item is None or item["id"] in found:
+                if item is None or item["id"] in found or not valid_answer(entry):   # unusable answers are reviewed again, one by one
                     continue
                 try:
                     explanation = normalize_explanation(entry, item["scores"], item["role_a"], item["text_a"], item["role_b"], item["text_b"], item["adjacent"])
