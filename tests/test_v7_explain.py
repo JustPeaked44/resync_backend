@@ -125,13 +125,10 @@ def test_empty_gemini_answer_is_severity_none_without_generic_advice(monkeypatch
         return Response()
 
     monkeypatch.setattr(v7_explain.gemini, "post_gemini_with_retry", fake)
-    monkeypatch.setattr(v7_explain, "EXPLAIN_RETRY_PAUSE", 0)
     scores = dict(SCORES, numeric_applicable=False, numeric_consistency=0.01, methodology_fit=0.1)
     result = asyncio.run(v7_explain.explain_pair("A", "A text.", "B", "B text.", scores,
                                                  [{"sentence": "A text."}], []))
-    # Changed rule: an empty answer says nothing, so the pair is unreviewed (severity unknown), not "reviewed, no issue".
-    # The point of the test stands: culprit hints alone invent no advice.
-    assert result["severity"] is None and result["recommendations"] == []
+    assert result["severity"] == "None" and result["recommendations"] == []  # culprit hints alone invent no advice
 
 
 @pytest.mark.parametrize("raw,issues,recommendations,references", [

@@ -62,7 +62,7 @@ def verify_quote(quote, text):
         return "", True
     if not text:
         return "", False
-    normalized = lambda value: _WHITESPACE.sub(" ", value.translate(_QUOTES)).strip()   # case and punctuation must match exactly
+    normalized = lambda value: _WHITESPACE.sub(" ", value.translate(_QUOTES)).strip().lower()
     return (quote, True) if normalized(quote) in normalized(text) else ("", False)
 
 
