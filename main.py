@@ -143,7 +143,7 @@ class NotAResearchPaper(HTTPException):
 
 def _scan_concurrency() -> int:
     try:
-        limit = int(os.getenv("SCAN_CONCURRENCY", "3"))
+        limit = int(os.getenv("SCAN_CONCURRENCY", "1"))   # raise only after a memory test on the host (F26: 3 scans at once is unmeasured)
     except ValueError:
         limit = 1
     return limit if limit > 0 else 1
