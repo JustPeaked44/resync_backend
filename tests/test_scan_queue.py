@@ -58,8 +58,10 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
         await asyncio.sleep(0)
         assert started == ["first"]
         third = await main.get_scan_status("third", "owner")
-        assert third.queue_position == 2 and third.estimated_wait_seconds >= 240
-        assert third.status_message_level == "wait" and third.status_message == main.QUEUE_MESSAGE
+        assert third.status == "processing"
+        assert "queue_position" not in third.model_dump()
+        assert "estimated_wait_seconds" not in third.model_dump()
+        assert third.status_message != main.QUEUE_MESSAGE
         gates["first"].set()
         for _ in range(100):
             if "second" in started:
@@ -67,14 +69,13 @@ def test_async_scans_are_fifo_and_poll_positions_advance(monkeypatch):
             await asyncio.sleep(0.01)
         assert rows["first"]["status"] == "failed"
         third = await main.get_scan_status("third", "owner")
-        assert third.queue_position == 1 and third.status_message_level == "wait"
-        assert third.status_message == main.QUEUE_MESSAGE
+        assert third.status == "processing" and third.status_message != main.QUEUE_MESSAGE
         gates["second"].set()
         for _ in range(100):
             if "third" in started:
                 break
             await asyncio.sleep(0.01)
-        assert (await main.get_scan_status("third", "owner")).queue_position is None
+        assert (await main.get_scan_status("third", "owner")).status == "processing"
         gates["third"].set()
         await asyncio.gather(*main._scan_workers)
         assert started == ["first", "second", "third"]

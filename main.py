@@ -980,8 +980,6 @@ class ScanJobResponse(BaseModel):
     """202 response acknowledging an accepted async scan job."""
     status: str
     analysis_run_id: str
-    queue_position: Optional[int] = None
-    estimated_wait_seconds: Optional[int] = None
     status_message: Optional[str] = None
     status_message_level: Optional[str] = None
     elapsed_seconds: Optional[int] = None
@@ -996,8 +994,6 @@ class ScanStatusResponse(BaseModel):
     elapsed_seconds: Optional[int] = None
     failure_kind: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
-    queue_position: Optional[int] = None
-    estimated_wait_seconds: Optional[int] = None
     status_message: Optional[str] = Field(default=None, description="Plain-language AI wait or busy notice while processing")
     status_message_level: Optional[str] = Field(default=None, description="info | wait, matching status_message")
 
@@ -1194,9 +1190,7 @@ async def start_scan(
             await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
             raise
         logger.info("Accepted async scan job: %s", analysis_run_id)
-        position, estimate, level, message = _queue_state(analysis_run_id)
-        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
-                               estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, elapsed_seconds=0)
     finally:
         if not handed_off:
             _release_reservation(reservation)
@@ -1283,9 +1277,7 @@ async def upload_and_start_scan(
             await _mark_failed(analysis_run_id, GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8]))
             raise
         logger.info("Accepted async file scan job: %s (file: %s)", analysis_run_id, file.filename)
-        position, estimate, level, message = _queue_state(analysis_run_id)
-        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, queue_position=position,
-                               estimated_wait_seconds=estimate, status_message=message, status_message_level=level, elapsed_seconds=0)
+        return ScanJobResponse(status="processing", analysis_run_id=analysis_run_id, elapsed_seconds=0)
     finally:
         if not handed_off:
             _release_reservation(reservation)
@@ -1478,12 +1470,9 @@ async def get_scan_status(
             result=locked_scan_view(result_json)
         )
 
-    position, estimate, level, message = _queue_state(analysis_run_id)
-    if position is None:
-        level, message = scan_status_message(analysis_run_id)
+    level, message = scan_status_message(analysis_run_id)
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id,
-                              elapsed_seconds=elapsed, queue_position=position, estimated_wait_seconds=estimate,
-                              status_message=message, status_message_level=level)
+                              elapsed_seconds=elapsed, status_message=message, status_message_level=level)
 
 
 @app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])
