@@ -78,6 +78,13 @@ ROLE_MAPPING: dict = {
     "background of the study":           "introduction",
     "rationale":                         "introduction",
     "rationale of the study":            "introduction",
+    # the short sections of a thesis' first chapter: each is a section of its own, so text is not credited to the section above it
+    "significance of the study":         "introduction",
+    "flow of the study":                 "introduction",
+    "organization of the study":         "introduction",
+    "definition of terms":               "introduction",
+    "definition of key terms":           "introduction",
+    "operational definition of terms":   "introduction",
 
     # objectives
     "objectives":                        "objectives",
@@ -136,6 +143,10 @@ ROLE_MAPPING: dict = {
     "scope and limitation":              "limitations",
     "scope and limitation of the study": "limitations",
     "scope and limitations of the study": "limitations",
+    "scope and delimitation":            "limitations",
+    "scope and delimitations":           "limitations",
+    "scope and delimitation of the study": "limitations",
+    "delimitations of the study":        "limitations",
 
     # future_work
     "future work":                       "future_work",
