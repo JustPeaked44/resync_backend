@@ -89,27 +89,28 @@ def rpm():
 
 
 class CallLimiter:
-    """Process-wide rolling-window limit on Gemini requests. Every request, retries included, takes a slot."""
+    """Per-key rolling windows shared by all scans; retries also take a slot."""
 
     def __init__(self):
         self.clock = time.monotonic
         self.sleep = asyncio.sleep
-        self.sent = collections.deque()
+        self.sent = {}  # hashed key -> rolling window
+        self.lock = asyncio.Lock()  # FIFO: the oldest waiting request takes the next slot
         self.waits = {}          # scan id -> end times of the waits in progress
         self.over_budget = set()  # scan ids whose remaining calls cannot fit in one window
         self.retrying_429 = set()
         self.rate_limited = set()
 
     def _prune(self, now):
-        while self.sent and now - self.sent[0] >= RATE_WINDOW_SECONDS:
-            self.sent.popleft()
+        for window in self.sent.values():
+            while window and now - window[0] >= RATE_WINDOW_SECONDS:
+                window.popleft()
 
-    def seconds_until_slot(self):
+    def seconds_until_slot(self, key=None):
         now = self.clock()
         self._prune(now)
-        if len(self.sent) < rpm():
-            return 0.0
-        return self.sent[0] + RATE_WINDOW_SECONDS - now
+        window = self.sent.get(_key_id(key), ())
+        return max(0.0, window[0] + RATE_WINDOW_SECONDS - now) if len(window) >= rpm() else 0.0
 
     async def pause(self, scan_id, seconds):
         end = self.clock() + seconds
@@ -121,17 +122,35 @@ class CallLimiter:
             if not self.waits[scan_id]:
                 del self.waits[scan_id]
 
-    async def acquire(self, scan_id, spent):
-        """Waits for a free rolling-window slot and takes it. Returns the total seconds spent, or None past the cap."""
-        while True:
-            wait = self.seconds_until_slot()
-            if not wait:
-                self.sent.append(self.clock())
-                return spent
-            if spent + wait > RETRY_CAP_SECONDS:
-                return None
-            await self.pause(scan_id, wait)
-            spent += wait
+    async def acquire(self, scan_id, spent, retry_key=None):
+        """Reserve the earliest available key in FIFO request order, within the retry cap."""
+        started = self.clock()
+        try:
+            async with asyncio.timeout(max(0.001, RETRY_CAP_SECONDS - spent)):
+                await self.lock.acquire()
+        except asyncio.TimeoutError:
+            return None
+        try:
+            spent += self.clock() - started
+            while spent <= RETRY_CAP_SECONDS:
+                now = time.monotonic()
+                keys = [key for key in _configured_keys() if now >= _quota_blocked_until.get(_key_id(key), 0.0)]
+                if not keys:
+                    raise GeminiQuotaExhausted("The AI's temporary limit was reached")
+                if retry_key in keys:
+                    keys = [retry_key]
+                key = min(keys, key=self.seconds_until_slot)
+                wait = self.seconds_until_slot(key)
+                if not wait:
+                    self.sent.setdefault(_key_id(key), collections.deque()).append(self.clock())
+                    return spent, key
+                if spent + wait > RETRY_CAP_SECONDS:
+                    return None
+                await self.pause(scan_id, wait)
+                spent += wait
+            return None
+        finally:
+            self.lock.release()
 
     def status(self, scan_id):
         now = self.clock()
@@ -142,7 +161,9 @@ class CallLimiter:
             seconds = math.ceil(max(ends) - now)
             return "wait", f"Waiting for the AI to be ready again (about {seconds} second{'' if seconds == 1 else 's'})."
         self._prune(now)
-        if scan_id is not None and (scan_id in self.over_budget or len(self.sent) >= 0.8 * rpm()):
+        active = [key for key in _configured_keys() if time.monotonic() >= _quota_blocked_until.get(_key_id(key), 0.0)]
+        used = sum(len(self.sent.get(_key_id(key), ())) for key in active)
+        if scan_id is not None and (scan_id in self.over_budget or (active and used >= 0.8 * rpm() * len(active))):
             return "info", BUSY_MESSAGE
         return None, None
 
@@ -153,7 +174,8 @@ LIMITER = CallLimiter()
 def expect_calls(count):
     """Flags the current scan while it needs more Gemini calls than one rolling window allows. Zero clears it."""
     scan_id = scan_context.get()
-    if count > rpm():
+    available = sum(time.monotonic() >= _quota_blocked_until.get(_key_id(key), 0.0) for key in _configured_keys())
+    if count > rpm() * available:
         LIMITER.over_budget.add(scan_id)
     else:
         LIMITER.over_budget.discard(scan_id)
@@ -216,16 +238,17 @@ async def post_gemini_with_retry(payload):
     spent = 0.0
     response = None
     transport_failures = 0
+    retry_key = None
     try:
         while True:
-            spent = await LIMITER.acquire(scan_id, spent)
-            if spent is None:
-                break
-            available = _available_key()
-            if available is None:
+            try:
+                slot = await LIMITER.acquire(scan_id, spent, retry_key)
+            except GeminiQuotaExhausted:
                 LIMITER.rate_limited.add(scan_id)
-                raise GeminiQuotaExhausted("The AI's temporary limit was reached")
-            _, key = available
+                raise
+            if slot is None:
+                break
+            spent, key = slot
             try:
                 response = await _send(payload, key)
             except httpx.TransportError:  # timeout or dropped connection
@@ -238,6 +261,7 @@ async def post_gemini_with_retry(payload):
             if response.status_code == 429:
                 if _is_daily_quota(response):
                     _quota_blocked_until[_key_id(key)] = time.monotonic() + QUOTA_RECHECK_SECONDS
+                    retry_key = None
                     available = _available_key()
                     if available is not None:
                         logging.getLogger("resync.gemini").warning("Gemini switching to the %s key", "first" if available[0] == 0 else "second")
@@ -245,12 +269,13 @@ async def post_gemini_with_retry(payload):
                     LIMITER.rate_limited.add(scan_id)
                     logging.getLogger("resync.gemini").warning("Gemini quota exhausted; pausing AI reviews for %ss", QUOTA_RECHECK_SECONDS)
                     raise GeminiQuotaExhausted("The AI's temporary limit was reached")
+                retry_key = key
                 LIMITER.rate_limited.add(scan_id)
                 LIMITER.retrying_429.add(scan_id)
             if not _is_retryable(response):
                 return response
             logging.getLogger("resync.gemini").warning("Gemini returned %s", response.status_code)
-            delay = _retry_delay(response) or max(1.0, LIMITER.seconds_until_slot())
+            delay = _retry_delay(response) or max(1.0, LIMITER.seconds_until_slot(key))
             if spent + delay > RETRY_CAP_SECONDS:
                 break
             await LIMITER.pause(scan_id, delay)

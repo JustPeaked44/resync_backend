@@ -128,7 +128,9 @@ def test_safe_failure_and_cancellation(monkeypatch):
 
 def test_concurrency_default(monkeypatch):
     monkeypatch.delenv('SCAN_CONCURRENCY', raising=False)
-    assert main._scan_concurrency() == 1
+    assert main._scan_concurrency() == 3
+    monkeypatch.setenv('SCAN_CONCURRENCY', '2')
+    assert main._scan_concurrency() == 2
     monkeypatch.setenv('SCAN_CONCURRENCY', 'bad')
     assert main._scan_concurrency() == 1
 

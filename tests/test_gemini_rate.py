@@ -170,3 +170,78 @@ def test_overloaded_503_is_retried(monkeypatch, clock):
     response = asyncio.run(gemini.post_gemini_with_retry({}))
     assert response.status_code == 200
     assert clock.waits == [1.0]
+
+
+def test_each_key_has_its_own_window_and_uses_free_key(monkeypatch, clock):
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK", "test-fallback")
+    calls = []
+
+    async def send(_, key):
+        calls.append((key == "test-primary", clock.t))
+        return ok_response()
+
+    monkeypatch.setattr(gemini, "_send", send)
+
+    async def run():
+        await asyncio.gather(*(gemini.post_gemini_with_retry({}) for _ in range(29)))
+
+    asyncio.run(run())
+    assert sum(primary for primary, _ in calls[:28]) == 14
+    assert all(t == 0 for _, t in calls[:28])
+    assert calls[28][1] == 60
+    for primary in (True, False):
+        times = [t for is_primary, t in calls if is_primary == primary]
+        assert all(sum(t <= other < t + 60 for other in times) <= 14 for t in times)
+
+
+def test_waiting_requests_are_served_fifo_and_cancelled_waiter_is_removed(monkeypatch, clock):
+    monkeypatch.setenv("GEMINI_RPM", "1")
+    order = []
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def sleep(seconds):
+        entered.set()
+        await gate.wait()
+        clock.t += seconds
+        await asyncio.sleep(0)
+
+    async def send(payload, _):
+        order.append(payload["name"])
+        return ok_response()
+
+    gemini.LIMITER.sleep = sleep
+    monkeypatch.setattr(gemini, "_send", send)
+
+    async def run():
+        await gemini.post_gemini_with_retry({"name": "initial"})
+        first = asyncio.create_task(gemini.post_gemini_with_retry({"name": "first"}))
+        await entered.wait()
+        cancelled = asyncio.create_task(gemini.post_gemini_with_retry({"name": "cancelled"}))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(gemini.post_gemini_with_retry({"name": "second"}))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        gate.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(run())
+    assert order == ["initial", "first", "second"]
+
+
+def test_minute_429_keeps_same_key_even_when_other_key_is_free(monkeypatch, clock):
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK", "test-fallback")
+    monkeypatch.setenv("GEMINI_RPM", "1")
+    calls = []
+
+    async def send(_, key):
+        calls.append(key == "test-primary")
+        return retry_response("1s") if len(calls) == 1 else ok_response()
+
+    monkeypatch.setattr(gemini, "_send", send)
+    response = asyncio.run(gemini.post_gemini_with_retry({}))
+    assert response.status_code == 200
+    assert calls == [True, True]
+    assert clock.t == 60

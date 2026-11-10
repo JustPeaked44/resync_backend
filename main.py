@@ -143,14 +143,12 @@ class NotAResearchPaper(HTTPException):
 
 def _scan_concurrency() -> int:
     try:
-        limit = int(os.getenv("SCAN_CONCURRENCY", "1"))
+        limit = int(os.getenv("SCAN_CONCURRENCY", "3"))
     except ValueError:
         limit = 1
     return limit if limit > 0 else 1
 
 
-# Gemini's rolling request limit is shared by every scan in the process (services/gemini.py), so more scans never exceed
-# it: they split it.
 SCAN_CONCURRENCY = _scan_concurrency()
 SCAN_SLOT = asyncio.Semaphore(SCAN_CONCURRENCY)
 # shortcut: tickets live in one process; use durable storage if scans must survive restarts or multiple workers.
@@ -1104,7 +1102,7 @@ async def run_scan(
 ) -> ScanResponse:
     """Synchronous free scan; returns the locked result after persistence.
 
-    Only one scan runs at a time (see SCAN_SLOT). Rather than blocking here
+    Scan concurrency is limited by SCAN_SLOT. Rather than blocking here
     and risking Render's 100s proxy timeout while merely queued, this fails
     fast with 503 so the Android client gets an honest "busy, retry" instead
     of a silent timeout."""
