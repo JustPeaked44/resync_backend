@@ -145,3 +145,22 @@ def test_a_check_started_early_gives_the_same_report_as_one_run_in_place(monkeyp
 
     assert asyncio.run(early()) == asyncio.run(full_check.apply_full_check(flow_late, sections)) == 1
     assert flow_early[-1]["explanation"] == flow_late[-1]["explanation"]
+
+
+def test_finding_fact_ids_keep_word_boundaries(monkeypatch):
+    async def extract(name, text):
+        return [{"statement": name, "quote": text}] * (2 if name == "first" else 1)
+
+    async def cross_check(facts):
+        return [{"fact_a": "F1", "fact_b": "F3", "what": "whereas F3 says", "why": "Statement F3 says the statement F3 (F3). F3. the  the F1."}]
+
+    async def confirm(candidates):
+        return {}
+
+    monkeypatch.setattr(full_check, "_extract", extract)
+    monkeypatch.setattr(full_check, "_cross_check", cross_check)
+    monkeypatch.setattr(full_check, "_confirm", confirm)
+    sections = [{"name": name, "text": ("word " * 100).strip()} for name in ("first", "second")]
+    candidates, _ = asyncio.run(full_check._prepare(sections))
+    assert candidates[0]["what"] == "whereas the second section says"
+    assert candidates[0]["why"] == "the second section says the second section (the second section). the second section. the first section."

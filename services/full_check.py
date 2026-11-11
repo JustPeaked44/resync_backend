@@ -348,7 +348,7 @@ async def _prepare(sections: List[Dict[str, Any]]):
         # The AI names statements by id ("Statement F3"); the student sees section names instead.
         def plain(text, a=a, b=b):
             for fact in (a, b):
-                text = re.sub(rf"\b(?:the )?(?:statement|fact)?\s*{fact['id']}\b", f"the {fact['section']} section", text, flags=re.I)
+                text = re.sub(rf"\b(?:(?:the\s+)?(?:statement|fact)\s+|the\s+)?{fact['id']}\b", f"the {fact['section']} section", text, flags=re.I)
             return re.sub(r"\bthe the\b", "the", re.sub(r"\s+", " ", text)).strip()
         what, why = plain(what), plain(why)
         fix = by_id.get(str(item.get("fix_id")))
