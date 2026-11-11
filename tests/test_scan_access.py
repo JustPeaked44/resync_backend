@@ -46,7 +46,7 @@ def test_locked_view_withholds_report_content_everywhere():
         assert projected["placeholder"]["paragraphs"]
     assert [r["id"] for r in locked["recommendations"]] == ["r-1-1", "r-1-2"]
     assert [r["category"] for r in locked["recommendations"]] == ["objectives", "claims"]
-    assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1}
+    assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1, "all_clear": 0}
     assert locked["citations"] == locked["inconsistencies"] == []
     assert locked["manuscript_flow"][0]["scores"]["overall_coherence"] == 0.4
     assert locked["score_breakdown"]["dimension_weights"] == {"claim_support": 1}
@@ -58,6 +58,32 @@ def test_locked_view_withholds_report_content_everywhere():
     assert locked_scan_view(dict(original, access={"unlocked": True})) == dict(original, access={"unlocked": True})
     assert locked_scan_view({k: v for k, v in original.items() if k != "access"}) == {
         k: v for k, v in original.items() if k != "access"}
+
+
+def test_all_clear_excludes_hidden_suggestions_unreviewed_and_invalid_pairs():
+    full = {"access": {"unlocked": False}, "manuscript_sections": [
+        {"name": "Intro", "text": "Visible."}, {"name": "Method", "text": "Hidden."}],
+        "recommendations": [
+            {"section": "Intro", "original_sentence": "Visible.", "pair_order": 1, "recommended_revision": "A suggestion."},
+            {"section": "Method", "pair_order": 2, "recommended_revision": "Another suggestion."},
+            {"section": "Method", "pair_order": 3, "recommended_revision": "Hidden advice."},
+            {"section": "Method", "pair_order": 4, "recommended_revision": " ** ` "}],
+        "manuscript_flow": [
+            {"order": order, "section_a": "Intro", "section_b": "Method", "severity": "None",
+             "scores": {"overall_coherence": 0.8}, "culprit_sentences": {}}
+            for order in range(1, 7)],
+        "citations": [], "inconsistencies": [], "ai_synthesis": {"summary": None}}
+    full["manuscript_flow"][4]["scores"]["overall_coherence"] = None
+    full["manuscript_flow"][5]["section_b"] = "Intro"
+    locked = locked_scan_view(full)
+    assert len(locked["recommendations"]) == 2
+    # Of the reviewed valid pairs, the unlocked list has one without usable advice.
+    unlocked_clear = [pair for pair in full["manuscript_flow"][:4]
+                      if pair["severity"] == "None" and not any(
+                          rec["pair_order"] == pair["order"] and rec["recommended_revision"].strip(" *`")
+                          for rec in full["recommendations"])]
+    assert len(unlocked_clear) == locked["access"]["locked_counts"]["all_clear"] == 1
+    assert "Hidden advice." not in json.dumps(locked)
 
 
 def test_placeholders_are_bounded_deterministic_and_do_not_echo_withheld_words():
