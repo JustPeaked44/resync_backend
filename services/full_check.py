@@ -22,7 +22,9 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from services import gemini, v7_explain
@@ -33,7 +35,7 @@ logger = logging.getLogger("resync.full_check")
 VERSION = "1"                      # bump when the prompts below change, so remembered answers are not reused
 CHUNK_CHARS = int(os.getenv("FULL_CHECK_CHUNK_CHARS", "12000"))
 MAX_CHUNK_CALLS = int(os.getenv("FULL_CHECK_MAX_CALLS", "80"))   # a safety stop for a huge paper
-CONCURRENCY = 6
+CONCURRENCY = int(os.getenv("FULL_CHECK_CONCURRENCY", "3"))
 MAX_FACTS_PER_CHUNK = 30
 LEDGER_SPLIT_CHARS = 120_000       # a longer list of statements is compared in two calls
 MAX_CONFLICTS = 12
@@ -104,7 +106,10 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> List[str]:
     return chunks
 
 
-ASK_PAUSES = (2.0, 5.0)            # waits between the 3 tries of one Gemini call (a 503 usually clears within seconds)
+ASK_PAUSES = (2.0, 5.0, 12.0, 25.0)
+ASK_WAIT_CAP = 45.0
+_jitter = random.Random()
+_failure_kind = contextvars.ContextVar("full_check_failure_kind", default=None)
 
 # What happened in the current whole-paper run. _prepare sets it; the steps below mark what failed. A plain dict shared
 # through the context, so the steps keep their signatures.
@@ -128,30 +133,54 @@ def _snippet(error: Exception) -> str:
 
 
 async def _ask(prompt: str, label: str) -> Optional[Dict[str, Any]]:
-    """One Gemini answer as a dict, or None when it could not be had (quota, errors). Three tries."""
+    """Ask up to five times, keeping malformed answers distinct from transient failures."""
+    _failure_kind.set(None)
+    waited = 0.0
     tries = len(ASK_PAUSES) + 1
     for attempt in range(1, tries + 1):
         try:
             raw = await v7_explain._generate(prompt, max_tokens=32768)
-            return raw if isinstance(raw, dict) else None
+            if not isinstance(raw, dict):
+                _failure_kind.set("malformed")
+                return None
+            return raw
         except gemini.GeminiQuotaExhausted:
+            _failure_kind.set("transient")
             logger.warning("Full check (%s) skipped: the AI's limit was reached", label)
             return None
         except Exception as error:
-            logger.warning("Full check (%s) failed (attempt %s of %s) %s", label, attempt, tries, _snippet(error))
-            if attempt < tries:
-                await asyncio.sleep(ASK_PAUSES[attempt - 1])
+            malformed = isinstance(error, (ValueError, KeyError, IndexError, TypeError))
+            _failure_kind.set("malformed" if malformed else "transient")
+            response = getattr(error, "response", None)
+            retry_after = getattr(response, "headers", {}).get("Retry-After") if response is not None else None
+            logger.warning("Full check (%s) failed (attempt %s of %s) %s%s", label, attempt, tries,
+                           _snippet(error), f" Retry-After: {retry_after}" if retry_after is not None else "")
+            if malformed or attempt == tries:
+                break
+            delay = ASK_PAUSES[attempt - 1] * _jitter.uniform(0.75, 1.25)
+            try:
+                delay = max(delay, float(retry_after)) if retry_after is not None else delay
+            except (ValueError, TypeError):
+                pass
+            if waited + delay > ASK_WAIT_CAP:
+                break
+            await asyncio.sleep(delay)
+            waited += delay
     return None
 
 
 async def _extract(section: str, chunk: str) -> Optional[List[Dict[str, str]]]:
     """The checkable statements of one piece of one section, each with a sentence that really is in the text."""
+    _failure_kind.set(None)
     key = VerdictCache.fingerprint("full-check-facts", VERSION, section, chunk)
     saved = (await VerdictCache.get_many([key])).get(key)
     if saved is not None and isinstance(saved.get("facts"), list):
         return saved["facts"]
     raw = await _ask(FACT_PROMPT.format(section=section, text=chunk), f"read {section}")
-    if raw is None or not isinstance(raw.get("facts"), list):
+    if raw is None:
+        return None
+    if not isinstance(raw.get("facts"), list):
+        _failure_kind.set("malformed")
         return None
     facts = []
     for item in raw["facts"][:MAX_FACTS_PER_CHUNK]:
@@ -312,7 +341,8 @@ def start(sections: List[Dict[str, Any]]) -> Optional["asyncio.Future"]:
     return asyncio.ensure_future(_prepare(sections))
 
 
-SECOND_PASS_PAUSE = 5.0            # before the one more pass over the pieces the AI could not read the first time
+EXTRA_PASS_PAUSES = (15.0, 20.0)
+EXTRA_TIME_BUDGET = 90.0
 
 
 async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], roles: Optional[Dict[str, str]] = None,
@@ -327,16 +357,25 @@ async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, 
     try:
         found = await (prepared if prepared is not None else _prepare(sections))
         stats = getattr(found, "stats", None)
-        if stats and stats["state"] != "ran":
-            # The AI had a bad moment. One more pass at the end: pieces already read come from the cache, so only the lost ones are asked again.
-            await asyncio.sleep(SECOND_PASS_PAUSE)
+        deadline = time.monotonic() + EXTRA_TIME_BUDGET
+        for pause in EXTRA_PASS_PAUSES:
+            if not stats or stats["state"] == "ran":
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= pause:
+                break
             try:
-                again = await _prepare(sections, announce=False)
+                async def retry_pass():
+                    await asyncio.sleep(pause)
+                    return await _prepare(sections, announce=False)
+                again = await asyncio.wait_for(retry_pass(), timeout=remaining)
                 found, stats = again, again.stats
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                break
             except Exception:
-                logger.exception("Full check second pass failed; keeping the first pass")
+                logger.exception("Full check extra pass failed; keeping the previous pass")
         if status is not None and stats:
             status.update(stats)
         return _commit(flow, sections, found)
@@ -396,7 +435,7 @@ async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run:
             name, chunk = sections[job[0]]["name"], job[1]
             found = await _extract(name, chunk)
             lost = found is None
-            if found is None and len(chunk) > 2500:   # an answer that came back broken: read the same piece again in two halves
+            if found is None and _failure_kind.get() == "malformed" and len(chunk) > 2500:   # an answer that came back broken: read the same piece again in two halves
                 halves = chunk_text(chunk, size=len(chunk) // 2 + 1)
                 parts = [await _extract(name, half) for half in halves]
                 found = [fact for part in parts for fact in (part or [])] if any(part is not None for part in parts) else None
