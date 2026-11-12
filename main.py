@@ -308,7 +308,12 @@ async def _check_scan_rate_limit(user_id: str) -> None:
 # real Gemini quota for free. Fine for local dev; set ENABLE_TEST_ENDPOINTS=
 # false in production to 404 them.
 # ---------------------------------------------------------------------------
-ENABLE_TEST_ENDPOINTS = os.getenv("ENABLE_TEST_ENDPOINTS", "true").strip().lower() not in ("false", "0", "no")
+ENABLE_TEST_ENDPOINTS = os.getenv("ENABLE_TEST_ENDPOINTS", "false").strip().lower() in ("true", "1", "yes")
+
+def _require_simulated_payments() -> None:
+    """Credits are granted without a verified payment (capstone sandbox). Set SIMULATED_PAYMENTS_ENABLED=false before real money is involved."""
+    if os.getenv("SIMULATED_PAYMENTS_ENABLED", "true").strip().lower() not in ("true", "1", "yes"):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Credit purchases are not available right now.")
 
 
 def _require_test_endpoints_enabled() -> None:
@@ -611,7 +616,7 @@ async def _resolve_manuscript_id(db_client: Any, req: ScanRequest, default_sourc
     """
     if req.manuscript_id:
         ms_resp = await asyncio.to_thread(
-            lambda: db_client.table("manuscript").select("manuscript_id").eq("manuscript_id", req.manuscript_id).execute()
+            lambda: db_client.table("manuscript").select("manuscript_id").eq("manuscript_id", req.manuscript_id).eq("user_id", req.user_id).execute()
         )
         if not ms_resp.data:
             raise HTTPException(
@@ -1864,6 +1869,7 @@ async def confirm_credit_checkout(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> ConfirmCheckoutResponse:
     _assert_owner(authenticated_user_id, x_user_id)
+    _require_simulated_payments()
     try:
         balance = await credits_service.confirm_checkout(x_user_id, body.pymt_txn_id)
         return ConfirmCheckoutResponse(status="paid", balance=balance)
@@ -2231,6 +2237,7 @@ async def purchase_credits(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> PurchaseResponse:
     _assert_owner(authenticated_user_id, x_user_id)
+    _require_simulated_payments()
     proof = None
     if body.proof:
         if body.proof.content_type not in PROOF_TYPES:
