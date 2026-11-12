@@ -5,6 +5,8 @@ from hashlib import sha256
 import random
 import re
 
+from services.citation_display import add_citation_display_status
+
 
 FILLER_WORDS = ("calm", "pale", "soft", "open", "clear", "quiet", "light", "plain")
 
@@ -61,6 +63,12 @@ def display_counts(result):
                          and pair.get("severity") == "None" and pair.get("order") not in advice),
         "citations": len(result.get("citations") or []),
     }
+
+
+def scan_view(result_json):
+    result = add_citation_display_status(deepcopy(result_json))
+    counts = display_counts(result)
+    return {**locked_scan_view(result), "display_counts": counts}
 
 
 def _filler(length, rng):

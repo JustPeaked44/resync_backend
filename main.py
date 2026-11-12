@@ -1,4 +1,3 @@
-from copy import deepcopy
 import os
 import json
 import base64
@@ -39,8 +38,7 @@ from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
-from services.scan_access import display_counts, locked_scan_view
-from services.citation_display import add_citation_display_status
+from services.scan_access import locked_scan_view, scan_view
 
 logger = logging.getLogger("resync.main")
 PROCESS_START = datetime.now(timezone.utc)
@@ -509,6 +507,7 @@ class CitationReport(BaseModel):
     citation_raw_reference_text: str
     citation_is_accessible: bool
     citation_status: str = "no_link"
+    display_status: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
     citation_primary_link: Optional[str] = None
     citation_authors_parsed: Optional[str] = None
     citation_year_parsed: Optional[int] = None
@@ -572,6 +571,7 @@ class ScanResponse(BaseModel):
     ai_synthesis: Dict[str, Any]
     citations_audited: int
     citations: List[CitationReport]
+    display_counts: Optional[Dict[str, int]] = Field(default=None, exclude_if=lambda value: value is None)
     score_breakdown: Optional[ScoreBreakdown] = None
     dimension_breakdown: Optional[Dict[str, Dict[str, Any]]] = None
     rescan_unchanged: bool = False  # this exact text was scanned before: nothing in the manuscript has changed since
@@ -1135,7 +1135,7 @@ async def run_scan(
         scan_user.set(req.user_id)
         try:
             result = await asyncio.wait_for(_execute_scan_pipeline(req, analysis_run_id, manuscript_id, credits_remaining), SCAN_DEADLINE_SECONDS)
-            return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
+            return ScanResponse.model_validate(scan_view(result.model_dump(mode="json")))
         except BaseException as exc:
             logger.exception("Synchronous scan failed: %s", analysis_run_id)
             await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
@@ -1368,7 +1368,7 @@ async def upload_and_run_scan(
                 req, analysis_run_id, resolved_manuscript_id, credits_remaining,
                 file_bytes=file_bytes, filename=file.filename,
             ), SCAN_DEADLINE_SECONDS)
-            return ScanResponse.model_validate(locked_scan_view(result.model_dump(mode="json")))
+            return ScanResponse.model_validate(scan_view(result.model_dump(mode="json")))
         except BaseException as exc:
             logger.exception("Synchronous scan failed: %s", analysis_run_id)
             await _mark_failed(analysis_run_id, _failure_message(analysis_run_id, exc))
@@ -1464,12 +1464,10 @@ async def get_scan_status(
     # Older rows can say completed without a saved report.
     result_json = row.get(RUN_RESULT)
     if job_status == "completed" and result_json:
-        result_json = add_citation_display_status(deepcopy(result_json))
-        counts = display_counts(result_json)
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result={**locked_scan_view(result_json), "display_counts": counts}
+            result=scan_view(result_json)
         )
 
     level, message = scan_status_message(analysis_run_id)
