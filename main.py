@@ -1,3 +1,4 @@
+from copy import deepcopy
 import os
 import json
 import base64
@@ -39,6 +40,7 @@ from services.gemini import scan_context, scan_status_message
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view
+from services.citation_display import add_citation_display_status
 
 logger = logging.getLogger("resync.main")
 PROCESS_START = datetime.now(timezone.utc)
@@ -1462,6 +1464,7 @@ async def get_scan_status(
     # Older rows can say completed without a saved report.
     result_json = row.get(RUN_RESULT)
     if job_status == "completed" and result_json:
+        result_json = add_citation_display_status(deepcopy(result_json))
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
