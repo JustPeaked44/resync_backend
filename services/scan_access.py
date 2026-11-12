@@ -51,6 +51,18 @@ def _has_revision(recommendation):
     return bool(text.strip())
 
 
+def display_counts(result):
+    sections = result.get("manuscript_sections") or []
+    advice = {item.get("pair_order") for item in result.get("recommendations") or [] if _has_revision(item)}
+    pairs = [pair for pair in result.get("manuscript_flow") or [] if _usable_pair(pair, sections)]
+    return {
+        "recommendations": len({pair.get("order") for pair in pairs if pair.get("order") in advice}),
+        "all_clear": sum(1 for pair in pairs if pair.get("scores", {}).get("overall_coherence") is not None
+                         and pair.get("severity") == "None" and pair.get("order") not in advice),
+        "citations": len(result.get("citations") or []),
+    }
+
+
 def _filler(length, rng):
     words = []
     while len(" ".join(words)) < length:

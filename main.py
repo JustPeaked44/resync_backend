@@ -39,7 +39,7 @@ from services.reference_parser import extract_intext_citations
 from services.gemini import scan_context, scan_status_message
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
-from services.scan_access import locked_scan_view
+from services.scan_access import display_counts, locked_scan_view
 from services.citation_display import add_citation_display_status
 
 logger = logging.getLogger("resync.main")
@@ -1465,10 +1465,11 @@ async def get_scan_status(
     result_json = row.get(RUN_RESULT)
     if job_status == "completed" and result_json:
         result_json = add_citation_display_status(deepcopy(result_json))
+        counts = display_counts(result_json)
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result=locked_scan_view(result_json)
+            result={**locked_scan_view(result_json), "display_counts": counts}
         )
 
     level, message = scan_status_message(analysis_run_id)
