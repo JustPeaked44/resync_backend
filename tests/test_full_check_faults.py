@@ -2,7 +2,10 @@ import asyncio
 from collections import Counter, defaultdict
 import hashlib
 import json
+import os
 import random
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 
@@ -13,6 +16,18 @@ from services import full_check, gemini
 from tests.test_full_check import _flow, METHOD_SENTENCE, CONCLUSION_SENTENCE
 
 _real_sleep = asyncio.sleep
+
+
+@pytest.mark.parametrize("value, expected", [(None, "6"), ("2", "2")])
+def test_concurrency_default_and_override(value, expected):
+    env = os.environ.copy()
+    env.pop("FULL_CHECK_CONCURRENCY", None)
+    if value is not None:
+        env["FULL_CHECK_CONCURRENCY"] = value
+    result = subprocess.check_output(
+        [sys.executable, "-c", "from services.full_check import CONCURRENCY; print(CONCURRENCY)"], env=env, text=True
+    )
+    assert result.strip() == expected
 
 
 async def _no_pause(*args):
