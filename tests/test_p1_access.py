@@ -94,3 +94,17 @@ assert response.status_code == 404, response.status_code
 '''
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_every_callable_security_definer_function_is_locked_by_a_migration():
+    import re
+    from pathlib import Path
+    migrations = Path(__file__).resolve().parent.parent / "migrations"
+    text = {p.name: p.read_text(encoding="utf-8-sig") for p in migrations.glob("*.sql")}
+    defined = set()
+    for sql in text.values():
+        for match in re.finditer(r"CREATE OR REPLACE FUNCTION public\.(\w+)\((.*?)\)\s*RETURNS\s+(\w+)(.*?)AS \$\$", sql, re.S | re.I):
+            if "SECURITY DEFINER" in match.group(4).upper() and match.group(3).lower() != "trigger":
+                defined.add(match.group(1))
+    locked = set(re.findall(r"'(\w+)'", re.search(r"p\.proname IN \((.*?)\)", text["016_lock_credit_functions.sql"], re.S).group(1)))
+    assert defined and defined <= locked, sorted(defined - locked)
