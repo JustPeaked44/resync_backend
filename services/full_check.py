@@ -17,6 +17,7 @@ step never fails a scan: any problem leaves the report exactly as the pair revie
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -103,19 +104,43 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> List[str]:
     return chunks
 
 
+ASK_PAUSES = (2.0, 5.0)            # waits between the 3 tries of one Gemini call (a 503 usually clears within seconds)
+
+# What happened in the current whole-paper run. _prepare sets it; the steps below mark what failed. A plain dict shared
+# through the context, so the steps keep their signatures.
+_run = contextvars.ContextVar("full_check_run", default=None)
+
+
+def _failed(step: str) -> None:
+    run = _run.get()
+    if run is not None:
+        run["failed"].add(step)
+
+
+class Prepared(tuple):
+    """(candidates, confirmed) as _prepare always returned them, plus .stats: how much of the paper was really checked."""
+    stats: Dict[str, Any]
+
+
+def _snippet(error: Exception) -> str:
+    """The first 200 characters of what Gemini answered with an error (never the request, so never the key)."""
+    return " ".join(str(getattr(getattr(error, "response", None), "text", "") or "").split())[:200]
+
+
 async def _ask(prompt: str, label: str) -> Optional[Dict[str, Any]]:
-    """One Gemini answer as a dict, or None when it could not be had (quota, errors). Two tries."""
-    for attempt in (1, 2):
+    """One Gemini answer as a dict, or None when it could not be had (quota, errors). Three tries."""
+    tries = len(ASK_PAUSES) + 1
+    for attempt in range(1, tries + 1):
         try:
             raw = await v7_explain._generate(prompt, max_tokens=32768)
             return raw if isinstance(raw, dict) else None
         except gemini.GeminiQuotaExhausted:
             logger.warning("Full check (%s) skipped: the AI's limit was reached", label)
             return None
-        except Exception:
-            logger.exception("Full check (%s) failed (attempt %s of 2)", label, attempt)
-            if attempt == 1:
-                await asyncio.sleep(1.5)
+        except Exception as error:
+            logger.warning("Full check (%s) failed (attempt %s of %s) %s", label, attempt, tries, _snippet(error))
+            if attempt < tries:
+                await asyncio.sleep(ASK_PAUSES[attempt - 1])
     return None
 
 
@@ -172,6 +197,9 @@ async def _cross_check(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for group in groups:
         if len({f["section"] for f in group}) < 2:
             continue
+        run = _run.get()
+        if run is not None:
+            run["compared"] = True
         text = lines(group)
         key = VerdictCache.fingerprint("full-check-cross", VERSION, text)
         saved = (await VerdictCache.get_many([key])).get(key)
@@ -180,6 +208,7 @@ async def _cross_check(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         raw = await _ask(CROSS_PROMPT.format(max=MAX_CONFLICTS, ledger=text), "compare")
         if raw is None or not isinstance(raw.get("conflicts"), list):
+            _failed("compare")
             continue
         conflicts = [c for c in raw["conflicts"] if isinstance(c, dict)][:MAX_CONFLICTS]
         await VerdictCache.save_many({key: {"severity": "None", "conflicts": conflicts}})
@@ -211,6 +240,7 @@ async def _confirm(candidates: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]
     saved = (await VerdictCache.get_many([key])).get(key)
     raw = saved if saved is not None and isinstance(saved.get("results"), list) else await _ask(prompt, "confirm")
     if raw is None or not isinstance(raw.get("results"), list):
+        _failed("confirm")
         return {}
     if saved is None:
         await VerdictCache.save_many({key: {"severity": "None", "results": raw["results"]}})
@@ -282,45 +312,104 @@ def start(sections: List[Dict[str, Any]]) -> Optional["asyncio.Future"]:
     return asyncio.ensure_future(_prepare(sections))
 
 
+SECOND_PASS_PAUSE = 5.0            # before the one more pass over the pieces the AI could not read the first time
+
+
 async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], roles: Optional[Dict[str, str]] = None,
-                           prepared: Optional["asyncio.Future"] = None) -> int:
-    """Reads every section in full, compares all of it, and adds the confirmed mismatches to the flow. Returns how many."""
+                           prepared: Optional["asyncio.Future"] = None, status: Optional[Dict[str, Any]] = None) -> int:
+    """Reads every section in full, compares all of it, and adds the confirmed mismatches to the flow. Returns how many.
+    When `status` is given it is filled with how much of the paper was really checked (see _outcome); it stays empty when the
+    check was off or not possible."""
     if not enabled() or len(sections) < 2 or gemini.quota_blocked():
         if prepared is not None:
             prepared.cancel()
         return 0
     try:
         found = await (prepared if prepared is not None else _prepare(sections))
+        stats = getattr(found, "stats", None)
+        if stats and stats["state"] != "ran":
+            # The AI had a bad moment. One more pass at the end: pieces already read come from the cache, so only the lost ones are asked again.
+            await asyncio.sleep(SECOND_PASS_PAUSE)
+            try:
+                again = await _prepare(sections, announce=False)
+                found, stats = again, again.stats
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Full check second pass failed; keeping the first pass")
+        if status is not None and stats:
+            status.update(stats)
         return _commit(flow, sections, found)
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.exception("Full check failed; the report keeps the pair review's findings")
+        if status is not None:
+            status.update(state="failed")
         return 0
 
 
-async def _prepare(sections: List[Dict[str, Any]]):
-    """Everything that needs the AI: (candidates, confirmed). It does not touch the report, so it can run early."""
+def _outcome(run: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """What the run really did. state: ran (every piece read, the comparison and the confirmation answered or not needed),
+    partial (some pieces could not be read), failed (the comparison or the confirmation got no answer, or errors left too
+    little to compare)."""
+    total, lost = run["chunks_total"], run["chunks_failed"]
+    compare = "failed" if "compare" in run["failed"] else ("ok" if run["compared"] else "skipped")
+    confirm = "failed" if "confirm" in run["failed"] else ("ok" if candidates else "none")
+    if "failed" in (compare, confirm):
+        state = "failed"
+    elif lost:
+        state = "failed" if compare == "skipped" else "partial"
+    else:
+        state = "ran"
+    return {"state": state, "chunks_total": total, "chunks_read": total - lost, "compare": compare, "confirm": confirm}
+
+
+async def _prepare(sections: List[Dict[str, Any]], announce: bool = True):
+    """Everything that needs the AI: (candidates, confirmed) plus .stats on what was really checked. It does not touch the report,
+    so it can run early."""
+    run = {"failed": set(), "chunks_total": 0, "chunks_failed": 0, "compared": False}
+    token = _run.set(run)
+    try:
+        candidates, confirmed = await _read_and_compare(sections, announce, run)
+    finally:
+        _run.reset(token)
+    result = Prepared((candidates, confirmed))
+    result.stats = _outcome(run, candidates)
+    return result
+
+
+async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run: Dict[str, Any]):
     jobs = [(index, chunk) for index, section in enumerate(sections) if len((section["text"] or "").split()) >= MIN_SECTION_WORDS
-            for chunk in chunk_text(section["text"])][:MAX_CHUNK_CALLS]
+            for chunk in chunk_text(section["text"])]
+    run["chunks_total"] = len(jobs)
+    run["chunks_failed"] = max(0, len(jobs) - MAX_CHUNK_CALLS)
+    jobs = jobs[:MAX_CHUNK_CALLS]
     if not jobs:
         return [], {}
-    gemini.expect_calls(len(jobs) + 2)
+    if announce:
+        gemini.expect_calls(len(jobs) + 2)
     gate = asyncio.Semaphore(CONCURRENCY)
 
     async def read(job):
         async with gate:
             name, chunk = sections[job[0]]["name"], job[1]
             found = await _extract(name, chunk)
+            lost = found is None
             if found is None and len(chunk) > 2500:   # an answer that came back broken: read the same piece again in two halves
                 halves = chunk_text(chunk, size=len(chunk) // 2 + 1)
                 parts = [await _extract(name, half) for half in halves]
                 found = [fact for part in parts for fact in (part or [])] if any(part is not None for part in parts) else None
+                lost = any(part is None for part in parts)
+            run["chunks_failed"] += lost
             return found
 
     results = await asyncio.gather(*(read(job) for job in jobs), return_exceptions=True)
     facts: List[Dict[str, Any]] = []
     for (index, _), found in zip(jobs, results):
+        if isinstance(found, asyncio.CancelledError):
+            raise found
+        run["chunks_failed"] += isinstance(found, BaseException)
         for fact in found if isinstance(found, list) else []:
             facts.append({**fact, "id": f"F{len(facts) + 1}", "index": index, "section": sections[index]["name"]})
     if len({fact["index"] for fact in facts}) < 2:

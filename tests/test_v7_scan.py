@@ -497,3 +497,39 @@ def test_an_unverified_finding_is_kept_apart_and_never_lowers_the_score():
     result = v7_explain.normalize_explanation(raw, scores, "A", "A text.", "B", "B text.")
     assert result["severity"] == "None" and result["highlighted_inconsistencies"] == []
     assert [item["what"] for item in result["unverified"]] == ["Conflict"]
+
+
+@pytest.mark.parametrize("whole", ["ran", "partial", "failed", "skipped", True, False])
+def test_analysis_quality_whole_paper_does_not_change_analysis(whole):
+    result = v7_scan.analysis_quality([{}], 0, whole)
+    assert result["analysis"] == "complete"
+    assert result["whole_paper_check"] == (whole if isinstance(whole, str) else "ran" if whole else "skipped")
+
+
+@pytest.mark.parametrize("state", ["failed", "ran"])
+def test_explain_flow_reports_whole_paper_state(monkeypatch, state):
+    sections = [{"name": "A", "text": "enough words for a valid section"},
+                {"name": "B", "text": "enough words for a valid section"}]
+    scores = {key: 0.2 for key in v7_scan.DIMENSIONS}
+    scores.update(pair_weight=1, overall_coherence=0.2)
+    flow = assemble_flow(sections, [{"scores": scores}])
+    async def pair(*args, **kwargs):
+        return {"severity": "None", "failed_dimension": "none", "coherence_scores": {},
+                "highlighted_inconsistencies": [], "recommendations": [], "reference_list": []}
+    async def summary(*args, **kwargs):
+        return None
+    async def whole(*args, status=None, **kwargs):
+        status.update(state=state, chunks_total=2, chunks_read=1, compare="failed", confirm="none")
+        return 0
+    monkeypatch.setattr(v7_explain, "explain_pair", pair)
+    monkeypatch.setattr(v7_explain, "explain_summary", summary)
+    from services import full_check
+    monkeypatch.setattr(full_check, "apply_full_check", whole)
+    _, _, synthesis = asyncio.run(explain_flow(sections, flow))
+    status = synthesis["review_status"]
+    assert (status["whole_paper_check"], status["status"], status["unreviewed"], status["analysis"]) == (state, "complete", 0, "complete")
+    assert ("whole_paper" in status) == (state == "failed")
+    assert ("whole_paper_note" in status) == (state == "failed")
+    if state == "failed":
+        assert status["whole_paper_note"] == v7_scan.WHOLE_PAPER_NOTE
+        assert status["whole_paper"] == {"chunks_total": 2, "chunks_read": 1, "compare": "failed", "confirm": "none"}

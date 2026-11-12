@@ -34,6 +34,8 @@ EXPLAIN_LIMIT = int(os.getenv("EXPLAIN_LIMIT", "0")) or None  # a cap on reviewe
 EXPLAIN_CONCURRENCY = int(os.getenv("EXPLAIN_CONCURRENCY", "8"))  # single-pair fallback reviews running at the same time
 EXPLAIN_TIMEOUT = 240  # seconds one pair may take (waiting for a rate-limit slot and all retries included)
 BRIDGE_ROUNDS = 3  # how many times pairs still missing linking sentences are asked about
+WHOLE_PAPER_NOTE = ("Part of the check across the whole paper could not finish because the AI was busy, so contradictions between "
+                    "sections that are far apart may be missing from this report. Scan again to retry.")
 MIN_SECTION_WORDS = 5  # a heading with no text under it cannot be rated, so neighbors are paired across it
 
 
@@ -582,7 +584,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
         apply_figure_conflicts(flow, sections)
         # The pair review sees where sections meet; this reads every section in full and compares all of it (full_check).
-        await full_check.apply_full_check(flow, sections, roles, prepared=full_check_task)
+        whole_paper = {}   # filled with how much of the paper the whole-paper check really covered
+        await full_check.apply_full_check(flow, sections, roles, prepared=full_check_task, status=whole_paper)
         full_check_task = None
         for pair in flow:
             overall = pair["scores"]["overall_coherence"]
@@ -598,7 +601,11 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         unreviewed = sum(1 for p in flow if p["scores"]["overall_coherence"] is not None and p["severity"] is None)
         # Tell the report why pairs are missing, so "no recommendations" is never mistaken for "nothing wrong".
         review_status = {"status": "complete" if not unreviewed else "partial", "unreviewed": unreviewed}
-        review_status.update(analysis_quality(to_explain, unreviewed, full_check.enabled() and not gemini.quota_blocked()))
+        checked = full_check.enabled() and not gemini.quota_blocked()
+        review_status.update(analysis_quality(to_explain, unreviewed, whole_paper.get("state", "ran" if checked else "skipped")))
+        if review_status["whole_paper_check"] in ("partial", "failed"):   # said plainly, never as "complete"; the pair-review fields are untouched
+            review_status.update(whole_paper={k: whole_paper[k] for k in ("chunks_total", "chunks_read", "compare", "confirm") if k in whole_paper},
+                                 whole_paper_note=WHOLE_PAPER_NOTE)
         unverified = [{"pair_order": p["order"], "section_a": p["section_a"], "section_b": p["section_b"], **item}
                       for p in flow for item in ((p["explanation"] or {}).get("unverified") or [])]
         review_status["unverified"] = len(unverified)
@@ -629,7 +636,7 @@ def analysis_quality(to_explain, unreviewed, whole_paper_check_ran):
         status = "degraded"
     return {"analysis": status, "needs_review": needs, "reviewed": reviewed,
             "basis": {"complete": "ai_verified", "degraded": "mixed", "incomplete": "ml_estimate"}[status],
-            "whole_paper_check": "ran" if whole_paper_check_ran else "skipped"}
+            "whole_paper_check": whole_paper_check_ran if isinstance(whole_paper_check_ran, str) else ("ran" if whole_paper_check_ran else "skipped")}
 
 
 def flatten_explanations(flow, sections=None):

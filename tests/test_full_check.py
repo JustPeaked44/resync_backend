@@ -164,3 +164,132 @@ def test_finding_fact_ids_keep_word_boundaries(monkeypatch):
     candidates, _ = asyncio.run(full_check._prepare(sections))
     assert candidates[0]["what"] == "whereas the second section says"
     assert candidates[0]["why"] == "the second section says the second section (the second section). the second section. the first section."
+
+
+def test_compare_failure_reports_failed_without_changing_flow(monkeypatch):
+    import copy
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    generate = v7_explain._generate
+
+    async def fail_compare(prompt, max_tokens=None):
+        if "STATEMENTS:" in prompt:
+            raise RuntimeError("unavailable")
+        return await generate(prompt, max_tokens=max_tokens)
+
+    monkeypatch.setattr(v7_explain, "_generate", fail_compare)
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    sections = _sections()
+    flow = _flow(sections)
+    before = copy.deepcopy(flow)
+    status = {}
+    assert asyncio.run(full_check.apply_full_check(flow, sections, status=status)) == 0
+    assert flow == before and status["state"] == status["compare"] == "failed"
+
+
+def test_failed_piece_recovers_on_second_pass(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    generate = v7_explain._generate
+    calls = []
+
+    async def intermittent(prompt, max_tokens=None):
+        if "ONE part of a student's thesis" in prompt and "Agile" in prompt:
+            calls.append(1)
+            if len(calls) <= 3:
+                raise RuntimeError("unavailable")
+        return await generate(prompt, max_tokens=max_tokens)
+
+    monkeypatch.setattr(v7_explain, "_generate", intermittent)
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    sections = _sections()
+    status = {}
+    assert asyncio.run(full_check.apply_full_check(_flow(sections), sections, status=status)) == 1
+    assert status["state"] == "ran" and len(calls) == 4
+
+
+def test_lost_piece_with_two_fact_sections_is_partial(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    generate = v7_explain._generate
+
+    async def fail_intro(prompt, max_tokens=None):
+        if 'called "introduction"' in prompt:
+            raise RuntimeError("unavailable")
+        return await generate(prompt, max_tokens=max_tokens)
+
+    monkeypatch.setattr(v7_explain, "_generate", fail_intro)
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    status = {}
+    sections = _sections()
+    assert asyncio.run(full_check.apply_full_check(_flow(sections), sections, status=status)) == 1
+    assert status["state"] == "partial" and status["chunks_read"] == status["chunks_total"] - 1
+    assert status["compare"] == "ok"
+
+
+def test_healthy_whole_check_reports_complete_stats(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    sections = _sections()
+    status = {}
+    assert asyncio.run(full_check.apply_full_check(_flow(sections), sections, status=status)) == 1
+    assert status["state"] == "ran" and status["chunks_read"] == status["chunks_total"]
+    assert status["compare"] == status["confirm"] == "ok"
+
+
+def test_no_statements_is_a_successful_check(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    async def empty(*args, **kwargs):
+        return {"facts": []}
+    monkeypatch.setattr(v7_explain, "_generate", empty)
+    sections = [{"name": str(i), "text": "word " * 20} for i in range(2)]
+    status = {}
+    assert asyncio.run(full_check.apply_full_check([], sections, status=status)) == 0
+    assert status["state"] == "ran" and status["compare"] == "skipped"
+
+
+def test_confirm_failure_reports_failed(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    _fake_ai(monkeypatch)
+    generate = v7_explain._generate
+    async def fail_confirm(prompt, max_tokens=None):
+        if "PAIR 1" in prompt:
+            raise RuntimeError("unavailable")
+        return await generate(prompt, max_tokens=max_tokens)
+    monkeypatch.setattr(v7_explain, "_generate", fail_confirm)
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    sections = _sections()
+    status = {}
+    assert asyncio.run(full_check.apply_full_check(_flow(sections), sections, status=status)) == 0
+    assert status["state"] == status["confirm"] == "failed"
+
+
+def test_cancelled_read_propagates(monkeypatch):
+    async def cancelled(*args):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(full_check, "_extract", cancelled)
+    sections = [{"name": str(i), "text": "word " * 20} for i in range(2)]
+    import pytest
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(full_check._prepare(sections))
+
+
+def test_chunks_over_safety_limit_are_unread(monkeypatch):
+    monkeypatch.setattr(full_check, "MAX_CHUNK_CALLS", 1)
+    async def empty(*args):
+        return []
+    monkeypatch.setattr(full_check, "_extract", empty)
+    sections = [{"name": str(i), "text": "word " * 20} for i in range(2)]
+    result = asyncio.run(full_check._prepare(sections))
+    assert result.stats == {"state": "failed", "chunks_total": 2, "chunks_read": 1,
+                            "compare": "skipped", "confirm": "none"}
+
+
+def test_split_ledger_without_comparable_group_is_skipped(monkeypatch):
+    monkeypatch.setattr(full_check, "LEDGER_SPLIT_CHARS", 1)
+    async def extract(name, text):
+        return [{"kind": "number" if name == "first" else "claim", "statement": name, "quote": text}]
+    monkeypatch.setattr(full_check, "_extract", extract)
+    sections = [{"name": name, "text": "word " * 20} for name in ("first", "second")]
+    result = asyncio.run(full_check._prepare(sections))
+    assert result.stats["state"] == "ran" and result.stats["compare"] == "skipped"
