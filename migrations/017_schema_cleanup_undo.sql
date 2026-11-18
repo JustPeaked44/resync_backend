@@ -498,6 +498,11 @@ DO $$ BEGIN
     ALTER TABLE public.payment_proof ADD FOREIGN KEY (pymt_txn_id)
       REFERENCES public.pymt_txn(pymt_txn_id) ON DELETE CASCADE;
     INSERT INTO public.payment_proof SELECT * FROM backup_012.payment_proof;
+    IF to_regclass('backup_012.payment_proof_legacy') IS NOT NULL THEN
+      INSERT INTO public.payment_proof
+        SELECT proof_id,pymt_txn_id,user_id,method,reference_number,payer_name,file_name,content_type,proof_data,created_at
+        FROM backup_012.payment_proof_legacy;
+    END IF;
     CREATE INDEX payment_proof_txn_idx ON public.payment_proof(pymt_txn_id);
     ALTER TABLE public.payment_proof ENABLE ROW LEVEL SECURITY;
     GRANT ALL ON public.payment_proof TO service_role;

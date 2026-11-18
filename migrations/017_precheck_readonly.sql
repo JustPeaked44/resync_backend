@@ -11,7 +11,7 @@ inventory AS (
 SELECT * FROM inventory ORDER BY object_type,object_name;
 
 -- Only run these two checks if the inventory shows these tables are present.
--- Both counts must be zero; resolve any rows with the owner before switching.
+-- Duplicate device IDs must be zero; move legacy proof rows with 017b after 017a.
 SELECT 'legacy_proof_rows' AS check_name, count(*) AS rows_requiring_review FROM public.payment_proof
 UNION ALL
 SELECT 'duplicate_device_ids', count(*) FROM (SELECT device_onesignal_player_id FROM public.user_device_token GROUP BY device_onesignal_player_id HAVING count(*) > 1) duplicates;

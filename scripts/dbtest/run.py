@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = Path(r"D:\RESYNC_DEV\handoff\session\db")
 BIN = Path(r"D:\RESYNC_DEV\_tools\pgsql\bin")
 DATA = Path(r"D:\RESYNC_DEV\_tools\pgdata")
-DB = "resync_f55_017_test"
+DB = "resync_f57_017_test"
 ENV = {**os.environ, "PGHOST": "127.0.0.1", "PGPORT": "54329", "PGUSER": "postgres", "PGPASSWORD": ""}
 
 
@@ -225,6 +225,10 @@ def main():
         for name in ("012_payment_proof.sql", "013_email_registered.sql", "014_pymt_txn_user.sql", "015_new_accounts_start_empty.sql", "016_lock_credit_functions.sql"):
             file(ROOT / "migrations" / name)
         sql(SEED)
+        sql("""INSERT INTO public.payment_proof(pymt_txn_id,user_id,method,reference_number,payer_name,file_name,content_type,proof_data)
+          SELECT p.pymt_txn_id,p.user_id,'gcash','synthetic-'||n,'payer-'||n,'file-'||n,'image/png',encode(convert_to('proof-'||n,'UTF8'),'base64')
+          FROM (SELECT * FROM public.pymt_txn LIMIT 1) p CROSS JOIN generate_series(1,7) n""")
+        proofs = sql("SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY proof_id),'[]') FROM public.payment_proof p")
         before = signature()
         check("read-only precheck inventory rows", len(file(ROOT / "migrations" / "017_precheck_readonly.sql").splitlines()), 30)
         counts_sql = "SELECT (SELECT count(*) FROM public.\"user\"),(SELECT count(*) FROM public.manuscript),(SELECT count(*) FROM public.analysis_run),(SELECT count(*) FROM public.inconsistency),(SELECT count(*) FROM public.recommendation),(SELECT count(*) FROM public.citation),(SELECT count(*) FROM public.pymt_txn),(SELECT count(*) FROM public.user_device_token)"
@@ -239,6 +243,12 @@ def main():
         skipped = run([BIN / "psql.exe", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", DB, "-c", (ROOT / "migrations" / "017_schema_cleanup.sql").read_text(encoding="utf-8")], check=False)
         check("enum must run separately first", (skipped.returncode != 0, "017a_ledger_kind.sql first" in skipped.stderr, signature() == unprepared), (True, True, True))
         editor_run(ROOT / "migrations" / "017a_ledger_kind.sql")
+        editor_run(ROOT / "migrations" / "017b_backup_legacy_proofs.sql")
+        check("seven proofs backed up identically", sql("SELECT coalesce(jsonb_agg(to_jsonb(b)-'moved_at' ORDER BY proof_id),'[]') FROM backup_012.payment_proof_legacy b"), proofs)
+        check("legacy proofs moved", sql("SELECT count(*) FROM public.payment_proof"), "0")
+        backup_before = sql("SELECT jsonb_agg(to_jsonb(b) ORDER BY proof_id) FROM backup_012.payment_proof_legacy b")
+        editor_run(ROOT / "migrations" / "017b_backup_legacy_proofs.sql")
+        check("backup rerun is a no-op", (sql("SELECT jsonb_agg(to_jsonb(b) ORDER BY proof_id) FROM backup_012.payment_proof_legacy b") == backup_before, sql("SELECT count(*) FROM public.payment_proof")), (True, "0"))
         editor_run(ROOT / "migrations" / "017_schema_cleanup.sql")
         sql("""CREATE SCHEMA storage; CREATE TABLE storage.buckets(id text PRIMARY KEY,name text,public boolean);
           CREATE TABLE storage.objects(bucket_id text,name text);
@@ -256,11 +266,18 @@ def main():
         check("latest feedback retained", sql("SELECT inconsistency_is_helpful::text FROM public.inconsistency WHERE inconsistency_id='30000000-0000-0000-0000-000000000001'"), "false")
         check("email lookup", sql("SELECT public.email_registered(' A@example.test '), public.email_registered('missing@example.test')"), "t|f")
         sql("INSERT INTO auth.users(id,email,raw_user_meta_data) VALUES ('00000000-0000-0000-0000-000000000005','new@example.test','{}')")
+        check("revoked signup trigger still runs", sql("SELECT count(*) FROM public.\"user\" WHERE user_id='00000000-0000-0000-0000-000000000005'"), "1")
+        sql("CREATE EVENT TRIGGER test_rls_auto_enable ON ddl_command_end EXECUTE FUNCTION public.rls_auto_enable()")
+        sql("CREATE TABLE public.f57_trigger_probe(id integer)")
+        check("revoked event trigger still runs", sql("SELECT relrowsecurity FROM pg_class WHERE oid='public.f57_trigger_probe'::regclass"), "t")
+        sql("DROP EVENT TRIGGER test_rls_auto_enable; DROP TABLE public.f57_trigger_probe")
+        check("trigger function execute revoked", sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN ('handle_new_user','rls_auto_enable') AND (has_function_privilege('anon',p.oid,'execute') OR has_function_privilege('authenticated',p.oid,'execute'))"), "0")
         check("new account starts at zero", sql("SELECT public.get_credit_balance('00000000-0000-0000-0000-000000000005')"), "0")
         check("payments retained", sql("SELECT string_agg(pymt_txn_status,',' ORDER BY pymt_txn_status) FROM public.pymt_txn"), "paid,pending")
         check("balances retained", sql("SELECT string_agg(public.get_credit_balance(user_id)::text,',' ORDER BY user_id) FROM public.\"user\""), "3,0,0,0,0")
         check("devices retained", sql("SELECT count(*) FROM public.user_device_token"), "2")
         file(ROOT / "migrations" / "017_schema_cleanup_undo.sql")
+        check("undo restores proofs identically", sql("SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY proof_id),'[]') FROM public.payment_proof p"), proofs)
         check("undo discarded report preserved", sql("SELECT status,result_json IS NULL,error_message LIKE 'This report was deleted%' FROM public.analysis_run WHERE analysis_run_id='20000000-0000-0000-0000-000000000001'"), "failed|t|t")
         after = signature()
         for part in ('columns','constraints','functions','triggers','rls','policies','grants','indexes','enums'):
@@ -277,6 +294,7 @@ def main():
         file(ROOT / "migrations" / "011_pair_verdict_cache.sql")
         sql("INSERT INTO public.pair_verdict_cache(cache_key,prompt_version,explanation) VALUES ('synthetic-cache','v1','{}')")
         editor_run(ROOT / "migrations" / "017a_ledger_kind.sql")
+        editor_run(ROOT / "migrations" / "017b_backup_legacy_proofs.sql")
         editor_run(ROOT / "migrations" / "017_schema_cleanup.sql")
         assert_schema(spec)
         check("discarded report preserved", sql("SELECT analysis_run_status,analysis_run_result_json IS NULL,analysis_run_error_message LIKE 'This report was deleted%' FROM public.analysis_run WHERE analysis_run_id='20000000-0000-0000-0000-000000000001'"), "failed|t|t")
@@ -288,11 +306,11 @@ def main():
         check("charged balance survives undo", sql("SELECT balance FROM public.credit_wallet WHERE user_id='00000000-0000-0000-0000-000000000001'"), "2")
         check("cached verdict restored", sql("SELECT count(*) FROM public.pair_verdict_cache WHERE cache_key='synthetic-cache'"), "1")
         sql("DROP SCHEMA backup_012 CASCADE")
-        sql("INSERT INTO public.payment_proof(pymt_txn_id,user_id,method,reference_number,content_type,proof_data) SELECT pymt_txn_id,user_id,'gcash','synthetic','image/png','synthetic' FROM public.pymt_txn LIMIT 1")
+
         editor_run(ROOT / "migrations" / "017a_ledger_kind.sql")
         proof_before = signature()
         rejected = run([BIN / "psql.exe", "-X", "-v", "ON_ERROR_STOP=1", "-At", "-d", DB, "-c", (ROOT / "migrations" / "017_schema_cleanup.sql").read_text(encoding="utf-8")], check=False)
-        check("existing proof rejected unchanged", (rejected.returncode != 0, "payment_proof has 1 rows" in rejected.stderr, signature() == proof_before, sql("SELECT count(*) FROM public.payment_proof")), (True, True, True, "1"))
+        check("existing proof rejected unchanged", (rejected.returncode != 0, "payment_proof has 7 rows" in rejected.stderr, signature() == proof_before, sql("SELECT count(*) FROM public.payment_proof")), (True, True, True, "7"))
         print("MIGRATE / UNDO / RE-APPLY COMPLETE")
     finally:
         if created:
