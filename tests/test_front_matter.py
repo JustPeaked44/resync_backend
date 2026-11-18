@@ -30,3 +30,16 @@ def test_text_inside_a_figure_is_not_part_of_the_section():
     found = sections(f"Rationale of the Study\n{BODY}\n{figure}\n{BODY}")
     everything = " ".join(found.values())
     assert "Designing" not in everything and "Figure 1" not in everything
+
+
+def test_abstract_before_contents_and_lists_is_kept_without_rows():
+    rows = ["ABSTRACT | i", "LIST OF TABLESv", "Topic\t2", "Another topic .... 3",
+            "Entry | iv", "More\t5", "LIST OF TABLES", "Table name | 6",
+            "LIST OF FIGURES", "53\tProject Road Map\t186"]
+    text = "\n".join(["Title page", "ABSTRACT", BODY, "TABLE OF CONTENTS", *rows,
+                       "CHAPTER I", "INTRODUCTION", BODY])
+    parsed = ManuscriptParserService.parse_manuscript_sections(text, None)
+    assert parsed["section_roles"][parsed["section_order"][0]] == "abstract"
+    assert BODY.strip() in parsed["parsed_sections"][parsed["section_order"][0]]
+    assert not any(row in body for row in rows + ["CHAPTER I"] for body in parsed["parsed_sections"].values())
+    assert "introduction" in parsed["section_roles"].values()

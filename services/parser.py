@@ -268,6 +268,22 @@ class ManuscriptParserService:
             if listed:
                 front_end = i
         skip.update(range(front_end))   # everything before the end of the contents is front matter, not part of the study
+        # shortcut: requires a standalone Chapter I and Introduction, expand for other layouts when observed.
+        for toc in range(len(lines)):
+            if not re.fullmatch(r"(?i)\s*(?:table of contents|contents)\s*", lines[toc]):
+                continue
+            for chapter in range(toc + 1, len(lines) - 1):
+                if (re.fullmatch(r"(?i)\s*chapter\s+i\s*", lines[chapter])
+                        and re.fullmatch(r"(?i)\s*introduction\s*", lines[chapter + 1])
+                        and sum(bool(re.search(r"(?i)(?:\||\t|\.{2,})\s*(?:\d{1,3}|[ivxlcdm]+)\s*$", row))
+                                for row in lines[toc + 1:chapter]) >= 5):
+                    skip.update(range(toc, chapter + 1))
+                    abstract = next((i for i in range(toc - 1, -1, -1)
+                                     if re.fullmatch(r"(?i)\s*abstract\s*", lines[i])), None)
+                    if abstract is not None:
+                        skip.difference_update(range(abstract, toc))
+                    break
+            break
         text = "\n".join(cls._without_diagram_text([line for i, line in enumerate(lines) if i not in skip]))
         result = cls._parse_manuscript_sections(text, template_toc, bool(skip))
         if source_records:
