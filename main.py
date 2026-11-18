@@ -27,7 +27,7 @@ from services.ingestion import DocumentIngestionService, looks_like_html_documen
 from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
-from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT
+from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT, DISCARDED_MESSAGE
 from services.notification import NotificationDeliveryService
 from services.credits import credits_service
 from services.scoring import compute_citation_integrity
@@ -1454,7 +1454,7 @@ async def get_scan_status(
     if job_status == "failed":
         error = row.get(RUN_ERROR) or ""
         generic = GENERIC_FAILURE_MESSAGE.format(scan_number=analysis_run_id[:8])
-        if error not in (INTERRUPTED_MESSAGE, TIMEOUT_MESSAGE, generic) and not _safe_refusal(error):
+        if error not in (INTERRUPTED_MESSAGE, TIMEOUT_MESSAGE, DISCARDED_MESSAGE, generic) and not _safe_refusal(error):
             error = generic
         return ScanStatusResponse(
             status="failed",
@@ -1478,6 +1478,19 @@ async def get_scan_status(
     level, message = scan_status_message(analysis_run_id)
     return ScanStatusResponse(status="processing", analysis_run_id=analysis_run_id,
                               elapsed_seconds=elapsed, status_message=message, status_message_level=level)
+
+
+@app.post("/api/scans/{scan_id}/discard", response_model=None, tags=["Scans"], summary="Delete a report the user has left")
+async def discard_scan(scan_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)) -> dict:
+    """Reports are not kept: when the student leaves one, its stored content is deleted (Terms and Privacy Policy)."""
+    try:
+        discarded = await DatabasePersistenceService.discard_scan(authenticated_user_id, scan_id)
+    except Exception as exc:
+        logger.exception("Could not discard scan %s", scan_id)
+        raise HTTPException(status_code=503, detail="Could not delete the report.") from exc
+    if not discarded:
+        raise HTTPException(status_code=404, detail="Scan not found.")
+    return {"discarded": True}
 
 
 @app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])

@@ -20,6 +20,7 @@ RUN_STATUS = "status"
 RUN_ERROR = "error_message"
 RUN_CREATED = "created_at"
 RUN_RESULT = "result_json"
+DISCARDED_MESSAGE = "This report was deleted when it was closed. Scan the paper again to get a new report."
 
 class DatabasePersistenceService:
     """
@@ -77,6 +78,29 @@ class DatabasePersistenceService:
                 )
             cls._client = cls._make_resilient(create_client(supabase_url, supabase_key))
         return cls._client
+
+    # Tables that keep sentences or findings of the manuscript for one scan; all are keyed by analysis_run_id.
+    SCAN_CONTENT_TABLES = ("inconsistency", "recommendation", "citation", "citation_crossmatch_issue")
+
+    @classmethod
+    async def discard_scan(cls, user_id: str, analysis_run_id: str) -> bool:
+        """Deletes the stored report of one scan: its saved result, findings, recommendations, citations and the saved parse of the
+        manuscript. Only the scan's owner can do this. What stays is the record that a scan happened (id, time, overall scores)
+        and the credit ledger. Returns False when the scan is not this user's."""
+        client = cls.get_client()
+        found = await asyncio.to_thread(lambda: client.table(RUN_TABLE).select("user_id, manuscript_id").eq(RUN_ID, analysis_run_id).execute())
+        if not found.data or found.data[0].get("user_id") != user_id:
+            return False
+        manuscript_id = found.data[0].get("manuscript_id")
+        for table in cls.SCAN_CONTENT_TABLES:
+            await asyncio.to_thread(lambda table=table: client.table(table).delete().eq("analysis_run_id", analysis_run_id).execute())
+        await asyncio.to_thread(lambda: client.table(RUN_TABLE).update({
+            RUN_RESULT: None, "score_breakdown_json": None, "ai_text_indicator_json": None,
+            RUN_STATUS: "failed", RUN_ERROR: DISCARDED_MESSAGE}).eq(RUN_ID, analysis_run_id).eq("user_id", user_id).execute())
+        if manuscript_id:
+            await asyncio.to_thread(lambda: client.table("manuscript_section_cache").delete()
+                                    .eq("user_id", user_id).eq("manuscript_id", manuscript_id).execute())
+        return True
 
     @classmethod
     async def save_scan_transaction(
