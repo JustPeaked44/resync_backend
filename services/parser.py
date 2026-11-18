@@ -222,6 +222,7 @@ class ManuscriptParserService:
         for line in text.splitlines(keepends=True):
             offsets.append(offset)
             offset += len(line)
+        front_end = 0   # the scan starts after the table of contents (and the lists of tables and figures that follow it)
         start = 0
         while start < len(lines) and offsets[start] * 4 < len(text):
             end = start
@@ -246,15 +247,52 @@ class ManuscriptParserService:
             if count >= 5:
                 skip.update(range(start, end))
                 heading = start - 1
+                named = False
                 while heading >= 0 and re.fullmatch(r'(?i)\s*(?:table of contents|contents|list of .+|chapter\s+(?:[ivxlcdm]+|\d+)\b.*)\s*', lines[heading]):
+                    named = named or bool(re.fullmatch(r'(?i)\s*(?:table of contents|contents|list of .+)\s*', lines[heading]))
                     skip.add(heading)
                     heading -= 1
+                if named:
+                    front_end = max(front_end, end)
             start = max(end, start + 1)
-        text = "\n".join(line for i, line in enumerate(lines) if i not in skip)
+        if front_end:   # the lists of tables, figures and the like that follow the contents are table rows, not prose
+            i, listed = front_end, False
+            while i < len(lines):
+                line = lines[i].strip()
+                is_list = bool(re.fullmatch(r'(?i)list of .+', line))
+                if is_list or not line or (('|' in line) and len(line) < 160) or re.fullmatch(r'(?i)[ivxlcdm\d]{1,6}', line):
+                    listed = listed or is_list
+                    i += 1
+                    continue
+                break
+            if listed:
+                front_end = i
+        skip.update(range(front_end))   # everything before the end of the contents is front matter, not part of the study
+        text = "\n".join(cls._without_diagram_text([line for i, line in enumerate(lines) if i not in skip]))
         result = cls._parse_manuscript_sections(text, template_toc, bool(skip))
         if source_records:
             cls._attach_preview(result, source_records)
         return result
+
+    @staticmethod
+    def _without_diagram_text(lines):
+        """Drops the text that sits inside a figure (a run of bullet labels just before its "Figure N:" caption) and the caption itself:
+        diagram labels are not prose and only produce meaningless recommendations."""
+        caption = re.compile(r'(?i)^\s*(?:figure|fig\.?)\s*\d+[a-z]?\s*[:.\-\u2013\u2014]')
+        bullet = re.compile(r'^\s*[\u25cf\u2022\u25aa\u25e6\u25a0\u25a1\u25cb*\-\u2013]\s*\S')
+        out = []
+        for line in lines:
+            if not caption.match(line):
+                out.append(line)
+                continue
+            j = len(out)
+            while j > 0 and len(out[j - 1].split()) <= 6 and not re.search(r'[.!?:]\s*$', out[j - 1].strip()):
+                j -= 1
+            run = out[j:]
+            first = next((k for k, text in enumerate(run) if bullet.match(text)), None)
+            if first is not None and sum(bool(bullet.match(text)) for text in run) >= 3:
+                del out[j + first:]
+        return out
 
     @classmethod
     def _attach_preview(cls, result, records):
