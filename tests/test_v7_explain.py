@@ -295,7 +295,7 @@ def test_shared_section_passage_has_one_highlight_recommendation():
                 {"name": "C", "text": "C sentence."}]
     flow = assemble_flow(sections, [{"scores": dict(SCORES, pair_weight=1)}] * 2)
     explanation = {"severity": "Moderate", "highlighted_inconsistencies": [], "reference_list": [],
-                   "recommendations": [{"section": "B", "original_sentence": "Shared sentence.",
+                   "recommendations": [{"section": "B", "original_sentence": "Shared sentence.", "issue": "It repeats a claim the other section contradicts.",
                                         "recommended_revision": "Revised shared sentence."}]}
     flow[0]["explanation"] = explanation
     flow[1]["explanation"] = explanation
@@ -319,8 +319,7 @@ def test_bridges_are_validated_capped_and_listed_first():
                          [{"scores": dict(low, pair_weight=1)}])
     flow[0]["explanation"] = result
     _, recommendations = flatten_explanations(flow)
-    assert [r["kind"] for r in recommendations] == ["add", "add"]
-    assert recommendations[0]["original_sentence"] is None and recommendations[0]["placement"] == "start"
+    assert recommendations == []   # linking sentences are kept on the explanation but never recommended: they only forced links between unrelated sections
     far = v7_explain.normalize_explanation(raw, low, "A", "A text here.", "B", "B text here.", adjacent=False)
     assert far["severity"] == "Moderate" and far["bridges"] == []        # a linking sentence only fits neighboring sections
     # severity "None" (no real issue) clears findings and advice, whatever else the model returned. A loosely linked

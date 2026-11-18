@@ -38,6 +38,7 @@ BRIDGE_ROUNDS = 3  # how many times pairs still missing linking sentences are as
 # turned into advice, so linking sentences are no longer requested.
 SUGGEST_LINKING_SENTENCES = False
 SERIOUS = ("Critical", "Moderate")
+SUBJECT_CHECK_BELOW = 0.30   # a pair rated below this that the review cleared gets one cheap check: are the two sections about the same subject?
 WHOLE_PAPER_NOTE = ("Part of the check across the whole paper could not finish because the AI was busy, so contradictions between "
                     "sections that are far apart may be missing from this report. Scan again to retry.")
 MIN_SECTION_WORDS = 5  # a heading with no text under it cannot be rated, so neighbors are paired across it
@@ -259,12 +260,21 @@ def senseless_recommendation(item):
     return bool(_ASKS_FOR_EXTRA.search(item.get("issue") or "")) and not sentence
 
 
+# Parts of a paper that carry no argument to check against the rest: front matter, lists and back matter.
+_NON_ARGUMENT = re.compile(r"(?i)^(?:chapter\s+\w+\s*[:.\-]?\s*)?(?:acknowledg\w*|dedication|approval sheet|certificat\w*(?:\s+.*)?|declaration|table of contents|contents|"
+                           r"list of\s+.+|appendix\b.*|appendices|curriculum vitae|glossary|abbreviations?|team composition|title page|preface|biograph\w+)\s*$")
+
+
+def is_argument_section(name):
+    return not _NON_ARGUMENT.match(re.sub(r"\s*\(\d+\)$", "", (name or "").strip()))
+
+
 def comparable_sections(parsed_sections, section_order, section_roles):
     """The sections a scan compares, in reading order: repeated headings merged; reference lists, empty headings and
     sections that are only table rows or diagram labels left out."""
     return [section for section in merge_repeated_sections(parsed_sections, section_order)
             if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS
-            and is_prose(section["text"])]
+            and is_argument_section(section["name"]) and is_prose(section["text"])]
 
 
 def manuscript_preview_sections(sections, parse_result):
@@ -498,6 +508,36 @@ def apply_figure_conflicts(flow, sections):
         pair["explanation"] = explanation
 
 
+async def apply_subject_check(flow, sections):
+    """Sections about completely different subjects are a Critical mismatch even when no sentence contradicts another. The review often
+    clears such a pair for lack of a contradiction, so every pair it cleared with a very low rating is asked once, in one call."""
+    from services import v7_explain
+    candidates = [p for p in flow if p["explanation"] and p["explanation"].get("severity") == "None"
+                  and p["scores"]["overall_coherence"] is not None and p["scores"]["overall_coherence"] < SUBJECT_CHECK_BELOW]
+    if not candidates:
+        return
+    from services import gemini
+    gemini.expect_calls(1)
+    try:
+        different = await asyncio.wait_for(v7_explain.check_subjects_batch(
+            [{"id": p["order"], "role_a": p["section_a"], "text_a": sections[p["index_a"]]["text"],
+              "role_b": p["section_b"], "text_b": sections[p["index_b"]]["text"]} for p in candidates]), EXPLAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning("The subject check of %s pairs took over %ss; skipped", len(candidates), EXPLAIN_TIMEOUT)
+        return
+    for pair in candidates:
+        found = different.get(pair["order"])
+        if not found:
+            continue
+        a, b = pair["section_a"], pair["section_b"]
+        what = f'The "{a}" section is about {found["subject_a"]}, but the "{b}" section is about {found["subject_b"]}.'
+        pair["explanation"] = dict(pair["explanation"], severity="Critical", failed_dimension="objectives_alignment", link_summary=what,
+                                   comparison={"a_says": found["subject_a"], "b_says": found["subject_b"]},
+                                   highlighted_inconsistencies=[{"section": b, "quote": found["quote_b"], "what": what,
+                                                                 "why": "The two sections do not belong to the same study."}],
+                                   reference_list=[{"section": a, "sentence": found["quote_a"]}], recommendations=[], bridges=[])
+
+
 async def explain_flow(sections, flow, roles=None, full_check_task=None):
     from services import gemini
     from services.v7_explain import (FLOW_SUGGESTION_BELOW, explain_batch, explain_pair, explain_summary, pair_cache_key,
@@ -615,6 +655,7 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         decided = [pair for pair in to_explain if pair["explanation"] and (pair in to_review or pair in loose)]
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
         apply_figure_conflicts(flow, sections)
+        await apply_subject_check(flow, sections)
         # The pair review sees where sections meet; this reads every section in full and compares all of it (full_check).
         whole_paper = {}   # filled with how much of the paper the whole-paper check really covered
         await full_check.apply_full_check(flow, sections, roles, prepared=full_check_task, status=whole_paper)
@@ -707,6 +748,12 @@ def flatten_explanations(flow, sections=None):
             matching_revision = next((r["recommended_revision"] for r in pair_recommendations
                                       if r["section"] == item["section"]), "")
             first = seen_findings.get((item["section"], norm(item["quote"])))
+            if first is None:
+                evidence = {(q["section"], norm(q["text"])) for q in quotes}
+                topic = "same study" in (item.get("why") or "").lower()   # two sections about different subjects: one finding, both sides quoted
+                first = next((f for f in findings if f["pair_order"] == pair["order"]
+                              and (bool(evidence) and {(q["section"], norm(q["text"])) for q in f["evidence_quotes"]} <= evidence or bool(evidence) and evidence <= {(q["section"], norm(q["text"])) for q in f["evidence_quotes"]}
+                                   or (topic and "same study" in f["explanation_why"].lower()))), None)
             if first is not None:   # same sentence already reported: keep one finding, add any new evidence to it
                 known = {(q["section"], norm(q["text"])) for q in first["evidence_quotes"]}
                 first["evidence_quotes"].extend(q for q in quotes if (q["section"], norm(q["text"])) not in known)
@@ -722,10 +769,19 @@ def flatten_explanations(flow, sections=None):
             seen_findings[(item["section"], norm(item["quote"]))] = findings[-1]
         number = 0
         # Advice is only for serious inconsistencies: a pair graded Minor, a loose link or a clear pair gets none.
-        advice = (bridges + pair_recommendations) if (pair.get("severity") or explanation.get("severity")) in SERIOUS else []
+        serious = (pair.get("severity") or explanation.get("severity")) in SERIOUS
+        # A recommendation fixes a quoted sentence and says why. Both sections of a clashing pair cannot be rewritten toward each other,
+        # so the fix goes on one side only: the later section when it has one. Linking sentences are never recommended.
+        advice = [item for item in pair_recommendations if not senseless_recommendation(item)] if serious else []
+        sides = {item["section"] for item in advice}
+        if len(sides) > 1:
+            keep = names[1] if names[1] in sides else advice[0]["section"]
+            advice = [item for item in advice if item["section"] == keep]
+        why = {inc["section"]: inc.get("why") or inc.get("what") or "" for inc in explanation["highlighted_inconsistencies"] if inc.get("section")}
         for item in advice:
-            if senseless_recommendation(item):
-                continue
+            item = dict(item, issue=(item.get("issue") or "").strip() or why.get(item["section"], "") or next((w for w in why.values() if w), ""))
+            if not item["issue"]:
+                continue   # a recommendation without a reason is not shown
             key = (item["section"], norm(item["original_sentence"]))
             if item["original_sentence"] is not None:  # the default advice has no sentence to dedupe on
                 if key in highlighted:   # one recommendation per sentence, however many pairs raise it

@@ -23,7 +23,8 @@ STRICT_RULES = """STRICT RULES:
 4. Only assess whether Section B logically correlates with Section A.
 5. Never change model scores; they come from the PyTorch model.
 6. Numbers: if a difference in numbers can be explained by legitimate research reasons (for example attrition or dropouts, missing responses, exclusion criteria, or a smaller group analysed than recruited), do NOT flag it as a contradiction. Only flag numeric inconsistencies if they are physically impossible (for example more people analysed than were ever recruited, percentages that cannot add up, or a total smaller than one of its parts).
-7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section. If you cannot give the exact quote, do not report it."""
+7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section. If you cannot give the exact quote, do not report it.
+8. Different subjects: if the two sections are about completely different subjects, so that the second one does not continue, apply or answer what the first one is about (for example one is about coastal erosion and the other about heart surgery), that IS a direct mismatch, not just a low score. Grade it "Critical" with failed_dimension "objectives_alignment", and quote ONE sentence from each section that shows its subject. In "what" say plainly what each section is about, and in "why" say that the two sections do not belong to the same study. Sections that only cover different parts of the same study (for example methods and results of one topic) are NOT a mismatch."""
 PAIR_PROMPT = """You are an objective logic auditor. Analyze Section A and Section B, two sections of the same manuscript.
 If the provided Overall Coherence score is below 0.85, determine whether there is a REAL logical inconsistency between them. A low score alone is not an inconsistency.
 {rules}
@@ -41,9 +42,9 @@ highlighted_inconsistencies (array of objects with section, quote, what, why),
 recommendations (array of objects with section, original_sentence, issue, recommended_revision, category),
 reference_list (array of objects with section, sentence),
 bridges (array of objects with section, placement, sentence).
-severity: assign "None" whenever the text flows logically and the second section addresses the goals the first one sets up. Assign "Critical", "Moderate" or "Minor" ONLY when there is a direct, undeniable contradiction or mismatch that you can quote from the supplied text, and you MUST quote it in highlighted_inconsistencies. "Critical" means the two sections directly contradict each other (quote both sides). "Moderate" means a specific claim, method, goal, or number in one section is clearly inconsistent with what the other section says or promises. "Minor" means a small but real discrepancy in a specific figure, term, or name between the two sections. A different topic, a missing transition, loose wording, or a low score is NOT an inconsistency and must be "None".
+severity: assign "None" whenever the text flows logically and the second section addresses the goals the first one sets up. Assign "Critical", "Moderate" or "Minor" ONLY when there is a direct, undeniable contradiction or mismatch that you can quote from the supplied text, and you MUST quote it in highlighted_inconsistencies. "Critical" means the two sections directly contradict each other (quote both sides). "Moderate" means a specific claim, method, goal, or number in one section is clearly inconsistent with what the other section says or promises. "Minor" means a small but real discrepancy in a specific figure, term, or name between the two sections. A missing transition, loose wording, or a low score is NOT an inconsistency and must be "None". The one exception is rule 8: when the two sections are about completely different subjects, that is a "Critical" mismatch.
 failed_dimension says which part of the paper this issue belongs to, so pick the single best fit: "objectives_alignment" (the text drifts from the purpose or aims the paper sets up), "methodology_fit" (how the work was done does not match how it is described elsewhere), "numeric_consistency" (numbers, data, or figures conflict or are missing), "claim_support" (a statement is not backed up by the surrounding text). Use "none" when severity is "None".
-STRICT TRIAGE RULES: If you cannot quote a direct contradiction or mismatch, you MUST set severity to "None" and deduct nothing: return ["No major inconsistencies found."] for highlighted_inconsistencies and empty arrays for recommendations and reference_list (bridges follow their own rule below). A low score alone is not an issue: sections about different parts of a paper naturally score low. FALSE ALARM OVERRIDE: If the provided score is low, but the text actually aligns logically, you MUST return severity "None", output "No major inconsistencies found." in highlighted_inconsistencies, and set recommendations to []. Do not hallucinate issues just because the score is low. You are the ultimate judge of logic. If it makes sense, pass it.
+STRICT TRIAGE RULES: If you cannot quote a direct contradiction or mismatch (two sections about completely different subjects ARE a mismatch, see rule 8), you MUST set severity to "None" and deduct nothing: return ["No major inconsistencies found."] for highlighted_inconsistencies and empty arrays for recommendations and reference_list (bridges follow their own rule below). A low score alone is not an issue: sections about different parts of the same study naturally score low. FALSE ALARM OVERRIDE: If the provided score is low, but the text actually aligns logically, you MUST return severity "None", output "No major inconsistencies found." in highlighted_inconsistencies, and set recommendations to []. Do not hallucinate issues just because the score is low. You are the ultimate judge of logic. If it makes sense, pass it.
 Do not generate generic advice. Only give a recommendation that directly fixes an exact quote you found, and use that exact quote as its original_sentence. The culprit sentences below are only hints: use one only if it is part of a real issue.
 comparison is a quick side-by-side for the student: a_says is what the "{a}" section says about the point where the two sections disagree, and b_says is what the "{b}" section says about that same point. Each is ONE short phrase of at most 15 words, concrete (keep key terms and numbers from the text), with no advice. If one section says nothing about the point, write "does not mention it".
 link_summary is the one-line problem: at most 20 words, naming the mismatch between the two sections (for example: the "{a}" section promises X, but the "{b}" section never covers X). If they connect well, say so briefly. No advice or rewrite in link_summary.
@@ -428,6 +429,51 @@ async def suggest_bridges_batch(items):
             return {}
         except Exception:
             logger.exception("v7 Gemini bridge batch of %s pairs failed (attempt %s of %s)", len(items), attempt, EXPLAIN_ATTEMPTS)
+        if attempt < EXPLAIN_ATTEMPTS:
+            await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
+    return {}
+
+
+SUBJECT_BATCH_PROMPT = """You check whether sections of one thesis are about the same study. Below are numbered pairs of sections, each with the start of both sections.
+{pairs}
+For EACH pair decide ONLY this: are the two sections about the same subject, so that the second belongs in the same study as the first (a methods section and a results section of the same topic ARE the same subject)? Answer false only when they are about completely different subjects (for example coastal erosion and heart surgery). Do not judge writing quality, missing transitions or detail.
+When the answer is false, also give subject_a and subject_b (each at most 10 words, plain words, what that section is about), and quote_a and quote_b: ONE sentence copied word for word from the first and from the second section that shows its subject.
+Return JSON with one key, pairs: an array with one object per pair, in the same order, each with pair_id (the pair's number, copied exactly), same_subject (true or false), and when false subject_a, subject_b, quote_a, quote_b."""
+
+
+def _squashed(value):
+    return " ".join((value or "").split())
+
+
+async def check_subjects_batch(items):
+    """In ONE call, finds the pairs whose two sections are about completely different subjects. Each item: id, role_a, text_a, role_b, text_b.
+    Returns {pair id: {subject_a, subject_b, quote_a, quote_b}} for pairs answered false whose quotes really are in the text."""
+    if not items:
+        return {}
+    blocks = "\n".join(f'=== PAIR {item["id"]} ===\nFirst section: "{item["role_a"]}": {gemini.truncate_text(item["text_a"], 2500)}\n'
+                       f'Second section: "{item["role_b"]}": {gemini.truncate_text(item["text_b"], 2500)}\n' for item in items)
+    prompt = SUBJECT_BATCH_PROMPT.replace("{pairs}", blocks)
+    by_id = {str(item["id"]): item for item in items}
+    for attempt in range(1, EXPLAIN_ATTEMPTS + 1):
+        try:
+            raw = await _generate(prompt, max_tokens=BATCH_MAX_OUTPUT_TOKENS)
+            answered = raw.get("pairs") if isinstance(raw, dict) else raw if isinstance(raw, list) else None
+            if not isinstance(answered, list):
+                raise ValueError(f"no pairs answered: {str(raw)[:200]}")
+            different = {}
+            for entry in answered:
+                item = by_id.get(str(entry.get("pair_id"))) if isinstance(entry, dict) else None
+                if item is None or entry.get("same_subject") is not False:
+                    continue
+                quote_a, quote_b = _squashed(entry.get("quote_a")), _squashed(entry.get("quote_b"))
+                subject_a, subject_b = _squashed(entry.get("subject_a")), _squashed(entry.get("subject_b"))
+                if quote_a and quote_b and subject_a and subject_b and quote_a in _squashed(item["text_a"]) and quote_b in _squashed(item["text_b"]):
+                    different[item["id"]] = {"subject_a": subject_a, "subject_b": subject_b, "quote_a": quote_a, "quote_b": quote_b}
+            return different
+        except gemini.GeminiQuotaExhausted:
+            return {}
+        except Exception:
+            logger.exception("v7 Gemini subject check of %s pairs failed (attempt %s of %s)", len(items), attempt, EXPLAIN_ATTEMPTS)
         if attempt < EXPLAIN_ATTEMPTS:
             await asyncio.sleep(EXPLAIN_RETRY_PAUSE * attempt)
     return {}

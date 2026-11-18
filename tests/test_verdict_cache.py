@@ -322,7 +322,7 @@ def test_flatten_normalizes_kind_and_placement():
     for pair in flow:
         pair["explanation"] = verdict()
     flow[0]["explanation"]["severity"] = "Moderate"
-    flow[0]["explanation"]["recommendations"] = [{"section": "A", "original_sentence": "alpha", "issue": "", "recommended_revision": "new", "kind": "surprise", "placement": "middle", "category": "evidence"}]
+    flow[0]["explanation"]["recommendations"] = [{"section": "A", "original_sentence": "alpha", "issue": "alpha clashes with the next section", "recommended_revision": "new", "kind": "surprise", "placement": "middle", "category": "evidence"}]
     _, recommendations = v7_scan.flatten_explanations(flow, sections)
     from main import RecommendationReport
     result = RecommendationReport(**recommendations[0])
