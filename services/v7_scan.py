@@ -34,6 +34,10 @@ EXPLAIN_LIMIT = int(os.getenv("EXPLAIN_LIMIT", "0")) or None  # a cap on reviewe
 EXPLAIN_CONCURRENCY = int(os.getenv("EXPLAIN_CONCURRENCY", "8"))  # single-pair fallback reviews running at the same time
 EXPLAIN_TIMEOUT = 240  # seconds one pair may take (waiting for a rate-limit slot and all retries included)
 BRIDGE_ROUNDS = 3  # how many times pairs still missing linking sentences are asked about
+# Recommendations are only for serious inconsistencies. Loose links and small differences still count in the score, but they are not
+# turned into advice, so linking sentences are no longer requested.
+SUGGEST_LINKING_SENTENCES = False
+SERIOUS = ("Critical", "Moderate")
 WHOLE_PAPER_NOTE = ("Part of the check across the whole paper could not finish because the AI was busy, so contradictions between "
                     "sections that are far apart may be missing from this report. Scan again to retry.")
 MIN_SECTION_WORDS = 5  # a heading with no text under it cannot be rated, so neighbors are paired across it
@@ -229,10 +233,38 @@ def merge_repeated_sections(parsed_sections, section_order):
     return list(merged.values())
 
 
+def is_prose(text):
+    """False for text that is mostly table rows or diagram labels: it has no argument to compare with the rest of the paper."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    words = sum(len(line.split()) for line in lines)
+    if not words:
+        return False
+    table_words = sum(len(line.split()) for line in lines if " | " in line)
+    label_words = sum(len(line.split()) for line in lines if len(line.split()) <= 4)
+    return not (table_words / words >= 0.35 or (len(lines) >= 10 and label_words / words >= 0.6))
+
+
+_CITATION_LINE = re.compile(r"(?i)(?:\bdoi\b|https?://|retrieved from|\bet al\.?,?\s*\(?\d{4}|^\s*\[?\d+\]\s|^[A-Z][A-Za-z'\-]+,\s+(?:[A-Z]\.\s*){1,3}[,&(])")
+_CAPTION = re.compile(r"(?i)^\s*(?:table|figure|fig\.?|appendix)\s*[\dA-Z]+\s*[:.\-\u2013\u2014|]")
+_ASKS_FOR_EXTRA = re.compile(r"(?i)\b(?:add|insert|include|create|provide|cite)\b[^.]{0,60}\b(?:tables?|figures?|diagrams?|citations?|references?|sources?)\b")
+
+
+def senseless_recommendation(item):
+    """A recommendation about a reference entry, a table row, a caption or a diagram label, or one that only asks for another
+    citation, table or figure, does not fix an inconsistency in the argument."""
+    sentence = (item.get("original_sentence") or "").strip()
+    if sentence and (" | " in sentence or _CITATION_LINE.search(sentence) or _CAPTION.match(sentence)
+                     or sentence.startswith(("\u25cf", "\u2022", "\u25aa"))):
+        return True
+    return bool(_ASKS_FOR_EXTRA.search(item.get("issue") or "")) and not sentence
+
+
 def comparable_sections(parsed_sections, section_order, section_roles):
-    """The sections a scan compares, in reading order: repeated headings merged, reference lists and empty headings left out."""
+    """The sections a scan compares, in reading order: repeated headings merged; reference lists, empty headings and
+    sections that are only table rows or diagram labels left out."""
     return [section for section in merge_repeated_sections(parsed_sections, section_order)
-            if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS]
+            if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS
+            and is_prose(section["text"])]
 
 
 def manuscript_preview_sections(sections, parse_result):
@@ -563,7 +595,7 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
             await asyncio.gather(*(second_opinion(group) for _, group in rechecks), return_exceptions=True)
         # A loosely linked neighbor pair always gets linking sentences to add: when the main review wrote none, ask for
         # just those (all pairs in ONE call), so a score that lost points to weak links never comes with an empty list.
-        loose = [p for p in flow if p.get("adjacent", True) and p["explanation"] and p["explanation"].get("severity") == "None"
+        loose = [p for p in flow if SUGGEST_LINKING_SENTENCES and p.get("adjacent", True) and p["explanation"] and p["explanation"].get("severity") == "None"
                  and len(p["explanation"].get("bridges") or []) < 2 and (p["scores"]["overall_coherence"] or 1) < FLOW_SUGGESTION_BELOW]
         for _ in range(BRIDGE_ROUNDS):   # pairs the request missed or whose sentences were already in the paper are asked again
             pending = [p for p in loose if len(p["explanation"].get("bridges") or []) < 2]
@@ -689,7 +721,11 @@ def flatten_explanations(flow, sections=None):
                              "finding_status": "material_issue"})
             seen_findings[(item["section"], norm(item["quote"]))] = findings[-1]
         number = 0
-        for item in bridges + pair_recommendations:
+        # Advice is only for serious inconsistencies: a pair graded Minor, a loose link or a clear pair gets none.
+        advice = (bridges + pair_recommendations) if (pair.get("severity") or explanation.get("severity")) in SERIOUS else []
+        for item in advice:
+            if senseless_recommendation(item):
+                continue
             key = (item["section"], norm(item["original_sentence"]))
             if item["original_sentence"] is not None:  # the default advice has no sentence to dedupe on
                 if key in highlighted:   # one recommendation per sentence, however many pairs raise it

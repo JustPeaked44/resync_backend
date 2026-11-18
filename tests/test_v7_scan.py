@@ -1,5 +1,5 @@
 import asyncio
-from services import v7_explain, gemini
+from services import v7_explain, v7_scan, gemini
 from services.v7_scan import (manuscript_score, assemble_flow, band, four_part_score, explain_flow, merge_repeated_sections,
                               pair_pointer, select_worst_pairs)
 import pytest
@@ -254,6 +254,7 @@ def test_a_pair_that_takes_too_long_is_left_unreviewed_without_holding_the_other
 
 
 def test_a_loosely_linked_neighbor_pair_gets_linking_sentences_even_when_the_main_review_wrote_none(monkeypatch):
+    monkeypatch.setattr(v7_scan, "SUGGEST_LINKING_SENTENCES", True)   # linking sentences are off by default
     sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABCD"]
     ratings = [0.4, 0.8, 0.5]   # A-B loose, B-C well linked (never reviewed), C-D loose
     raw = [{"scores": {"pair_weight": 1, "overall_coherence": o, "objectives_alignment": o, "methodology_fit": o,
@@ -279,7 +280,8 @@ def test_a_loosely_linked_neighbor_pair_gets_linking_sentences_even_when_the_mai
     monkeypatch.setattr(v7_explain, "suggest_bridges_batch", fake_bridges)
     _, recommendations, _ = asyncio.run(explain_flow(sections, flow))
     assert asked == [[("A", "B"), ("C", "D")]]                      # ONE call for both loose neighbor pairs, nothing for B-C
-    assert [(r["pair_order"], r["kind"]) for r in recommendations] == [(1, "add"), (1, "add"), (3, "add"), (3, "add")]
+    assert [len(p["explanation"]["bridges"]) for p in flow] == [2, 0, 2]   # the sentences are found, but a loose link is not a serious inconsistency
+    assert recommendations == []
     assert [p["severity"] for p in flow] == ["None", "None", "None"]   # a suggestion is never a penalty
 
 

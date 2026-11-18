@@ -188,6 +188,7 @@ def test_a_pair_the_ai_could_not_judge_is_asked_again_next_time(monkeypatch, ai)
 
 
 def test_a_loosely_linked_neighbor_pair_with_only_one_linking_sentence_is_completed_to_two(monkeypatch, ai):
+    monkeypatch.setattr(v7_scan, "SUGGEST_LINKING_SENTENCES", True)   # linking sentences are off by default
     sections, flow = paper(["alpha words here", "beta words here", "gamma words here", "delta words here"])
     asked_for = []
 
@@ -236,6 +237,7 @@ def test_when_the_second_review_cannot_run_the_first_verdict_stands(monkeypatch,
 
 
 def test_pairs_missing_linking_sentences_are_asked_again_until_they_have_both(monkeypatch, ai):
+    monkeypatch.setattr(v7_scan, "SUGGEST_LINKING_SENTENCES", True)   # linking sentences are off by default
     sections, flow = paper(["alpha words here", "beta words here", "gamma words here", "delta words here"])
     rounds = []
 
@@ -319,6 +321,7 @@ def test_flatten_normalizes_kind_and_placement():
     sections, flow = paper(["alpha", "beta", "gamma", "delta"])
     for pair in flow:
         pair["explanation"] = verdict()
+    flow[0]["explanation"]["severity"] = "Moderate"
     flow[0]["explanation"]["recommendations"] = [{"section": "A", "original_sentence": "alpha", "issue": "", "recommended_revision": "new", "kind": "surprise", "placement": "middle", "category": "evidence"}]
     _, recommendations = v7_scan.flatten_explanations(flow, sections)
     from main import RecommendationReport

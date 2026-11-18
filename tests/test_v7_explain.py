@@ -294,7 +294,7 @@ def test_shared_section_passage_has_one_highlight_recommendation():
     sections = [{"name": "A", "text": "A sentence."}, {"name": "B", "text": "Shared sentence."},
                 {"name": "C", "text": "C sentence."}]
     flow = assemble_flow(sections, [{"scores": dict(SCORES, pair_weight=1)}] * 2)
-    explanation = {"highlighted_inconsistencies": [], "reference_list": [],
+    explanation = {"severity": "Moderate", "highlighted_inconsistencies": [], "reference_list": [],
                    "recommendations": [{"section": "B", "original_sentence": "Shared sentence.",
                                         "recommended_revision": "Revised shared sentence."}]}
     flow[0]["explanation"] = explanation
