@@ -159,6 +159,8 @@ class _Wallet:
 
         class Call:
             def execute(self_inner):
+                if name == "get_credit_balance":
+                    return type("R", (), {"data": wallet.balance})()
                 assert name == "purchase_credits"
                 key = args["p_idempotency_key"]
                 if key not in wallet.purchases:
@@ -234,14 +236,19 @@ def test_a_purchase_still_works_when_the_table_has_no_user_column(wallet, monkey
         handle.insert = insert
         return handle
     monkeypatch.setattr(wallet, "table", table)
-    assert asyncio.run(credits.credits_service.purchase("user", 5, "card"))["balance"] == 5
+    with pytest.raises(RuntimeError):
+        asyncio.run(credits.credits_service.purchase("user", 5, "card"))
+    assert wallet.balance == 0
 
 
-def test_a_purchase_with_proof_saves_the_proof_first(wallet):
-    proof = {"reference_number": "1234 567", "payer_name": "Sheena", "file_name": "r.png", "content_type": "image/png",
-             "proof_data": "data:image/png;base64,aGk="}
-    asyncio.run(credits.credits_service.purchase("user", 5, "gcash", proof))
-    assert wallet.tables["payment_proof"][0]["reference_number"] == "1234 567" and wallet.balance == 5
+def test_a_purchase_with_proof_saves_the_proof_first(wallet, monkeypatch):
+    calls = []
+    async def save(*args):
+        calls.append(args)
+    monkeypatch.setattr(credits.CreditsService, "save_payment_proof", save)
+    proof = {"reference_number": "1234 567", "payer_name": "Tester", "file_name": "r.png", "content_type": "image/png", "proof_data": "data:image/png;base64,aGk="}
+    result = asyncio.run(credits.credits_service.purchase("user", 5, "gcash", proof))
+    assert calls[0][:4] == ("user", result["pymt_txn_id"], "gcash", "1234 567") and wallet.balance == 5
 
 
 def test_the_endpoint_refuses_someone_elses_account(wallet):
@@ -254,7 +261,7 @@ def test_a_purchase_is_filed_under_the_buyers_subscription(wallet):
     wallet.tables["subscription"] = [{"subscription_id": "sub-1", "user_id": "user"}]
     asyncio.run(credits.credits_service.purchase("user", 5, "card"))
     row = wallet.tables["pymt_txn"][0]
-    assert row["subscription_id"] == "sub-1" and row["pymt_txn_created_at"]
+    assert row["user_id"] == "user" and "subscription_id" not in row and row["pymt_txn_created_at"]
 
 
 def test_the_old_credits_enabled_setting_no_longer_turns_credits_off(monkeypatch):

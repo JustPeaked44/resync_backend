@@ -39,7 +39,7 @@ def test_scan_routes_return_same_display_contract(monkeypatch, route):
     }
     original = deepcopy(stored)
     db_row = row('scan', 'completed')
-    db_row['result_json'] = stored
+    db_row['analysis_run_result_json'] = stored
     monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: FakeDB([db_row]))
     async def provision(*args, **kwargs):
         return 'scan', 'ms', 0
@@ -67,6 +67,7 @@ def test_scan_routes_return_same_display_contract(monkeypatch, route):
             assert locked['citations'] == []
             assert locked['access']['locked_counts'] == locked_scan_view(original)['access']['locked_counts']
             stored['access']['unlocked'] = True
+            db_row['analysis_run_is_unlocked'] = True
             unlocked_original = deepcopy(stored)
             unlocked = request()
             assert stored == unlocked_original

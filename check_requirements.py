@@ -78,8 +78,8 @@ def check_system_readiness():
         try:
             from supabase import create_client
             client = create_client(sb_url, sb_key)
-            res = client.table("subscription_plan").select("*").execute()
-            print(f"    --> ✅ PASS: Connected to Supabase! Found {len(res.data)} subscription plans in DB.")
+            res = client.table("user").select("user_id").limit(1).execute()
+            print(f"    --> ✅ PASS: Connected to Supabase! User table query returned {len(res.data)} rows.")
         except Exception as e:
             print(f"    --> ❌ FAIL: Supabase Connection Error: {str(e)}")
     else:

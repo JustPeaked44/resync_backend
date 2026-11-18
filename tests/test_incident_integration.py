@@ -46,7 +46,7 @@ def test_queued_users_keep_separate_verdicts(monkeypatch):
 
 def test_restart_and_deadline_keep_terminal_rows(monkeypatch):
     rows = [row('old'), row('done', 'completed'), row('timeout'), row('finished', 'completed')]
-    rows[1]['result_json'] = rows[3]['result_json'] = {'report': 'kept'}
+    rows[1]['analysis_run_result_json'] = rows[3]['analysis_run_result_json'] = {'report': 'kept'}
     db = FakeDB(rows)
     monkeypatch.setattr(main.DatabasePersistenceService, 'get_client', lambda: db)
     monkeypatch.setattr(main, 'INTERRUPTED_GRACE_SECONDS', 0)
@@ -60,9 +60,9 @@ def test_restart_and_deadline_keep_terminal_rows(monkeypatch):
         await main._run_scan_job(SimpleNamespace(user_id='owner'), 'timeout', None, 0)
         await main._mark_failed('finished', main.TIMEOUT_MESSAGE)
     asyncio.run(run())
-    assert rows[2]['error_message'] == main.TIMEOUT_MESSAGE
-    assert rows[1]['status'] == rows[3]['status'] == 'completed'
-    assert rows[3]['result_json'] == {'report': 'kept'}
+    assert rows[2]['analysis_run_error_message'] == main.TIMEOUT_MESSAGE
+    assert rows[1]['analysis_run_status'] == rows[3]['analysis_run_status'] == 'completed'
+    assert rows[3]['analysis_run_result_json'] == {'report': 'kept'}
 
 
 def test_normal_parser_path_does_not_load_spacy():
@@ -96,11 +96,11 @@ def test_sync_scan_context_and_busy_slot(monkeypatch, upload):
     async def run():
         monkeypatch.setattr(main, 'SCAN_SLOT', asyncio.Semaphore(1))
         with pytest.raises(ValueError): await invoke()
-        db.rows[0]['status'] = 'processing'
+        db.rows[0]['analysis_run_status'] = 'processing'
         class Busy:
             async def acquire(self): raise asyncio.TimeoutError()
         monkeypatch.setattr(main, 'SCAN_SLOT', Busy())
         with pytest.raises(main.HTTPException) as exc: await invoke()
         assert exc.value.status_code == 503
-        assert db.rows[0]['error_message'] == main.GENERIC_FAILURE_MESSAGE.format(scan_number='sync')
+        assert db.rows[0]['analysis_run_error_message'] == main.GENERIC_FAILURE_MESSAGE.format(scan_number='sync')
     asyncio.run(run())

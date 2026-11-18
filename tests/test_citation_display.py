@@ -56,7 +56,7 @@ def test_get_old_result_and_locked_view(monkeypatch):
         def table(self, *_): return self
         def select(self, *_): return self
         def eq(self, *_): return self
-        def execute(self): return SimpleNamespace(data=[{"user_id": "owner", "status": "completed", "result_json": stored}])
+        def execute(self): return SimpleNamespace(data=[{"user_id": "owner", "analysis_run_status": "completed", "analysis_run_is_unlocked": stored.get("access", {}).get("unlocked", False), "analysis_run_result_json": stored}])
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
     result = asyncio.run(main.get_scan_status("run", "owner")).result

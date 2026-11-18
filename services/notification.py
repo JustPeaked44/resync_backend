@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import httpx
 from typing import Optional, List, Dict, Any
@@ -30,13 +29,12 @@ class NotificationDeliveryService:
         analysis_run_id: str
     ) -> bool:
         """
-        1. Query `public.user_device_token` via Supabase to find device_onesignal_player_id for user_id.
+        1. Query `public.user_device_token` via Supabase to find player IDs for user_id.
         2. If player ID exists, send an async POST request to https://onesignal.com/api/v1/notifications:
            - Use ONESIGNAL_APP_ID and ONESIGNAL_REST_API_KEY from .env.
            - Headings: {"en": "Scan Complete!"}
            - Contents: {"en": f"Your manuscript '{manuscript_title}' scored {coherence_score}% coherence."}
-        3. Insert an in-app notification record into `public.notification` table with notification_type='scan_completed'.
-        4. Return True if sent/logged, False otherwise.
+        3. Return True if push delivery succeeded, False otherwise.
         """
         try:
             supabase = cls._get_supabase_client()
@@ -46,13 +44,13 @@ class NotificationDeliveryService:
             try:
                 device_query = (
                     supabase.table("user_device_token")
-                    .select("device_onesignal_player_id")
+                    .select("user_device_token_player_id")
                     .eq("user_id", user_id)
                     .execute()
                 )
                 if device_query and device_query.data:
                     for row in device_query.data:
-                        pid = row.get("device_onesignal_player_id")
+                        pid = row.get("user_device_token_player_id")
                         if pid and isinstance(pid, str) and pid.strip():
                             player_ids.append(pid.strip())
             except Exception as e:
@@ -60,6 +58,7 @@ class NotificationDeliveryService:
 
             # 2. If player ID exists, send OneSignal push notification
             onesignal_notification_id: Optional[str] = None
+            push_delivered = False
             onesignal_app_id = os.getenv("ONESIGNAL_APP_ID")
             onesignal_api_key = os.getenv("ONESIGNAL_REST_API_KEY")
 
@@ -91,6 +90,7 @@ class NotificationDeliveryService:
                             json=onesignal_payload,
                         )
                         if response.status_code in (200, 201):
+                            push_delivered = True
                             res_json = response.json()
                             onesignal_notification_id = res_json.get("id")
                             logger.info(f"OneSignal push notification sent successfully: {onesignal_notification_id}")
@@ -101,35 +101,7 @@ class NotificationDeliveryService:
                 except Exception as e:
                     logger.warning(f"Error sending OneSignal push notification: {e}")
 
-            # 3. Insert in-app notification record into public.notification table
-            notification_payload = json.dumps({
-                "title": "Scan Complete!",
-                "message": f"Your manuscript '{manuscript_title}' scored {coherence_score}% coherence.",
-                "manuscript_title": manuscript_title,
-                "coherence_score": coherence_score,
-                "analysis_run_id": str(analysis_run_id),
-            })
-
-            notification_data: Dict[str, Any] = {
-                "user_id": user_id,
-                "notification_type": "scan_completed",
-                "notification_payload": notification_payload,
-                "notification_isread": False,
-            }
-
-            if analysis_run_id:
-                notification_data["analysis_run_id"] = str(analysis_run_id)
-            if onesignal_notification_id:
-                notification_data["notification_onesignal_id"] = str(onesignal_notification_id)
-
-            insert_response = supabase.table("notification").insert(notification_data).execute()
-
-            if insert_response and insert_response.data:
-                logger.info(f"In-app notification logged successfully for user {user_id}")
-                return True
-            else:
-                logger.warning(f"Notification insertion returned empty data: {insert_response}")
-                return False
+            return push_delivered
 
         except Exception as e:
             logger.error(f"Error in send_scan_completion_alert: {e}", exc_info=True)

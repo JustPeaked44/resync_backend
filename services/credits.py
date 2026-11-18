@@ -7,6 +7,7 @@ stored report unlocked in one transaction.
 """
 
 import logging
+import base64
 import os
 import uuid
 from datetime import datetime, timezone
@@ -47,13 +48,7 @@ class CreditsService:
         client = cls._client()
 
         def _fetch():
-            resp = (
-                client.table("credit_wallet")
-                .select("balance")
-                .eq("user_id", user_id)
-                .execute()
-            )
-            return resp.data[0]["balance"] if resp.data else 0
+            return client.rpc("get_credit_balance", {"p_user_id": user_id}).execute().data
 
         return await asyncio.to_thread(_fetch)
 
@@ -177,24 +172,7 @@ class CreditsService:
                "pymt_txn_credits": credit_amount, "pymt_txn_provider": method,
                "pymt_txn_created_at": datetime.now(timezone.utc).isoformat()}
 
-        def _record():
-            # Payments in this project belong to the buyer's subscription record.
-            try:
-                found = (client.table("subscription").select("subscription_id")
-                         .eq("user_id", user_id).order("subscription_started_at", desc=True).limit(1).execute())
-                if found.data:
-                    row["subscription_id"] = found.data[0]["subscription_id"]
-            except Exception as error:
-                logger.warning("Could not look up the subscription for user %s: %s", user_id, error)
-            try:
-                client.table("pymt_txn").insert({**row, "user_id": user_id}).execute()
-            except Exception as error:
-                # Projects set up before migration 014 have no user_id column here; the ledger still names the buyer.
-                if "user_id" not in str(error):
-                    raise
-                client.table("pymt_txn").insert(row).execute()
-
-        await asyncio.to_thread(_record)
+        await asyncio.to_thread(lambda: client.table("pymt_txn").insert({**row, "user_id": user_id}).execute())
 
         def _mark(status: str):
             try:
@@ -203,11 +181,9 @@ class CreditsService:
                 logger.error("Could not mark transaction %s as %s: %s", txn_id, status, error)
 
         if proof:
-            # The receipt is a keepsake while no payment provider confirms the money: if it cannot be stored (for
-            # example migration 012 has not been run), the purchase still goes through.
             try:
-                await asyncio.to_thread(lambda: client.table("payment_proof").insert(
-                    {"proof_id": str(uuid.uuid4()), "pymt_txn_id": txn_id, "user_id": user_id, "method": method, **proof}).execute())
+                await cls.save_payment_proof(user_id, txn_id, method, proof["reference_number"],
+                    proof.get("payer_name"), proof.get("file_name"), proof["content_type"], proof["proof_data"])
             except Exception as error:
                 logger.warning("Proof of payment for %s was not stored: %s", txn_id, error)
         try:
@@ -225,22 +201,31 @@ class CreditsService:
     async def save_payment_proof(cls, user_id: str, pymt_txn_id: str, method: str, reference_number: str,
                                  payer_name: Optional[str], file_name: Optional[str], content_type: str,
                                  proof_data: str) -> str:
-        """Keeps the uploaded proof of payment for a pending transaction that belongs to this user."""
+        """Stores a proof for a transaction owned by this user."""
         import asyncio
         client = cls._client()
 
         def _save():
-            txn = (client.table("pymt_txn").select("pymt_txn_id")
+            txn = (client.table("pymt_txn").select("pymt_txn_id, pymt_txn_proof_file_path")
                    .eq("pymt_txn_id", pymt_txn_id).eq("user_id", user_id).execute())
             if not txn.data:
                 raise ValueError(f"Payment transaction {pymt_txn_id} not found for user {user_id}.")
+            suffix = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}[content_type]
             proof_id = str(uuid.uuid4())
-            client.table("payment_proof").insert({
-                "proof_id": proof_id, "pymt_txn_id": pymt_txn_id, "user_id": user_id, "method": method,
-                "reference_number": reference_number, "payer_name": payer_name, "file_name": file_name,
-                "content_type": content_type, "proof_data": proof_data,
-            }).execute()
-            client.table("pymt_txn").update({"pymt_txn_provider": method}).eq("pymt_txn_id", pymt_txn_id).execute()
+            path = f"{user_id}/{pymt_txn_id}/{proof_id}.{suffix}"
+            raw = base64.b64decode(proof_data.split(",", 1)[1], validate=True)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("The proof of payment is larger than 2 MB.")
+            client.storage.from_("payment-proofs").upload(
+                path, raw, {"content-type": content_type, "upsert": "true"})
+            (client.table("pymt_txn").update({
+                "pymt_txn_proof_method": method,
+                "pymt_txn_proof_reference": reference_number,
+                "pymt_txn_proof_payer_name": payer_name,
+                "pymt_txn_proof_file_path": path,
+                "pymt_txn_proof_uploaded_at": datetime.now(timezone.utc).isoformat(),
+                "pymt_txn_provider": method,
+            }).eq("pymt_txn_id", pymt_txn_id).eq("user_id", user_id).execute())
             return proof_id
 
         return await asyncio.to_thread(_save)
@@ -297,13 +282,16 @@ class CreditsService:
         def _fetch():
             resp = (
                 client.table("credit_ledger")
-                .select("ledger_id, kind, delta, balance_after, analysis_run_id, note, created_at")
+                .select("credit_ledger_id, credit_ledger_kind, credit_ledger_delta, credit_ledger_balance_after, analysis_run_id, credit_ledger_note, credit_ledger_created_at")
                 .eq("user_id", user_id)
-                .order("created_at", desc=True)
+                .order("credit_ledger_created_at", desc=True)
                 .limit(limit)
                 .execute()
             )
-            return resp.data or []
+            return [{"ledger_id": row["credit_ledger_id"], "kind": row["credit_ledger_kind"],
+                     "delta": row["credit_ledger_delta"], "balance_after": row["credit_ledger_balance_after"],
+                     "analysis_run_id": row.get("analysis_run_id"), "note": row.get("credit_ledger_note"),
+                     "created_at": row["credit_ledger_created_at"]} for row in (resp.data or [])]
 
         return await asyncio.to_thread(_fetch)
 

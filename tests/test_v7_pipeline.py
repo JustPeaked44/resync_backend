@@ -35,7 +35,7 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
         def update(self, payload):
             self.updated = True
             captured.setdefault("updates", []).append(payload)
-            captured.setdefault("events", []).append("publish" if payload.get("status") == "completed" else "fail")
+            captured.setdefault("events", []).append("publish" if payload.get("analysis_run_status") == "completed" else "fail")
             return self
 
         def eq(self, *args):
@@ -47,7 +47,7 @@ def build_scan(monkeypatch, reuse_saved_sections=False, captured=None):
         def execute(self):
             if getattr(self, "updated", False):
                 payload = captured["updates"][-1]
-                if captured.get("fail_publish") and payload.get("status") == "completed":
+                if captured.get("fail_publish") and payload.get("analysis_run_status") == "completed":
                     raise RuntimeError("publish failed")
                 captured.setdefault("row", {}).update(payload)
                 return SimpleNamespace(data=[{}])
@@ -342,8 +342,8 @@ def test_persistence_rounds_only_legacy_integer_mirror(monkeypatch):
         user_id="u", manuscript_id="m", analysis_run_id="r", coherence_score=77.1,
         inconsistencies=[], recommendations=[], citations=[],
         score_breakdown={"overall_score": 77.1, "band": "Solid", "cross_chapter_coherence_score": 77.1}))
-    assert updates[0]["analysis_run_coherence_score"] == 77
-    assert updates[0]["functional_metric_score"] == 77.1
+    assert updates[0]["analysis_run_score"] == 77
+    assert updates[0]["analysis_run_band"] == "Solid"
     assert "structural_completeness_score" not in updates[0]
 
 
@@ -382,8 +382,8 @@ def test_notification_outcome_is_published_once(monkeypatch, notify_result, noti
     payload, captured, _ = build_scan(monkeypatch, captured={"notify_result": notify_result, "notify_raises": notify_raises})
     assert captured["events"] == ["save", "notify", "publish"]
     assert len(captured["updates"]) == 1
-    stored = captured["row"]["result_json"]
-    assert captured["row"]["status"] == "completed"
+    stored = captured["row"]["analysis_run_result_json"]
+    assert captured["row"]["analysis_run_status"] == "completed"
     assert stored["notification_dispatched"] is notify_result
     assert payload == stored
 
@@ -391,8 +391,8 @@ def test_notification_outcome_is_published_once(monkeypatch, notify_result, noti
 def test_publish_failure_after_notification_marks_row_failed(monkeypatch, caplog):
     _, captured, _ = build_scan(monkeypatch, captured={"fail_publish": True, "run_job": True})
     assert captured["events"] == ["save", "notify", "publish", "fail"]
-    assert captured["row"]["status"] == "failed"
-    assert captured["row"]["error_message"] == main.GENERIC_FAILURE_MESSAGE.format(scan_number="run")
+    assert captured["row"]["analysis_run_status"] == "failed"
+    assert captured["row"]["analysis_run_error_message"] == main.GENERIC_FAILURE_MESSAGE.format(scan_number="run")
     assert "Failed to publish scan run after notification" in caplog.text
 
 

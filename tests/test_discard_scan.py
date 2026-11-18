@@ -52,21 +52,21 @@ def db(monkeypatch):
 
 def test_leaving_a_report_deletes_everything_it_holds_of_the_manuscript(db):
     assert asyncio.run(main.discard_scan("scan-1", "user-1")) == {"discarded": True}
-    deleted = {(name, filters.get("analysis_run_id") or filters.get("manuscript_id")) for name, mode, filters, _ in db.calls if mode == "delete"}
-    assert {("inconsistency", "scan-1"), ("recommendation", "scan-1"), ("citation", "scan-1"),
-            ("citation_crossmatch_issue", "scan-1"), ("manuscript_section_cache", "m-1")} <= deleted
+    deleted = {name for name, mode, _, _ in db.calls if mode == "delete"}
+    assert deleted == set(DatabasePersistenceService.SCAN_CONTENT_TABLES)
     update = next(payload for name, mode, _, payload in db.calls if name == "analysis_run" and mode == "update")
-    assert update["result_json"] is None and update["score_breakdown_json"] is None and update["error_message"] == DISCARDED_MESSAGE
-    assert update["ai_text_indicator_json"] is None and update["status"] == "failed"
+    assert update == {"analysis_run_result_json": None, "analysis_run_status": "failed", "analysis_run_error_message": DISCARDED_MESSAGE}
+    manuscript = next(payload for name, mode, _, payload in db.calls if name == "manuscript" and mode == "update")
+    assert manuscript == dict.fromkeys(("manuscript_content_hash", "manuscript_structure", "manuscript_parsed_sections", "manuscript_raw_text"))
     assert db.calls[1][:3] == ("analysis_run", "update", {"analysis_run_id": "scan-1", "user_id": "user-1"})
 
 
-@pytest.mark.parametrize("failed_table", ["citation_crossmatch_issue", "manuscript_section_cache"])
-def test_content_delete_failure_does_not_stop_discard(db, caplog, failed_table):
-    db.failure = (failed_table, "delete")
+@pytest.mark.parametrize("failed_table, mode", [("citation", "delete"), ("manuscript", "update")])
+def test_content_delete_failure_does_not_stop_discard(db, caplog, failed_table, mode):
+    db.failure = (failed_table, mode)
     assert asyncio.run(DatabasePersistenceService.discard_scan("user-1", "scan-1")) is True
     assert db.calls[1][1] == "update"
-    assert {call[0] for call in db.calls if call[1] == "delete"} == set(DatabasePersistenceService.SCAN_CONTENT_TABLES) | {"manuscript_section_cache"}
+    assert {call[0] for call in db.calls if call[1] == "delete"} == set(DatabasePersistenceService.SCAN_CONTENT_TABLES)
     assert failed_table in caplog.text
 
 

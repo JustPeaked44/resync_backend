@@ -83,7 +83,7 @@ def test_saved_verdicts_come_back_from_the_database_and_incomplete_ones_are_neve
     client = FakeClient()
     monkeypatch.setattr(verdict_cache.DatabasePersistenceService, "get_client", lambda: client)
     asyncio.run(VerdictCache.save_many({"k1": verdict("Moderate"), "k2": verdict(None), "k3": verdict("None")}))
-    assert sorted(row["cache_key"] for row in client.rows) == ["k1", "k3"]          # k2 was a pair the AI could not judge
+    assert sorted(row["pair_verdict_cache_key"] for row in client.rows) == ["k1", "k3"]          # k2 was a pair the AI could not judge
     VerdictCache.forget_everything_in_memory()                                      # a restarted server: only the database remembers
     found = asyncio.run(VerdictCache.get_many(["k1", "k2", "k3", "k4"]))
     assert set(found) == {"k1", "k3"} and found["k1"]["severity"] == "Moderate"
@@ -347,10 +347,10 @@ def test_invalid_database_entry_is_overwritten(monkeypatch, ai):
     texts = ["alpha words here", "beta words here", "gamma words here", "delta words here"]
     sections, flow = paper(texts)
     asyncio.run(explain_flow(sections, flow))
-    client.rows[0]["explanation"]["severity"] = "surprise"
-    key = client.rows[0]["cache_key"]
+    client.rows[0]["pair_verdict_cache_explanation"]["severity"] = "surprise"
+    key = client.rows[0]["pair_verdict_cache_key"]
     VerdictCache.forget_everything_in_memory()
     ai.asked.clear()
     sections, flow = paper(texts)
     asyncio.run(explain_flow(sections, flow))
-    assert ai.asked and next(row for row in client.rows if row["cache_key"] == key)["explanation"]["severity"] == "None"
+    assert ai.asked and next(row for row in client.rows if row["pair_verdict_cache_key"] == key)["pair_verdict_cache_explanation"]["severity"] == "None"

@@ -5,6 +5,8 @@ import time
 import uuid
 import logging
 import re
+import binascii
+from copy import deepcopy
 from html import unescape
 from collections import defaultdict, deque
 import math
@@ -39,6 +41,14 @@ from services.gemini import scan_context, scan_status_message
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view, scan_view
+
+
+def _saved_scan_view(result: Dict[str, Any], unlocked: bool) -> Dict[str, Any]:
+    saved = deepcopy(result)
+    if not isinstance(saved.get("access"), dict):
+        saved["access"] = {"unlock_cost": 1}
+    saved["access"]["unlocked"] = unlocked
+    return locked_scan_view(saved)
 
 logger = logging.getLogger("resync.main")
 PROCESS_START = datetime.now(timezone.utc)
@@ -443,7 +453,7 @@ class ScanRequest(BaseModel):
         description=(
             "UUID of an existing manuscript row in public.manuscript. Omit to "
             "have the pipeline create a new manuscript row automatically from "
-            "manuscript_title + doc_url — every scan-and-go submission is its "
+            "manuscript_title + doc_url â€” every scan-and-go submission is its "
             "own manuscript rather than all users sharing one hardcoded row."
         ),
     )
@@ -666,9 +676,7 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
 
         manuscript_id = await _resolve_manuscript_id(db_client, req, default_source_name=default_source_name)
 
-        # Bug 4: analysis_run_template_toc is a text column, stringify the list
-        toc_str = json.dumps(req.template_toc) if req.template_toc else None
-        source_identifier = req.doc_url or req.filename or default_source_name or "uploaded_file.docx"
+        toc = req.template_toc if req.template_toc else None
 
         # Bug 1: Add user_id to the insert payload
         insertion = asyncio.create_task(asyncio.to_thread(
@@ -677,13 +685,9 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
                 "user_id": req.user_id,
                 "manuscript_id": manuscript_id,
                 "analysis_run_status": "processing",
-                "analysis_run_template_toc": toc_str,
-                "analysis_run_coherence_score": 0,
-                # Plain-text mirror of the job state. The polling endpoint reads
-                # this rather than the enum column, because the enum has no
-                # 'failed' member (see migration 003).
-                RUN_STATUS: "processing",
-                "doc_url": source_identifier,
+                "analysis_run_template_toc": toc,
+                "analysis_run_score": 0,
+                "analysis_run_is_unlocked": False,
             }).execute()
         ))
         try:
@@ -1008,8 +1012,7 @@ async def _save_completed_result(result: ScanResponse) -> bool:
     db_client = DatabasePersistenceService.get_client()
     response = await asyncio.to_thread(
         lambda: db_client.table(RUN_TABLE).update({
-            RUN_STATUS: "completed", RUN_RESULT: result.model_dump(mode="json"),
-            "analysis_run_status": "completed", "analysis_run_completed_at": datetime.now(timezone.utc).isoformat(),
+            RUN_STATUS: "completed", RUN_RESULT: result.model_dump(mode="json"), "analysis_run_completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq(RUN_ID, result.analysis_run_id).eq(RUN_STATUS, "processing").execute()
     )
     return bool(response.data)
@@ -1097,9 +1100,9 @@ async def _sweep_interrupted():
     summary="Master Production Scan (synchronous)",
     description=(
         "Runs the full RESYNC analysis pipeline and blocks until it finishes: "
-        "Ingestion → Parser → v7 scoring and explanation → Citation → DB → Notification. "
+        "Ingestion â†’ Parser â†’ v7 scoring and explanation â†’ Citation â†’ DB â†’ Notification. "
         "Retained for the Android client. Long manuscripts can exceed upstream "
-        "proxy request timeouts on this endpoint — new clients should prefer "
+        "proxy request timeouts on this endpoint â€” new clients should prefer "
         "POST /api/scans/start."
     ),
     tags=["Scans"]
@@ -1409,7 +1412,7 @@ async def get_scan_status(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table(RUN_TABLE)
-                .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED)))
+                .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED, "analysis_run_is_unlocked")))
                 .eq(RUN_ID, analysis_run_id)
                 .execute()
         )
@@ -1447,7 +1450,7 @@ async def get_scan_status(
             and (datetime.now(timezone.utc) - PROCESS_START).total_seconds() >= INTERRUPTED_GRACE_SECONDS):
         await _mark_failed(analysis_run_id, INTERRUPTED_MESSAGE)
         run_resp = await asyncio.to_thread(lambda: db_client.table(RUN_TABLE)
-            .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED)))
+            .select(", ".join((RUN_ID, "user_id", RUN_STATUS, RUN_ERROR, RUN_RESULT, RUN_CREATED, "analysis_run_is_unlocked")))
             .eq(RUN_ID, analysis_run_id).execute())
         row = run_resp.data[0]
         job_status = row.get(RUN_STATUS) or "processing"
@@ -1473,7 +1476,7 @@ async def get_scan_status(
         return ScanStatusResponse(
             status="completed",
             analysis_run_id=analysis_run_id,
-            result=scan_view(result_json)
+            result=scan_view({**result_json, "access": {**(result_json.get("access") or {}), "unlocked": row["analysis_run_is_unlocked"]}})
         )
 
     level, message = scan_status_message(analysis_run_id)
@@ -1577,7 +1580,7 @@ async def get_manuscript_preview(
         run_resp = await asyncio.to_thread(
             lambda: db_client
                 .table("analysis_run")
-                .select("user_id, result_json")
+                .select("user_id, analysis_run_result_json, analysis_run_is_unlocked")
                 .eq("analysis_run_id", scan_id)
                 .execute()
         )
@@ -1595,9 +1598,9 @@ async def get_manuscript_preview(
         
     result_json = row.get(RUN_RESULT) or {}
     if result_json.get("manuscript_sections"):
-        sections = locked_scan_view(result_json).get("manuscript_sections") or []
+        sections = _saved_scan_view(result_json, row["analysis_run_is_unlocked"]).get("manuscript_sections") or []
         return {"available": bool(sections), "text": "\n\n".join(section["text"] or "" for section in sections if section["text"] is not None)}
-    if not (result_json.get("access") or {}).get("unlocked"):
+    if not row["analysis_run_is_unlocked"]:
         return {"available": False, "reason": "locked"}
     doc_url = result_json.get("doc_url")
     
@@ -1697,7 +1700,7 @@ async def submit_issue_feedback(
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> IssueFeedbackResponse:
     """
-    Stores user feedback for a specific inconsistency in public.issue_feedback.
+    Stores the owner's latest feedback on the inconsistency.
 
     Security:
     - Validates the caller's bearer token actually belongs to x_user_id.
@@ -1742,13 +1745,9 @@ async def submit_issue_feedback(
         feedback_id = str(uuid.uuid4())
 
         await asyncio.to_thread(
-            lambda: db_client.table("issue_feedback").insert({
-                "feedback_id": feedback_id,
-                "inconsistency_id": issue_id,
-                "user_id": x_user_id,
-                "is_helpful": body.helpful,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
+            lambda: db_client.table("inconsistency").update({
+                "inconsistency_is_helpful": body.helpful,
+            }).eq("inconsistency_id", issue_id).execute()
         )
 
         logger.info(
@@ -1777,6 +1776,33 @@ async def submit_issue_feedback(
 # confirm_checkout -> the purchase_credits RPC) instead of being invoked
 # directly by the client. Nothing else in the credits flow changes.
 # ---------------------------------------------------------------------------
+
+class DeviceRegistration(BaseModel):
+    player_id: str = Field(..., min_length=1, max_length=200)
+    platform: Literal["android", "ios", "web"]
+
+
+@app.post("/api/devices", tags=["Devices"])
+async def register_device(body: DeviceRegistration, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    client = DatabasePersistenceService.get_client()
+    await asyncio.to_thread(lambda: client.table("user_device_token").upsert({
+        "user_id": authenticated_user_id,
+        "user_device_token_player_id": body.player_id,
+        "user_device_token_platform": body.platform,
+    }, on_conflict="user_device_token_player_id").execute())
+    return {"registered": True}
+
+
+@app.delete("/api/devices/{player_id}", tags=["Devices"])
+async def remove_device(player_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    client = DatabasePersistenceService.get_client()
+    response = await asyncio.to_thread(lambda: client.table("user_device_token").delete()
+                                       .eq("user_device_token_player_id", player_id)
+                                       .eq("user_id", authenticated_user_id).execute())
+    if not response.data:
+        raise HTTPException(status_code=404, detail="Device not found.")
+    return {"removed": True}
+
 
 class CreditBalanceResponse(BaseModel):
     user_id: str
@@ -1841,7 +1867,7 @@ async def get_credit_balance(
     summary="Start a (simulated) credit purchase",
     description=(
         "Creates a pending payment transaction and returns a mock checkout "
-        "reference. No real payment provider is wired up — this is a "
+        "reference. No real payment provider is wired up â€” this is a "
         "capstone-safe simulated ledger, not a live charge. Call "
         "POST /api/credits/confirm with the returned pymt_txn_id to complete it."
     ),
@@ -1871,7 +1897,7 @@ async def create_credit_checkout(
     response_model=ConfirmCheckoutResponse,
     summary="Confirm a (simulated) credit purchase",
     description=(
-        "Marks the transaction paid and credits the wallet. Idempotent — "
+        "Marks the transaction paid and credits the wallet. Idempotent â€” "
         "confirming an already-paid transaction just returns the current "
         "balance rather than double-crediting it."
     ),
@@ -2308,13 +2334,15 @@ async def upload_payment_proof(
     _assert_owner(authenticated_user_id, x_user_id)
     if body.content_type not in PROOF_TYPES:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Upload a PNG, JPEG, WebP or PDF file.")
-    if len(body.proof_data) * 3 // 4 > PROOF_MAX_BYTES:
+    if len(body.proof_data.rstrip("=")) * 3 // 4 > PROOF_MAX_BYTES:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="The proof of payment is larger than 2 MB.")
     try:
         proof_id = await credits_service.save_payment_proof(
             x_user_id, body.pymt_txn_id, body.method, body.reference_number.strip(), body.payer_name,
             body.file_name, body.content_type, f"data:{body.content_type};base64,{body.proof_data}")
         return PaymentProofResponse(status="received", proof_id=proof_id)
+    except binascii.Error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The proof of payment is not valid base64.")
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except Exception as exc:

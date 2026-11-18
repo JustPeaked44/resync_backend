@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 
 RUN_TABLE = "analysis_run"
 RUN_ID = "analysis_run_id"
-RUN_STATUS = "status"
-RUN_ERROR = "error_message"
-RUN_CREATED = "created_at"
-RUN_RESULT = "result_json"
+RUN_STATUS = "analysis_run_status"
+RUN_ERROR = "analysis_run_error_message"
+RUN_CREATED = "analysis_run_created_at"
+RUN_RESULT = "analysis_run_result_json"
 DISCARDED_MESSAGE = "This report was deleted when it was closed. Scan the paper again to get a new report."
 
 class DatabasePersistenceService:
@@ -71,7 +71,7 @@ class DatabasePersistenceService:
         """
         if cls._client is None:
             supabase_url = os.getenv("SUPABASE_URL")
-            supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+            supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
             if not supabase_url or not supabase_key:
                 raise ValueError(
                     "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured in environment."
@@ -80,7 +80,7 @@ class DatabasePersistenceService:
         return cls._client
 
     # Tables that keep sentences or findings of the manuscript for one scan; all are keyed by analysis_run_id.
-    SCAN_CONTENT_TABLES = ("inconsistency", "recommendation", "citation", "citation_crossmatch_issue")
+    SCAN_CONTENT_TABLES = ("inconsistency", "recommendation", "citation")
 
     @classmethod
     async def discard_scan(cls, user_id: str, analysis_run_id: str) -> bool:
@@ -94,7 +94,7 @@ class DatabasePersistenceService:
             return False
         manuscript_id = found.data[0].get("manuscript_id")
         await asyncio.to_thread(lambda: client.table(RUN_TABLE).update({
-            RUN_RESULT: None, "score_breakdown_json": None, "ai_text_indicator_json": None,
+            RUN_RESULT: None,
             RUN_STATUS: "failed", RUN_ERROR: DISCARDED_MESSAGE}).eq(RUN_ID, analysis_run_id).eq("user_id", user_id).execute())
         for table in cls.SCAN_CONTENT_TABLES:
             try:
@@ -103,10 +103,10 @@ class DatabasePersistenceService:
                 logger.warning("Failed to delete scan content from %s", table)
         if manuscript_id:
             try:
-                await asyncio.to_thread(lambda: client.table("manuscript_section_cache").delete()
+                await asyncio.to_thread(lambda: client.table("manuscript").update({"manuscript_content_hash": None, "manuscript_structure": None, "manuscript_parsed_sections": None, "manuscript_raw_text": None})
                                         .eq("user_id", user_id).eq("manuscript_id", manuscript_id).execute())
             except Exception:
-                logger.warning("Failed to delete scan content from %s", "manuscript_section_cache")
+                logger.warning("Failed to delete scan content from %s", "manuscript")
         return True
 
     @classmethod
@@ -131,15 +131,13 @@ class DatabasePersistenceService:
         1. Initialize Supabase client using SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY from .env.
         2. Update `public.analysis_run` where analysis_run_id = analysis_run_id:
            - analysis_run_status = 'completed'
-           - analysis_run_coherence_score = coherence_score
+           - analysis_run_score = coherence_score
            - analysis_run_completed_at = 'now()'
-           - the three functional-metric sub-scores, band, and biggest lever
+           - citation and AI text scores and the band
         3. Insert rows into `public.inconsistency` (linking each to analysis_run_id).
         4. Insert rows into `public.recommendation` (linking each to analysis_run_id).
         5. Insert rows into `public.citation` (linking each to analysis_run_id), carrying
            the full segmentation/verification detail rather than just the old two fields.
-        5b. Insert rows into `public.citation_crossmatch_issue` for orphan in-text
-            citations and uncited references.
         6. Return {"status": "success", "analysis_run_id": analysis_run_id}
 
         Credit accounting is no longer done here — it happens up front in
@@ -153,23 +151,19 @@ class DatabasePersistenceService:
         # Step 2: Update public.analysis_run
         # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
         analysis_run_update: Dict[str, Any] = {
-            "analysis_run_coherence_score": round(coherence_score),
+            "analysis_run_score": round(coherence_score),
         }
         if sections_analyzed is not None:
-            analysis_run_update["sections_analyzed"] = sections_analyzed
+            analysis_run_update["analysis_run_sections_analyzed"] = sections_analyzed
         if inconsistencies_found is not None:
-            analysis_run_update["inconsistencies_found"] = inconsistencies_found
+            analysis_run_update["analysis_run_inconsistency_count"] = inconsistencies_found
         if citations_audited is not None:
-            analysis_run_update["citations_audited"] = citations_audited
+            analysis_run_update["analysis_run_citation_count"] = citations_audited
         if score_breakdown is not None:
-            analysis_run_update["cross_chapter_coherence_score"] = score_breakdown.get("cross_chapter_coherence_score")
-            analysis_run_update["citation_integrity_score"] = score_breakdown.get("citation_integrity_score")
-            analysis_run_update["functional_metric_score"] = score_breakdown.get("overall_score")
-            analysis_run_update["functional_metric_band"] = score_breakdown.get("band")
-            analysis_run_update["score_breakdown_json"] = score_breakdown
+            analysis_run_update["analysis_run_citation_score"] = score_breakdown.get("citation_integrity_score")
+            analysis_run_update["analysis_run_band"] = score_breakdown.get("band")
         if ai_text_indicator is not None:
-            analysis_run_update["ai_text_indicator_score"] = ai_text_indicator.get("overall_score")
-            analysis_run_update["ai_text_indicator_json"] = ai_text_indicator
+            analysis_run_update["analysis_run_ai_text_score"] = ai_text_indicator.get("overall_score")
 
 
 
@@ -188,16 +182,11 @@ class DatabasePersistenceService:
                     # Bug 6: Normalize enum values to match DB definitions (lower case for type, PascalCase for severity)
                     "inconsistency_type": (data.get("inconsistency_type") or data.get("type") or "contextual").lower(),
                     "inconsistency_severity": str(data.get("inconsistency_severity") or data.get("severity") or "Medium").capitalize(),
-                    "inconsistency_description": (
-                        data.get("inconsistency_description")
-                        or data.get("description")
-                        or data.get("explanation_what")
-                        or data.get("inconsistency_explanation_what")
-                        or "Semantic inconsistency detected"
-                    ),
                     "inconsistency_explanation_what": (
                         data.get("inconsistency_explanation_what")
                         or data.get("explanation_what")
+                        or data.get("inconsistency_description")
+                        or data.get("description")
                         or ""
                     ),
                     "inconsistency_explanation_why": (
@@ -210,36 +199,21 @@ class DatabasePersistenceService:
                         or data.get("suggested_fix")
                         or ""
                     ),
-                    "inconsistency_text_offset_start": data.get(
-                        "inconsistency_text_offset_start",
-                        data.get("text_offset_start", 0)
-                    ),
-                    "inconsistency_text_offset_end": data.get(
-                        "inconsistency_text_offset_end",
-                        data.get("text_offset_end", 0)
-                    ),
-                    "inconsistency_status": data.get(
-                        "inconsistency_status",
-                        data.get("status", "active")
-                    ),
-                    "primary_section_name": (
+                    "inconsistency_section_a": (
                         data.get("primary_section_name")
                         or data.get("section_a")
                         or "General"
                     ),
-                    "conflicting_section_name": (
+                    "inconsistency_section_b": (
                         data.get("conflicting_section_name")
                         or data.get("section_b")
                         or ""
                     ),
-                    "coherence_score": data.get("coherence_score"),
-                    # Previously computed by the XAI and returned to the
-                    # client, then silently dropped here -- reload from
-                    # history lost the evidence quotes and unaddressed
-                    # objectives entirely. Requires migration 007.
-                    "evidence_a": data.get("evidence_a") or "",
-                    "evidence_b": data.get("evidence_b") or "",
-                    "evidence_verified": bool(data.get("evidence_verified", False)),
+                    "inconsistency_pair_score": data.get("coherence_score"),
+                    # Keep the XAI evidence in the finding as well as the report JSON.
+                    "inconsistency_evidence_a": data.get("evidence_a") or "",
+                    "inconsistency_evidence_b": data.get("evidence_b") or "",
+                    "inconsistency_evidence_verified": bool(data.get("evidence_verified", False)),
                 }
                 if "inconsistency_id" in data:
                     row["inconsistency_id"] = data["inconsistency_id"]
@@ -262,7 +236,7 @@ class DatabasePersistenceService:
                 )
                 row = {
                     "analysis_run_id": analysis_run_id,
-                    "target_section_name": (
+                    "recommendation_section": (
                         data.get("target_section_name")
                         or data.get("section_name")
                         or data.get("section")
@@ -336,30 +310,6 @@ class DatabasePersistenceService:
                 # Bug 5: Wrap synchronous Supabase call in asyncio.to_thread
                 await asyncio.to_thread(
                     lambda: cls._save_rows(client, "citation", citation_rows, "citation_id")
-                )
-
-        # Step 5b: Insert in-text/reference-list cross-match findings
-        if crossmatch_issues:
-            issue_rows: List[Dict[str, Any]] = []
-            for orphan in crossmatch_issues.get("orphan_intext_citations", []):
-                issue_rows.append({
-                    "analysis_run_id": analysis_run_id,
-                    "issue_type": "orphan_intext",
-                    "surname": orphan.get("surname"),
-                    "year": int(orphan["year"]) if str(orphan.get("year", "")).isdigit() else None,
-                    "context_sentence": orphan.get("context"),
-                })
-            for uncited in crossmatch_issues.get("uncited_references", []):
-                issue_rows.append({
-                    "analysis_run_id": analysis_run_id,
-                    "issue_type": "uncited_reference",
-                    "surname": uncited.get("first_author_surname"),
-                    "year": uncited.get("year_parsed"),
-                    "reference_raw_text": uncited.get("citation_raw_reference_text"),
-                })
-            if issue_rows:
-                await asyncio.to_thread(
-                    lambda: client.table("citation_crossmatch_issue").insert(issue_rows).execute()
                 )
 
         await asyncio.to_thread(

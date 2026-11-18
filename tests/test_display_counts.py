@@ -41,7 +41,7 @@ def test_get_adds_counts_for_old_saved_results_in_both_access_states(monkeypatch
         def select(self, *_): return self
         def eq(self, *_): return self
         def execute(self):
-            return SimpleNamespace(data=[{"analysis_run_id": "run", "user_id": "owner", "status": "completed", "result_json": result}])
+            return SimpleNamespace(data=[{"analysis_run_id": "run", "user_id": "owner", "analysis_run_status": "completed", "analysis_run_is_unlocked": result.get("access", {}).get("unlocked", False), "analysis_run_result_json": result}])
 
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
     locked = asyncio.run(main.get_scan_status("run", "owner")).result
