@@ -12,7 +12,7 @@ def test_counts_full_result_before_locking():
                             {"pair_order": 2, "recommended_revision": "Third"},
                             {"pair_order": 3, "recommended_revision": " ** ` "}],
         "citations": [{}], "inconsistencies": [], "ai_synthesis": {"summary": None}}
-    expected = {"recommendations": 2, "all_clear": 2, "citations": 1}
+    expected = {"recommendations": 2, "all_clear": 2, "minor_points": 0, "citations": 1}
     assert display_counts(result) == expected
     locked = {**locked_scan_view(result), "display_counts": display_counts(result)}
     assert locked["display_counts"] == expected
@@ -20,7 +20,7 @@ def test_counts_full_result_before_locking():
 
 
 def test_empty_and_old_results():
-    assert display_counts({}) == {"recommendations": 0, "all_clear": 0, "citations": 0}
+    assert display_counts({}) == {"recommendations": 0, "all_clear": 0, "minor_points": 0, "citations": 0}
     assert display_counts({"manuscript_flow": [], "recommendations": []}) == display_counts({})
 
 
@@ -47,5 +47,37 @@ def test_get_adds_counts_for_old_saved_results_in_both_access_states(monkeypatch
     locked = asyncio.run(main.get_scan_status("run", "owner")).result
     result["access"]["unlocked"] = True
     unlocked = asyncio.run(main.get_scan_status("run", "owner")).result
-    assert locked["display_counts"] == unlocked["display_counts"] == {"recommendations": 1, "all_clear": 0, "citations": 1}
+    assert locked["display_counts"] == unlocked["display_counts"] == {"recommendations": 1, "all_clear": 0, "minor_points": 0, "citations": 1}
     assert locked["citations"] == [] and len(unlocked["citations"]) == 1
+
+
+def test_point_losses_and_legacy_fallback_in_both_views():
+    from services.scan_access import scan_view
+
+    pairs = [{"order": i, "section_a": "A", "section_b": "B", "severity": severity,
+              "scores": {"overall_coherence": 0.8}, "culprit_sentences": {}}
+             for i, severity in enumerate(("None", "Minor", "None", "Moderate", "None", "None"), 1)]
+    pairs[4]["scores"]["overall_coherence"] = None
+    pairs[5]["section_b"] = "A"
+    result = {"access": {"unlocked": False}, "manuscript_sections": [
+        {"name": "A", "text": "A"}, {"name": "B", "text": "B"}], "manuscript_flow": pairs,
+        "recommendations": [{"pair_order": 4, "recommended_revision": "Improve"}],
+        "score_breakdown": {"dimensions": {"claim_support": 0.5}, "dimension_breakdown": {
+            "context_alignment": {"failures": [{"order": 1, "reason": "loose_link"}, {"order": 4}]},
+            "logical_support": {"failures": [{"order": 2, "reason": "contradiction"}, {"order": 5}, {"order": 6}]}}},
+        "citations": [], "inconsistencies": [], "ai_synthesis": {"summary": None}}
+    locked = scan_view(result)
+    unlocked = scan_view({**result, "access": {"unlocked": True}})
+    expected = {"recommendations": 1, "all_clear": 1, "minor_points": 2, "citations": 0}
+    assert locked["display_counts"] == unlocked["display_counts"] == expected
+    assert {k: locked["access"]["locked_counts"][k] for k in ("all_clear", "minor_points")} == {
+        "all_clear": 1, "minor_points": 2}
+    legacy = {**result, "score_breakdown": {"dimensions": {"claim_support": 0.5}}}
+    assert display_counts(legacy) == {"recommendations": 1, "all_clear": 2, "minor_points": 0, "citations": 0}
+    assert locked_scan_view(legacy)["access"]["locked_counts"]["all_clear"] == 2
+    assert locked_scan_view(legacy)["access"]["locked_counts"]["minor_points"] == 0
+    # The same detailed breakdown is also stored at the top level.
+    top_level = {**legacy, "dimension_breakdown": result["score_breakdown"]["dimension_breakdown"]}
+    assert display_counts(top_level) == expected
+    empty_failures = {**legacy, "dimension_breakdown": {"context_alignment": {"failures": []}}}
+    assert display_counts(empty_failures)["all_clear"] == 3

@@ -57,10 +57,17 @@ def display_counts(result):
     sections = result.get("manuscript_sections") or []
     advice = {item.get("pair_order") for item in result.get("recommendations") or [] if _has_revision(item)}
     pairs = [pair for pair in result.get("manuscript_flow") or [] if _usable_pair(pair, sections)]
+    breakdown = (result.get("score_breakdown") or {}).get("dimension_breakdown") or result.get("dimension_breakdown") or {}
+    failures = [dimension["failures"] for dimension in breakdown.values()
+                if isinstance(dimension, dict) and isinstance(dimension.get("failures"), list)]
+    lost = {failure.get("order") for group in failures for failure in group}
+    scored = [pair for pair in pairs if pair.get("scores", {}).get("overall_coherence") is not None
+              and pair.get("order") not in advice]
     return {
         "recommendations": len({pair.get("order") for pair in pairs if pair.get("order") in advice}),
-        "all_clear": sum(1 for pair in pairs if pair.get("scores", {}).get("overall_coherence") is not None
-                         and pair.get("severity") == "None" and pair.get("order") not in advice),
+        "all_clear": sum(1 for pair in scored if (pair.get("order") not in lost if failures
+                                                  else pair.get("severity") == "None")),
+        "minor_points": sum(1 for pair in scored if pair.get("order") in lost),
         "citations": len(result.get("citations") or []),
     }
 
@@ -87,10 +94,7 @@ def locked_scan_view(result):
     rng = random.Random(int.from_bytes(sha256(str(result.get("analysis_run_id", "")).encode()).digest(), "big"))
     remaining = max(0, 40000 - sum(len(section["name"]) for section in sections[1:]))
     full_recommendations = view.get("recommendations") or []
-    advice_orders = {item.get("pair_order") for item in full_recommendations if _has_revision(item)}
-    all_clear = sum(1 for pair in view.get("manuscript_flow", [])
-                    if _usable_pair(pair, sections) and pair.get("scores", {}).get("overall_coherence") is not None
-                    and pair.get("severity") == "None" and pair.get("order") not in advice_orders)
+    counts = display_counts(result)
     section_order = {item["name"]: index for index, item in enumerate(sections)}
 
     def position(item):
@@ -103,7 +107,8 @@ def locked_scan_view(result):
         "sections": max(0, len(sections) - 1),
         "recommendations": max(0, len(full_recommendations) - len(view["recommendations"])),
         "citations": len(view.get("citations") or []),
-        "all_clear": all_clear,
+        "all_clear": counts["all_clear"],
+        "minor_points": counts["minor_points"],
     }
     for section in sections[1:]:
         heading = _filler(len(section["name"]), rng)

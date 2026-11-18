@@ -46,7 +46,7 @@ def test_locked_view_withholds_report_content_everywhere():
         assert projected["placeholder"]["paragraphs"]
     assert [r["id"] for r in locked["recommendations"]] == ["r-1-1", "r-1-2"]
     assert [r["category"] for r in locked["recommendations"]] == ["objectives", "claims"]
-    assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1, "all_clear": 0}
+    assert locked["access"]["locked_counts"] == {"sections": 2, "recommendations": 2, "citations": 1, "all_clear": 0, "minor_points": 0}
     assert locked["citations"] == locked["inconsistencies"] == []
     assert locked["manuscript_flow"][0]["scores"]["overall_coherence"] == 0.4
     assert locked["score_breakdown"]["dimension_weights"] == {"claim_support": 1}

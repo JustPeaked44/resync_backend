@@ -71,7 +71,7 @@ def test_scan_routes_return_same_display_contract(monkeypatch, route):
             unlocked = request()
             assert stored == unlocked_original
             assert locked['display_counts'] == unlocked['display_counts'] == {
-                'recommendations': 3, 'all_clear': 1, 'citations': 3}
+                'recommendations': 3, 'all_clear': 1, 'minor_points': 0, 'citations': 3}
             assert [c['display_status'] for c in unlocked['citations']] == [
                 'accessible', 'inaccessible', 'no_link']
     finally:
