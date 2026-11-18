@@ -27,8 +27,7 @@ def test_count_bytes_and_user_limits(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         main._reserve_scan("c", 5)
     assert (exc.value.status_code, exc.value.detail) == (429, main.QUEUE_FULL_MESSAGE)
-    main._reserve_scan("b", 0, queued=False)
-    with pytest.raises(HTTPException) as exc:
+    with pytest.raises(HTTPException) as exc:   # "b" already has a scan: one at a time per account
         main._reserve_scan("b", 0)
     assert (exc.value.status_code, exc.value.detail) == (429, main.USER_FULL_MESSAGE)
 
@@ -83,8 +82,7 @@ async def test_every_scan_route_refuses_before_creating_row(monkeypatch, route, 
         monkeypatch.setattr(main, "MAX_QUEUED_BYTES", 3)
     else:
         main._reserve_scan("user", 0, queued=False)
-        main._reserve_scan("user", 0, queued=False)
-        expected = "You already have scans in progress. Please wait for them to finish."
+        expected = main.USER_FULL_MESSAGE
 
     if route in ("start", "run"):
         req = main.ScanRequest(user_id="user", file_content_base64="AAAA")

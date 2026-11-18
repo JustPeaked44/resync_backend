@@ -160,7 +160,8 @@ _running_scan_starts = []
 MAX_QUEUED_SCANS = max(0, int(os.getenv("MAX_QUEUED_SCANS", "8")))
 MAX_QUEUED_BYTES = max(0, int(os.getenv("MAX_QUEUED_BYTES", str(80 * 1024 * 1024))))
 QUEUE_FULL_MESSAGE = "Many scans are waiting right now. Please try again in a few minutes."
-USER_FULL_MESSAGE = "You already have scans in progress. Please wait for them to finish."
+USER_FULL_MESSAGE = "You already have a scan in progress. Please wait for it to finish before starting another."
+MAX_SCANS_PER_USER = 1   # one scan at a time per account, however many tabs or devices start one
 # Reservations cover provisioning as well as queued and running work; no await occurs in admission.
 _scan_reservations = {}
 _scan_reservations_by_id = {}
@@ -172,7 +173,7 @@ def _check_base64_size(req):
 
 
 def _reserve_scan(user_id, size, queued=True):
-    if sum(entry["user"] == user_id for entry in _scan_reservations.values()) >= 2:
+    if sum(entry["user"] == user_id for entry in _scan_reservations.values()) >= MAX_SCANS_PER_USER:
         raise HTTPException(status_code=429, detail=USER_FULL_MESSAGE)
     waiting = [entry for entry in _scan_reservations.values() if entry["queued"]]
     if queued and (len(waiting) >= MAX_QUEUED_SCANS or sum(entry["bytes"] for entry in waiting) + size > MAX_QUEUED_BYTES):
