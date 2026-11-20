@@ -178,7 +178,7 @@ def manuscript_score(pairs, transitions=None):
                 reason = "contradiction"
                 earned = CONTRADICTION_CREDIT.get(severity, 0.0)
                 kind[2] += earned
-            elif rating < CHECK_PASS_AT and (neighbors or severity is None):
+            elif rating < CHECK_PASS_AT and severity is None:   # only a pair the AI never reviewed keeps the model's rating (marked estimated)
                 reason = "loose_link"
                 earned = max(0.0, min(CHECK_PASS_AT, rating))
                 kind[2] += earned
@@ -269,12 +269,42 @@ def is_argument_section(name):
     return not _NON_ARGUMENT.match(re.sub(r"\s*\(\d+\)$", "", (name or "").strip()))
 
 
+# Lines that are not body text: page numbers ("12", "iv", "- 25 -", "Page 4 of 10"), "continued" captions and table rows.
+_ROMAN = r"(?=[ivxlcdm])m{0,4}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
+_PAGE_NUMBER = re.compile(rf"(?i)^\s*(?:page\s*)?[-\u2013\u2014]?\s*(?:\d{{1,4}}|{_ROMAN})\s*(?:(?:of|/)\s*\d{{1,4}})?\s*[-\u2013\u2014]?\s*$")
+_CONTINUED = re.compile(r"(?i)^.{0,90}\b(?:cont(?:inued|['\u2019]d)|continuation)\.?\s*$")
+
+
+def _line_key(line):
+    return re.sub(r"\s+", " ", line.strip().lower())
+
+
+def clean_analysis_text(sections):
+    """Only real body paragraphs are read by the model and the AI. Page numbers, "continued" captions, table rows and running
+    headers or footers (a short line repeated through the paper) are removed from every section's text. `sections` is a list of
+    {name, text}; the same list is returned with cleaned text."""
+    repeats = {}
+    for section in sections:
+        for line in section["text"].splitlines():
+            key = _line_key(line)
+            if key and len(key.split()) >= 2 and len(key) <= 90 and not re.search(r"[.!?:;]$", key) and not re.match(r"[\u2022\u25cf*\-]\s", key):
+                repeats[key] = repeats.get(key, 0) + 1
+    running = {key for key, count in repeats.items() if count >= 4}
+    cleaned = []
+    for section in sections:
+        kept = [line for line in section["text"].splitlines()
+                if not (_PAGE_NUMBER.match(line) or _CONTINUED.match(line) or " | " in line or _line_key(line) in running)]
+        cleaned.append(dict(section, text="\n".join(kept).strip()))
+    return cleaned
+
+
 def comparable_sections(parsed_sections, section_order, section_roles):
-    """The sections a scan compares, in reading order: repeated headings merged; reference lists, empty headings and
-    sections that are only table rows or diagram labels left out."""
-    return [section for section in merge_repeated_sections(parsed_sections, section_order)
-            if section_roles.get(section["name"]) != "references" and len(section["text"].split()) >= MIN_SECTION_WORDS
-            and is_argument_section(section["name"]) and is_prose(section["text"])]
+    """The sections a scan compares, in reading order: repeated headings merged; reference lists, front and back matter, empty
+    headings and sections that are only table rows or diagram labels left out, and every section reduced to its body paragraphs."""
+    kept = [section for section in merge_repeated_sections(parsed_sections, section_order)
+            if section_roles.get(section["name"]) != "references" and is_argument_section(section["name"])]
+    return [section for section in clean_analysis_text(kept)
+            if len(section["text"].split()) >= MIN_SECTION_WORDS and is_prose(section["text"])]
 
 
 def manuscript_preview_sections(sections, parse_result):
@@ -772,7 +802,13 @@ def flatten_explanations(flow, sections=None):
         serious = (pair.get("severity") or explanation.get("severity")) in SERIOUS
         # A recommendation fixes a quoted sentence and says why. Both sections of a clashing pair cannot be rewritten toward each other,
         # so the fix goes on one side only: the later section when it has one. Linking sentences are never recommended.
-        advice = [item for item in pair_recommendations if not senseless_recommendation(item)] if serious else []
+        def in_section(item):
+            if not sections or item.get("original_sentence") is None:
+                return True
+            text = sections[(pair["index_a"], pair["index_b"])[names.index(item["section"])]]["text"]
+            return norm(item["original_sentence"]) in norm(text)
+
+        advice = [item for item in pair_recommendations if not senseless_recommendation(item) and in_section(item)] if serious else []
         sides = {item["section"] for item in advice}
         if len(sides) > 1:
             keep = names[1] if names[1] in sides else advice[0]["section"]

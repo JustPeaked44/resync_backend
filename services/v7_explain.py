@@ -17,6 +17,7 @@ def plain_text(value):
 
 
 STRICT_RULES = """STRICT RULES:
+0. You are a conservative academic auditor. Do not invent problems. Give the paper the benefit of the doubt: a pair is fine unless you can prove otherwise from the supplied text.
 1. Do not assume or mention research type.
 2. Do not demand specific structural changes or missing chapters.
 3. Do not use outside knowledge; use only supplied text and model scores.
@@ -24,7 +25,10 @@ STRICT_RULES = """STRICT RULES:
 5. Never change model scores; they come from the PyTorch model.
 6. Numbers: if a difference in numbers can be explained by legitimate research reasons (for example attrition or dropouts, missing responses, exclusion criteria, or a smaller group analysed than recruited), do NOT flag it as a contradiction. Only flag numeric inconsistencies if they are physically impossible (for example more people analysed than were ever recruited, percentages that cannot add up, or a total smaller than one of its parts).
 7. Evidence: every inconsistency and every recommendation MUST carry an exact quote copied word for word from the named section. If you cannot give the exact quote, do not report it.
-8. Different subjects: if the two sections are about completely different subjects, so that the second one does not continue, apply or answer what the first one is about (for example one is about coastal erosion and the other about heart surgery), that IS a direct mismatch, not just a low score. Grade it "Critical" with failed_dimension "objectives_alignment", and quote ONE sentence from each section that shows its subject. In "what" say plainly what each section is about, and in "why" say that the two sections do not belong to the same study. Sections that only cover different parts of the same study (for example methods and results of one topic) are NOT a mismatch."""
+8. Different subjects: if the two sections are about completely different subjects, so that the second one does not continue, apply or answer what the first one is about (for example one is about coastal erosion and the other about heart surgery), that IS a direct mismatch, not just a low score. Grade it "Critical" with failed_dimension "objectives_alignment", and quote ONE sentence from each section that shows its subject. In "what" say plainly what each section is about, and in "why" say that the two sections do not belong to the same study. Sections that only cover different parts of the same study (for example methods and results of one topic) are NOT a mismatch, and neither is different wording for the same thing.
+9. If Section A and Section B use different vocabulary (for example "students" and "participants", or "users" and "respondents") but make logical sense together, you MUST return severity "None".
+10. Only flag an issue if there is a direct, undeniable contradiction (for example Section A says 50 people and Section B says 100 people), a goal that is never addressed, or a completely missing logical step.
+11. If you have to stretch to find a contradiction, it is not a contradiction: set severity to "None". A low model score is never a reason to report a problem, and you must never report one only because the score is low."""
 PAIR_PROMPT = """You are an objective logic auditor. Analyze Section A and Section B, two sections of the same manuscript.
 If the provided Overall Coherence score is below 0.85, determine whether there is a REAL logical inconsistency between them. A low score alone is not an inconsistency.
 {rules}

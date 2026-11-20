@@ -171,15 +171,18 @@ def test_a_category_with_no_applicable_pair_is_na_and_left_out_of_the_average():
     assert score == 88.0   # (100 + 100 + 62.5) / 3 = 87.5, rounded up: figures are left out
 
 
-def test_neighbors_fail_on_a_loose_link_but_far_apart_pairs_need_a_quoted_contradiction():
+def test_the_ai_verdict_overrides_a_low_model_rating_and_only_unreviewed_pairs_keep_it():
+    """A pair the AI cleared costs nothing, whatever the model rated it. Only a pair the AI never reviewed keeps the model's
+    rating (and is counted as estimated)."""
     neighbor = pair_for_score("None", "none", order=1, overall=0.4)
     far = dict(pair_for_score("None", "none", order=2, overall=0.4), adjacent=False)
     far_unreviewed = dict(pair_for_score(None, None, order=3, overall=0.4), adjacent=False)
-    _, breakdown = manuscript_score([neighbor, far, far_unreviewed])
+    neighbor_unreviewed = pair_for_score(None, None, order=4, overall=0.4)
+    _, breakdown = manuscript_score([neighbor, far, far_unreviewed, neighbor_unreviewed])
     context = breakdown["context_alignment"]
-    assert (context["items"], context["passed"]) == (3, 1)   # only the AI-cleared far-apart pair passes
-    assert [(f["order"], f["reason"]) for f in context["failures"]] == [(1, "loose_link"), (3, "loose_link")]
-    assert context["failures"][0]["rating"] == 0.4 and context["issues"] == 0
+    assert (context["items"], context["passed"]) == (4, 2)   # the two AI-cleared pairs pass, however low the model rated them
+    assert [(f["order"], f["reason"]) for f in context["failures"]] == [(3, "loose_link"), (4, "loose_link")]
+    assert context["failures"][0]["rating"] == 0.4 and context["issues"] == 0 and context["estimated"] == 2
 
 
 def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
@@ -203,9 +206,9 @@ def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
     assert [p["severity"] for p in flow] == ["Moderate", "Critical", "Minor", "None"]   # the review's grade stands
     score, breakdown = manuscript_score(flow)
     logical = breakdown["logical_support"]
-    assert (logical["items"], logical["passed"], logical["issues"]) == (4, 0, 3)   # three contradictions and one loose link (rated 0.3)
-    assert breakdown["context_alignment"]["score"] == 62.5   # the two low-rated neighbors (0.2 and 0.3) are loose links and keep only their ratings
-    assert score == 51.0   # failed checks keep part of their credit; numeric is N/A for these texts
+    assert (logical["items"], logical["passed"], logical["issues"]) == (4, 1, 3)   # three contradictions; the pair the AI cleared passes although the model rated it 0.3
+    assert breakdown["context_alignment"]["score"] == 100.0   # the AI cleared this part of every pair, so the low model ratings (0.2, 0.3) cost nothing
+    assert score == 82.0   # only logical support lost points (three contradictions keep part of their credit); numeric is N/A for these texts
 
 
 def test_failed_reviews_get_a_second_one_at_a_time_pass(monkeypatch):
@@ -371,7 +374,7 @@ def test_a_cap_applies_only_when_one_is_set(monkeypatch):
 
 
 def test_many_easy_far_apart_pairs_cannot_hide_weak_flow_between_neighbors():
-    weak_flow = [pair_for_score("None", "none", order=n, overall=0.4) for n in (1, 2, 3)]                    # three loose neighbor links
+    weak_flow = [pair_for_score(None, None, order=n, overall=0.4) for n in (1, 2, 3)]                    # three loose neighbor links the AI never reviewed
     easy_far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in range(4, 14)]   # ten far pairs that pass
     score, breakdown = manuscript_score(weak_flow + easy_far)
     context = breakdown["context_alignment"]
@@ -385,7 +388,7 @@ def test_many_easy_far_apart_pairs_cannot_hide_weak_flow_between_neighbors():
 def test_a_kind_with_too_few_checks_stays_balanced_but_is_marked_limited():
     """Changed rule: a kind with fewer than MIN_HALF_CHECKS is no longer pooled (pooling let the many chapter checks hide weak
     flow). It still counts for half, and the category says its evidence is limited."""
-    one_miss_of_two = [pair_for_score("None", "none", order=1, overall=0.4), pair_for_score("None", "none", order=2, overall=0.6)]
+    one_miss_of_two = [pair_for_score(None, None, order=1, overall=0.4), pair_for_score("None", "none", order=2, overall=0.6)]
     far = [dict(pair_for_score("None", "none", order=n, overall=0.6), adjacent=False) for n in (3, 4, 5)]
     category = manuscript_score(one_miss_of_two + far)[1]["context_alignment"]
     assert (category["flow"]["items"], category["cross"]["items"]) == (2, 3) and category["halves"] is True

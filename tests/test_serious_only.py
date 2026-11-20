@@ -110,3 +110,28 @@ def test_the_subject_check_only_accepts_quotes_that_are_in_the_text(monkeypatch)
     items = [{"id": 1, "role_a": "A", "text_a": "Coastal erosion.", "role_b": "B", "text_b": "Heart surgery."},
              {"id": 2, "role_a": "A", "text_a": "Same.", "role_b": "B", "text_b": "Same."}]
     assert asyncio.run(v7_explain.check_subjects_batch(items)) == {}
+
+
+def test_only_body_paragraphs_are_kept():
+    from services.v7_scan import clean_analysis_text
+    body = "This study explains why practice matters for learners in many different schools."
+    text = "\n".join([body, "12", "iv", "- 25 -", "Page 4 of 10", "AGILE SPRINT PLAN cont’d", "Name | Age | Score", "Another body sentence follows here for the reader.", "mild"])
+    cleaned = clean_analysis_text([{"name": "A", "text": text}])[0]["text"].splitlines()
+    assert cleaned == [body, "Another body sentence follows here for the reader.", "mild"]
+
+
+def test_a_running_header_repeated_through_the_paper_is_removed():
+    from services.v7_scan import clean_analysis_text
+    header = "Capstone Thesis Draft 2026"
+    sections = [{"name": str(i), "text": f"{header}\nA real sentence number {i} that belongs to the study."} for i in range(5)]
+    assert all(header not in section["text"] for section in clean_analysis_text(sections))
+    # a line that appears only a couple of times is not a header
+    few = [{"name": "a", "text": f"{header}\nBody sentence one is here."}, {"name": "b", "text": f"{header}\nBody sentence two is here."}]
+    assert all(header in section["text"] for section in clean_analysis_text(few))
+
+
+def test_a_recommendation_whose_sentence_is_not_in_the_section_is_dropped():
+    wrong = dict(EDIT, original_sentence="A sentence the paper never contains.")
+    sections, flow = flow_with("Critical", [wrong, EDIT])
+    recs = flatten_explanations(flow, sections)[1]
+    assert [r["original_sentence"] for r in recs] == [EDIT["original_sentence"]]
