@@ -43,3 +43,15 @@ def test_abstract_before_contents_and_lists_is_kept_without_rows():
     assert BODY.strip() in parsed["parsed_sections"][parsed["section_order"][0]]
     assert not any(row in body for row in rows + ["CHAPTER I"] for body in parsed["parsed_sections"].values())
     assert "introduction" in parsed["section_roles"].values()
+
+
+def test_the_reference_list_of_a_paper_with_numbered_headings_is_not_part_of_its_conclusion():
+    body = "This part explains the idea in plain words so a reader can follow the study from start to finish without confusion. " * 3
+    text = "\n".join(["Title of the study", "1. Introduction", body, "2. Methodology", body, "3. Results", body, "4. Conclusion", body,
+               "References", "Cohen, J. (1988). Statistical power analysis. Lawrence Erlbaum.", "Vygotsky, L. S. (1978). Mind in society. Harvard University Press."])
+    parsed = ManuscriptParserService.parse_manuscript_sections(text, None)
+    roles = parsed["section_roles"]
+    assert "references" in roles.values()
+    reference_key = next(key for key, role in roles.items() if role == "references")
+    assert "Vygotsky" in parsed["parsed_sections"][reference_key]
+    assert all("Vygotsky" not in body for key, body in parsed["parsed_sections"].items() if key != reference_key)

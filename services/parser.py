@@ -755,6 +755,8 @@ class ManuscriptParserService:
             if name and cls._CHAPTER_RE.match(line) and not cls._CHAPTER_RE.match(line).group(2).strip() and following \
                     and len(following.split()) <= 12 and not following.endswith((".", ",", ";")) and not cls._NOT_HEADING_RE.search(following):
                 name, end = following.strip(), index + 1     # "CHAPTER 1" then its title on the next line
+            if not name and re.fullmatch(r"(?i)(?:references|bibliography|works cited|literature cited)", line) and index >= len(lines) * 0.5:
+                name = line   # the reference list heading has no number, but it still ends the last section and starts the list
             if name:
                 found.append((index, end, name))
             index = end + 1
