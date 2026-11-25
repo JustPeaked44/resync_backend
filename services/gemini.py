@@ -27,12 +27,19 @@ class GeminiQuotaExhausted(Exception):
 _quota_blocked_until = {}
 
 
+# Tried in this order; each next one is used only when every one before it is out of daily quota. Keys from different Google
+# projects have separate quotas, so each fallback should come from its own project.
+FALLBACK_KEY_NAMES = ("GEMINI_API_KEY_FALLBACK", "GEMINI_API_KEY_FALLBACK_2")
+KEY_ORDINALS = ("first", "second", "third", "fourth")
+
+
 def _configured_keys():
     first = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    second = os.getenv("GEMINI_API_KEY_FALLBACK")
-    keys = [first] if first or not second else []
-    if second and second != first:
-        keys.append(second)
+    extras = [os.getenv(name) for name in FALLBACK_KEY_NAMES]
+    keys = [first] if first or not any(extras) else []
+    for extra in extras:
+        if extra and extra not in keys:
+            keys.append(extra)
     return keys
 
 
@@ -281,7 +288,7 @@ async def post_gemini_with_retry(payload):
                     retry_key = None
                     available = _available_key()
                     if available is not None:
-                        logging.getLogger("resync.gemini").warning("Gemini switching to the %s key", "first" if available[0] == 0 else "second")
+                        logging.getLogger("resync.gemini").warning("Gemini switching to the %s key", KEY_ORDINALS[min(available[0], len(KEY_ORDINALS) - 1)])
                         continue
                     LIMITER.rate_limited.add(scan_id)
                     logging.getLogger("resync.gemini").warning("Gemini quota exhausted; pausing AI reviews for %ss", QUOTA_RECHECK_SECONDS)

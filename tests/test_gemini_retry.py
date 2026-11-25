@@ -180,3 +180,56 @@ def test_minute_limit_retries_same_key(monkeypatch):
     assert calls == [0, 0]
     assert gemini.rate_limited()
     assert not gemini.quota_blocked()
+
+
+def configure_three_keys(monkeypatch):
+    keys = [uuid.uuid4().hex for _ in range(3)]
+    monkeypatch.setenv("GEMINI_API_KEY", keys[0])
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK", keys[1])
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK_2", keys[2])
+    return keys
+
+
+def test_a_third_key_is_read_in_order_and_a_repeated_key_is_counted_once(monkeypatch):
+    first, second, third = configure_three_keys(monkeypatch)
+    assert gemini._configured_keys() == [first, second, third]
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK_2", first)   # the same key pasted twice must not become a fallback of itself
+    assert gemini._configured_keys() == [first, second]
+    monkeypatch.delenv("GEMINI_API_KEY_FALLBACK", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY_FALLBACK_2", third)
+    assert gemini._configured_keys() == [first, third]   # a missing second slot does not stop the third from being used
+
+
+def test_the_third_key_takes_over_when_the_first_two_are_out_of_quota_and_the_scan_stops_only_after_all_three(monkeypatch):
+    first, second, third = configure_three_keys(monkeypatch)
+    used, warnings = [], []
+    payload = {"contents": []}
+
+    async def send(request, credential):
+        used.append([first, second, third].index(credential))
+        return QuotaResponse(429) if credential in (first, second) else Response(200)
+
+    class Logger:
+        def warning(self, message, *args):
+            rendered = message % args
+            warnings.append(rendered if all(key not in rendered for key in (first, second, third)) else "LEAKED A KEY")
+
+    monkeypatch.setattr(gemini, "_send", send)
+    monkeypatch.setattr(gemini.logging.getLogger("resync.gemini"), "warning", Logger().warning)
+
+    async def call():
+        token = gemini.scan_context.set("third-key")
+        try:
+            return (await gemini.post_gemini_with_retry(payload)).status_code
+        finally:
+            gemini.scan_context.reset(token)
+
+    assert asyncio.run(call()) == 200
+    assert used == [0, 1, 2] and not gemini.quota_blocked() and not gemini.quota_reached()
+    assert warnings == ["Gemini switching to the second key", "Gemini switching to the third key"]   # names the position, never the key
+
+    async def third_runs_out():
+        gemini._quota_blocked_until[gemini._key_id(third)] = gemini.time.monotonic() + 600
+        return gemini.quota_blocked(), gemini.quota_reached()
+
+    assert asyncio.run(third_runs_out()) == (True, True)   # the first two are blocked and now the third: no key is left, so scans stop
