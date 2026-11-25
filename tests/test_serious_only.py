@@ -24,10 +24,13 @@ def test_serious_inconsistencies_get_recommendations():
         assert len(flatten_explanations(flow, sections)[1]) == 1
 
 
-def test_minor_differences_and_loose_links_get_no_recommendations():
-    for severity in ("Minor", "None", None):
+def test_minor_differences_get_their_advice_and_loose_links_get_linking_sentences():
+    """Restored 2026-11-26 (d0d15a9 had limited advice to Critical and Moderate pairs)."""
+    sections, flow = flow_with("Minor", [EDIT], [BRIDGE])
+    assert [r["kind"] for r in flatten_explanations(flow, sections)[1]] == ["add", "edit"]   # the linking sentence first, then the edit
+    for severity in ("None", None):   # a loose link: only the linking sentence, never an edit of a sentence the AI did not flag
         sections, flow = flow_with(severity, [EDIT], [BRIDGE])
-        assert flatten_explanations(flow, sections)[1] == []
+        assert [r["kind"] for r in flatten_explanations(flow, sections)[1]] == ["add"]
 
 
 def test_recommendations_about_citations_tables_and_captions_are_dropped():

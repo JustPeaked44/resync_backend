@@ -319,7 +319,7 @@ def test_bridges_are_validated_capped_and_listed_first():
                          [{"scores": dict(low, pair_weight=1)}])
     flow[0]["explanation"] = result
     _, recommendations = flatten_explanations(flow)
-    assert recommendations == []   # linking sentences are kept on the explanation but never recommended: they only forced links between unrelated sections
+    assert [r["kind"] for r in recommendations] == ["add", "add"]   # linking sentences are shown again as suggestions (d0d15a9 of Nov 18 had stopped that)
     far = v7_explain.normalize_explanation(raw, low, "A", "A text here.", "B", "B text here.", adjacent=False)
     assert far["severity"] == "Moderate" and far["bridges"] == []        # a linking sentence only fits neighboring sections
     # severity "None" (no real issue) clears findings and advice, whatever else the model returned. A loosely linked

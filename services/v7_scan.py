@@ -35,10 +35,12 @@ EXPLAIN_LIMIT = int(os.getenv("EXPLAIN_LIMIT", "0")) or None  # a cap on reviewe
 EXPLAIN_CONCURRENCY = int(os.getenv("EXPLAIN_CONCURRENCY", "8"))  # single-pair fallback reviews running at the same time
 EXPLAIN_TIMEOUT = 240  # seconds one pair may take (waiting for a rate-limit slot and all retries included)
 BRIDGE_ROUNDS = 3  # how many times pairs still missing linking sentences are asked about
-# Recommendations are only for serious inconsistencies. Loose links and small differences still count in the score, but they are not
-# turned into advice, so linking sentences are no longer requested.
-SUGGEST_LINKING_SENTENCES = False
+# Advice covers every graded pair again (restored 2026-11-26; d0d15a9 of Nov 18 had limited it to Critical and Moderate): a Minor
+# difference gets its advice, and a neighbor pair that is only loosely linked gets linking sentences to add. What d0d15a9 added to keep
+# bad advice out stays: nothing about reference entries, table rows, captions or sentences that are not in the section.
+SUGGEST_LINKING_SENTENCES = os.getenv("SUGGEST_LINKING_SENTENCES", "on").strip().lower() not in ("off", "false", "0", "no")
 SERIOUS = ("Critical", "Moderate")
+ADVISED = ("Critical", "Moderate", "Minor")   # the grades whose own recommendations are shown
 SUBJECT_CHECK_BELOW = 0.30   # a pair rated below this that the review cleared gets one cheap check: are the two sections about the same subject?
 WHOLE_PAPER_NOTE = ("Part of the check across the whole paper could not finish because the AI was busy, so contradictions between "
                     "sections that are far apart may be missing from this report. Scan again to retry.")
@@ -686,11 +688,14 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
             pending = [p for p in loose if len(p["explanation"].get("bridges") or []) < 2]
             if not pending:
                 break
+            if gemini.budget_left() < 2:   # linking sentences are an extra; they wait for the budget the required reviews need
+                break
             gemini.expect_calls(1)
             try:
-                found = await asyncio.wait_for(suggest_bridges_batch(
-                    [{"id": p["order"], "role_a": p["section_a"], "text_a": sections[p["index_a"]]["text"],
-                      "role_b": p["section_b"], "text_b": sections[p["index_b"]]["text"]} for p in pending]), EXPLAIN_TIMEOUT)
+                with gemini.purpose("linking sentences"):
+                    found = await asyncio.wait_for(suggest_bridges_batch(
+                        [{"id": p["order"], "role_a": p["section_a"], "text_a": sections[p["index_a"]]["text"],
+                          "role_b": p["section_b"], "text_b": sections[p["index_b"]]["text"]} for p in pending]), EXPLAIN_TIMEOUT)
             except asyncio.TimeoutError:
                 found = {}
                 log.warning("Linking sentences for %s pairs took over %ss; skipped", len(pending), EXPLAIN_TIMEOUT)
@@ -829,23 +834,24 @@ def flatten_explanations(flow, sections=None):
         # Advice is only for serious inconsistencies: a pair graded Minor, a loose link or a clear pair gets none.
         serious = (pair.get("severity") or explanation.get("severity")) in SERIOUS
         # A recommendation fixes a quoted sentence and says why. Both sections of a clashing pair cannot be rewritten toward each other,
-        # so the fix goes on one side only: the later section when it has one. Linking sentences are never recommended.
+        # so the fix goes on one side only: the later section when it has one. Linking sentences go on their own ends of the two sections.
         def in_section(item):
             if not sections or item.get("original_sentence") is None:
                 return True
             text = sections[(pair["index_a"], pair["index_b"])[names.index(item["section"])]]["text"]
             return norm(item["original_sentence"]) in norm(text)
 
-        advice = [item for item in pair_recommendations if not senseless_recommendation(item) and in_section(item)] if serious else []
+        advice = [item for item in pair_recommendations if not senseless_recommendation(item) and in_section(item)] if (pair.get("severity") or explanation.get("severity")) in ADVISED else []
         sides = {item["section"] for item in advice}
         if len(sides) > 1:
             keep = names[1] if names[1] in sides else advice[0]["section"]
             advice = [item for item in advice if item["section"] == keep]
+        advice = bridges + advice   # linking sentences first: they connect the two sections, which is what moves the score
         why = {inc["section"]: inc.get("why") or inc.get("what") or "" for inc in explanation["highlighted_inconsistencies"] if inc.get("section")}
         for item in advice:
             item = dict(item, issue=(item.get("issue") or "").strip() or why.get(item["section"], "") or next((w for w in why.values() if w), ""))
-            if not item["issue"]:
-                continue   # a recommendation without a reason is not shown
+            if not item["issue"] and item.get("kind") != "add":
+                continue   # an edit without a reason is not shown; a linking sentence is its own reason
             key = (item["section"], norm(item["original_sentence"]))
             if item["original_sentence"] is not None:  # the default advice has no sentence to dedupe on
                 if key in highlighted:   # one recommendation per sentence, however many pairs raise it
