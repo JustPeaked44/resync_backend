@@ -1497,8 +1497,30 @@ async def discard_scan(scan_id: str, authenticated_user_id: str = Depends(get_au
     return {"discarded": True}
 
 
+EMPTY_REPORT_MESSAGE = "This report has no recommendations to unlock, so there is nothing to pay for and no credit was used."
+
+
+async def _nothing_to_unlock(scan_id: str, user_id: str) -> bool:
+    """True for a finished report that is still locked and holds no recommendation, so unlocking would reveal nothing.
+    Best effort: any problem reading the row answers False and the normal unlock goes ahead."""
+    try:
+        client = DatabasePersistenceService.get_client()
+        rows = await asyncio.to_thread(lambda: client.table(RUN_TABLE).select(f"{RUN_RESULT}, analysis_run_is_unlocked")
+                                       .eq(RUN_ID, scan_id).eq("user_id", user_id).execute().data)
+        row = rows[0] if rows else None
+        if not row or row.get("analysis_run_is_unlocked") or not isinstance(row.get(RUN_RESULT), dict):
+            return False
+        recommendations = row[RUN_RESULT].get("recommendations") or []
+        return not any(isinstance(item, dict) and str(item.get("recommended_revision") or "").strip() for item in recommendations)
+    except Exception:
+        logger.exception("Could not check whether scan %s has anything to unlock", scan_id)
+        return False
+
+
 @app.post("/api/scans/{scan_id}/unlock", tags=["Scans"])
 async def unlock_scan(scan_id: str, authenticated_user_id: str = Depends(get_authenticated_user_id)):
+    if await _nothing_to_unlock(scan_id, authenticated_user_id):
+        raise HTTPException(status_code=409, detail=EMPTY_REPORT_MESSAGE)
     try:
         return await credits_service.unlock_report(authenticated_user_id, scan_id)
     except Exception as exc:

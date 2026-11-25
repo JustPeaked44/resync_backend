@@ -289,3 +289,43 @@ def test_a_purchase_goes_through_even_if_the_proof_cannot_be_stored(wallet, monk
     proof = {"reference_number": "TEST", "payer_name": None, "file_name": "r.png", "content_type": "image/png",
              "proof_data": "data:image/png;base64,aGk="}
     assert asyncio.run(credits.credits_service.purchase("user", 5, "gcash", proof))["balance"] == 5
+
+
+def _report_db(monkeypatch, row, calls):
+    class Query:
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def execute(self): return type("Response", (), {"data": [row] if row else []})()
+
+    class DB:
+        def table(self, name): return Query()
+        def rpc(self, name, args):
+            calls.append(args)
+            return type("Request", (), {"execute": lambda self: type("Response", (), {"data": {"unlocked": True, "charged": True, "credits_remaining": 0}})()})()
+
+    monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
+    monkeypatch.setattr(credits, "CREDITS_ENABLED", True)
+
+
+def test_a_report_with_no_recommendations_is_not_unlocked_or_charged(monkeypatch):
+    calls = []
+    _report_db(monkeypatch, {main.RUN_RESULT: {"recommendations": [{"recommended_revision": " "}, {}]}, "analysis_run_is_unlocked": False}, calls)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(main.unlock_scan("scan", "user"))
+    assert exc.value.status_code == 409 and exc.value.detail == main.EMPTY_REPORT_MESSAGE
+    assert calls == []   # the credit RPC was never called
+
+
+def test_a_report_with_a_recommendation_or_already_unlocked_still_unlocks(monkeypatch):
+    calls = []
+    _report_db(monkeypatch, {main.RUN_RESULT: {"recommendations": [{"recommended_revision": "Rewrite the aim."}]}, "analysis_run_is_unlocked": False}, calls)
+    assert asyncio.run(main.unlock_scan("scan", "user"))["charged"] is True
+    _report_db(monkeypatch, {main.RUN_RESULT: {"recommendations": []}, "analysis_run_is_unlocked": True}, calls)
+    assert asyncio.run(main.unlock_scan("scan", "user"))["unlocked"] is True   # already unlocked: the normal path answers
+    assert len(calls) == 2
+
+
+def test_an_unreadable_row_never_blocks_the_unlock(monkeypatch):
+    calls = []
+    _report_db(monkeypatch, None, calls)
+    assert asyncio.run(main.unlock_scan("scan", "user"))["unlocked"] is True
