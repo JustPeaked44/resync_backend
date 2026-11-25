@@ -27,3 +27,26 @@ def test_filler_and_everyday_documents_are_refused(text):
 
 def test_a_tiny_document_is_refused():
     assert _check("Introduction\nHello.\nMethodology\nWorld.")["reason"] == "too_short"
+
+
+def _docx(body: str) -> bytes:
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", f"<w:document><w:body>{body}</w:body></w:document>")
+    return buf.getvalue()
+
+
+def test_a_scanned_docx_is_named_as_a_scan():
+    from services.paper_check import SCANNED_MESSAGE, docx_layout_problem
+    assert docx_layout_problem(_docx("<w:p><w:r><w:drawing/></w:r></w:p>"), 5) == SCANNED_MESSAGE
+
+
+def test_a_two_column_docx_is_named_as_two_columns():
+    from services.paper_check import TWO_COLUMN_MESSAGE, docx_layout_problem
+    assert docx_layout_problem(_docx('<w:sectPr><w:cols w:num="2" w:space="720"/></w:sectPr>'), 900) == TWO_COLUMN_MESSAGE
+
+
+def test_a_plain_docx_has_no_layout_problem():
+    from services.paper_check import docx_layout_problem
+    assert docx_layout_problem(_docx('<w:p/><w:sectPr><w:cols w:space="720"/></w:sectPr>'), 900) is None

@@ -4,7 +4,9 @@ The scanner will happily split any text into parts and score it, so a recipe, a 
 come back with a score. This check looks for what makes a manuscript a manuscript: real academic headings (introduction,
 methodology, results, conclusion, references ...), citations, and enough writing to compare.
 """
+import io
 import re
+import zipfile
 from typing import Any, Dict, Optional
 
 from services.reference_parser import extract_intext_citations
@@ -49,3 +51,30 @@ def check_research_paper(raw_text: str, parse_result: Optional[Dict[str, Any]], 
     if vocabulary < 0.004 and citations < 3:
         return {"ok": False, "reason": "not_academic_language", **signals}
     return {"ok": True, "reason": "", **signals}
+
+
+SCANNED_MESSAGE = (
+    "This document looks like a scan: it is made of page pictures and has almost no text we can read, so it was not "
+    "scanned. Upload the original Word file, or a text version, instead."
+)
+TWO_COLUMN_MESSAGE = (
+    "This document uses a two-column layout, which mixes up the reading order, so it was not scanned. "
+    "Save a copy with a single column and upload that instead."
+)
+
+
+def docx_layout_problem(data: bytes, words: int) -> Optional[str]:
+    """Why a .docx that failed the paper check cannot be read: page pictures (a scan) or two columns. None if neither."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            info = z.getinfo("word/document.xml")
+            if info.file_size > 60 * 1024 * 1024:
+                return None
+            xml = z.read(info).decode("utf-8", "ignore")
+    except Exception:
+        return None
+    if words < MIN_WORDS and (xml.count("<w:drawing") + xml.count("<w:pict")) > 0:
+        return SCANNED_MESSAGE
+    if any(int(n) >= 2 for n in re.findall(r'<w:cols[^>]*?\sw:num="(\d+)"', xml)):
+        return TWO_COLUMN_MESSAGE
+    return None

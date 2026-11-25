@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES, DOCX_COMPLEX_MESSAGE
-from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper
+from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper, docx_layout_problem
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT, DISCARDED_MESSAGE
@@ -2046,7 +2046,7 @@ async def manuscript_outline(
     )
     paper = check_research_paper(raw_text, parsed)
     response.looks_like_paper = paper["ok"]
-    response.paper_problem = None if paper["ok"] else NOT_A_PAPER_MESSAGE
+    response.paper_problem = None if paper["ok"] else ((docx_layout_problem(data, words) if file is not None else None) or NOT_A_PAPER_MESSAGE)
     if file is None and doc_url:
         now = time.time()
         _outline_cache_prune(now)
