@@ -171,18 +171,15 @@ def test_a_category_with_no_applicable_pair_is_na_and_left_out_of_the_average():
     assert score == 88.0   # (100 + 100 + 62.5) / 3 = 87.5, rounded up: figures are left out
 
 
-def test_the_ai_verdict_overrides_a_low_model_rating_and_only_unreviewed_pairs_keep_it():
-    """A pair the AI cleared costs nothing, whatever the model rated it. Only a pair the AI never reviewed keeps the model's
-    rating (and is counted as estimated)."""
+def test_neighbors_fail_on_a_loose_link_but_far_apart_pairs_need_a_quoted_contradiction():
     neighbor = pair_for_score("None", "none", order=1, overall=0.4)
     far = dict(pair_for_score("None", "none", order=2, overall=0.4), adjacent=False)
     far_unreviewed = dict(pair_for_score(None, None, order=3, overall=0.4), adjacent=False)
-    neighbor_unreviewed = pair_for_score(None, None, order=4, overall=0.4)
-    _, breakdown = manuscript_score([neighbor, far, far_unreviewed, neighbor_unreviewed])
+    _, breakdown = manuscript_score([neighbor, far, far_unreviewed])
     context = breakdown["context_alignment"]
-    assert (context["items"], context["passed"]) == (4, 2)   # the two AI-cleared pairs pass, however low the model rated them
-    assert [(f["order"], f["reason"]) for f in context["failures"]] == [(3, "loose_link"), (4, "loose_link")]
-    assert context["failures"][0]["rating"] == 0.4 and context["issues"] == 0 and context["estimated"] == 2
+    assert (context["items"], context["passed"]) == (3, 1)   # only the AI-cleared far-apart pair passes
+    assert [(f["order"], f["reason"]) for f in context["failures"]] == [(1, "loose_link"), (3, "loose_link")]
+    assert context["failures"][0]["rating"] == 0.4 and context["issues"] == 0
 
 
 def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
@@ -206,9 +203,9 @@ def test_the_ai_reviews_own_grade_decides_the_contradiction_checks(monkeypatch):
     assert [p["severity"] for p in flow] == ["Moderate", "Critical", "Minor", "None"]   # the review's grade stands
     score, breakdown = manuscript_score(flow)
     logical = breakdown["logical_support"]
-    assert (logical["items"], logical["passed"], logical["issues"]) == (4, 1, 3)   # three contradictions; the pair the AI cleared passes although the model rated it 0.3
-    assert breakdown["context_alignment"]["score"] == 100.0   # the AI cleared this part of every pair, so the low model ratings (0.2, 0.3) cost nothing
-    assert score == 82.0   # only logical support lost points (three contradictions keep part of their credit); numeric is N/A for these texts
+    assert (logical["items"], logical["passed"], logical["issues"]) == (4, 0, 3)   # three contradictions and one loose link (rated 0.3)
+    assert breakdown["context_alignment"]["score"] == 62.5   # the two low-rated neighbors (0.2 and 0.3) are loose links and keep only their ratings
+    assert score == 51.0   # failed checks keep part of their credit; numeric is N/A for these texts
 
 
 def test_failed_reviews_get_a_second_one_at_a_time_pass(monkeypatch):
@@ -538,3 +535,19 @@ def test_explain_flow_reports_whole_paper_state(monkeypatch, state):
     if state == "failed":
         assert status["whole_paper_note"] == v7_scan.WHOLE_PAPER_NOTE
         assert status["whole_paper"] == {"chunks_total": 2, "chunks_read": 1, "compare": "failed", "confirm": "none"}
+
+
+def test_an_ai_cleared_neighbor_below_the_pass_mark_keeps_its_rating_but_a_far_pair_passes():
+    """Unrelated text has no contradiction to quote, so the AI clearing a weak neighboring pair cannot earn it a full point
+    (this is what let 96b74f3 score most papers and non-papers 100). Far-apart chapters are meant to differ and still pass."""
+    unrelated = pair_for_score("None", "none", order=1, overall=0.15)
+    weak = pair_for_score("None", "none", order=2, overall=0.4)
+    far = dict(pair_for_score("None", "none", order=3, overall=0.15), adjacent=False)
+    context = manuscript_score([unrelated, weak, far])[1]["context_alignment"]
+    assert [(f["order"], f["reason"], f["credit"]) for f in context["failures"]] == [(1, "loose_link", 0.15), (2, "loose_link", 0.4)]
+    assert context["passed"] == 1
+
+
+def test_a_document_of_unrelated_sections_scores_low_instead_of_100():
+    bogus = [pair_for_score("None", "none", order=n, overall=0.15) for n in range(1, 6)]
+    assert manuscript_score(bogus)[0] == 15.0

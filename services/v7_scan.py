@@ -178,7 +178,11 @@ def manuscript_score(pairs, transitions=None):
                 reason = "contradiction"
                 earned = CONTRADICTION_CREDIT.get(severity, 0.0)
                 kind[2] += earned
-            elif rating < CHECK_PASS_AT and severity is None:   # only a pair the AI never reviewed keeps the model's rating (marked estimated)
+            # A neighboring pair rated below CHECK_PASS_AT is a loose link even when the AI found no contradiction: unrelated text
+            # has nothing to contradict, so the AI clearing it cannot earn a full point (owner decision, 2026-11-25; 96b74f3 had
+            # let every AI-cleared pair pass, which scored most papers and non-papers 100). Far-apart pairs fail only on a
+            # quoted contradiction; a pair the AI never reviewed keeps the model's rating (marked estimated).
+            elif rating < CHECK_PASS_AT and (neighbors or severity is None):
                 reason = "loose_link"
                 earned = max(0.0, min(CHECK_PASS_AT, rating))
                 kind[2] += earned
