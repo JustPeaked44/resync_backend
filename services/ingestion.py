@@ -11,7 +11,8 @@ MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
 MAX_DOCUMENT_XML_BYTES = 40 * 1024 * 1024
 MAX_ELEMENT_TEXT_CHARS = 500_000
-MAX_DOCUMENT_CHARS = 600_000   # all the text read from one document (raised from 500,000 on 2026-11-25)
+MAX_DOCUMENT_CHARS = 600_000   # characters of text (paragraphs) in one document; raised from 500,000 on 2026-11-25
+MAX_TOTAL_CHARS = 3_000_000   # everything read from one document, table rows included: only a memory guard
 DOCX_COMPLEX_MESSAGE = "This document is too complex to read. Please save a simpler copy and try again."
 READ_CHUNK_BYTES = 1024 * 1024
 
@@ -148,6 +149,7 @@ def extract_docx_with_metadata(file_bytes, include_metadata=True):
     lines = []
     records = []
     count = 0
+    guard = [MAX_DOCUMENT_CHARS + 2]
     table_id = 0
 
     def append(text, cells=None, table=None):
@@ -158,11 +160,12 @@ def extract_docx_with_metadata(file_bytes, include_metadata=True):
         if include_metadata:
             records.append({"text": text, "cells": cells, "table": table})
         count += len(text) + 1
-        if count > 500_002:
+        if count > guard[0]:
             cleaned = DocumentIngestionService.strip_document_noise("\n".join(lines))
             DocumentIngestionService.enforce_size_limits(cleaned)
             lines = [cleaned] if cleaned else []
             count = len(cleaned)
+            guard[0] = count + 300_000   # clean again only after much more text, however long the table rows keep it
             kept = []
             offset = 0
             for record in records:
@@ -359,16 +362,24 @@ class DocumentIngestionService:
         
     @classmethod
     def enforce_size_limits(cls, text: str) -> str:
-        """Enforces limits on document size to prevent out-of-memory errors on small instances."""
+        """Refuses a document with more than MAX_DOCUMENT_CHARS characters of text. Table rows (lines of cells joined by " | ")
+        are not read by the scan, so they do not count toward that limit; MAX_TOTAL_CHARS only guards memory. While a document is
+        still being read the check runs on what has been read so far, so the message says "more than", not an exact size."""
         char_count = len(text)
-        
+        prose = sum(len(line) + 1 for line in text.split("\n") if " | " not in line)
+
         if char_count > 200_000:
-            logging.getLogger("resync.ingestion").warning(f"Large document ingested: {char_count} characters.")
-            
-        if char_count > MAX_DOCUMENT_CHARS:
+            logging.getLogger("resync.ingestion").warning(f"Large document ingested: {char_count} characters ({prose} of text).")
+
+        if prose > MAX_DOCUMENT_CHARS:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Document is too large to process ({char_count:,} characters). Max limit is {MAX_DOCUMENT_CHARS:,} characters."
+                detail=f"Document is too large to process. It has more than {MAX_DOCUMENT_CHARS:,} characters of text, which is the limit."
             )
-            
+        if char_count > MAX_TOTAL_CHARS:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Document is too large to process. With its tables it has more than {MAX_TOTAL_CHARS:,} characters, which is the limit."
+            )
+
         return text

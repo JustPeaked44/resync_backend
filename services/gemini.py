@@ -51,7 +51,7 @@ def quota_blocked():
 
 
 # Shown to the person as written. It must never say why (the AI quota), only that the scan did not finish and can be retried.
-AI_LIMIT_MESSAGE = "We could not finish your scan right now. Nothing was charged. Please try again in a little while."
+AI_LIMIT_MESSAGE = "We could not finish your scan right now. Please try again later."
 
 
 class AIQuotaReached(Exception):
