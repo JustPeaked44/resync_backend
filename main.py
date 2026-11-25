@@ -262,6 +262,12 @@ async def _drain_scan_queue():
 # to verify the bearer token server-side (not a local/offline JWT decode) --
 # no new dependency needed since supabase-py already exposes it.
 # ---------------------------------------------------------------------------
+def _is_login_rejection(exc: BaseException) -> bool:
+    """True when Supabase itself said the token is not valid, False when the check could not be completed."""
+    from supabase_auth.errors import AuthError, AuthRetryableError, AuthUnknownError
+    return isinstance(exc, AuthError) and not isinstance(exc, (AuthRetryableError, AuthUnknownError))
+
+
 async def get_authenticated_user_id(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(
@@ -270,11 +276,20 @@ async def get_authenticated_user_id(authorization: Optional[str] = Header(None))
         )
     token = authorization.split(" ", 1)[1].strip()
     db_client = DatabasePersistenceService.get_client()
-    try:
-        user_resp = await asyncio.to_thread(db_client.auth.get_user, token)
-    except Exception as exc:
-        logger.warning("Supabase token check failed: %s: %s", type(exc).__name__, str(exc)[:200])
-        user_resp = None
+    user_resp = None
+    for attempt in (1, 2):
+        try:
+            user_resp = await asyncio.to_thread(db_client.auth.get_user, token)
+            break
+        except Exception as exc:
+            if _is_login_rejection(exc):   # Supabase answered: this login is not valid
+                logger.warning("Supabase rejected a token: %s", type(exc).__name__)
+                break
+            # No answer (a dropped connection, a timeout): that says nothing about the login, so try once more on a fresh
+            # connection, and if Supabase still cannot be reached say so (503) instead of ending the person's session (401).
+            logger.warning("Supabase token check could not reach Supabase (attempt %s of 2): %s: %s", attempt, type(exc).__name__, str(exc)[:200])
+            if attempt == 2:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="We could not check your session right now. Please try again.")
     if not user_resp or not user_resp.user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session.")
     return user_resp.user.id
