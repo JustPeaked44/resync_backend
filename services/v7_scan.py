@@ -5,6 +5,7 @@ import math
 import os
 import re
 import asyncio
+import collections
 import uuid
 import json
 
@@ -717,6 +718,13 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         findings, recommendations = flatten_explanations(flow, sections)
         scored = [p for p in flow if p["pair_score"] is not None]
         unreviewed = sum(1 for p in flow if p["scores"]["overall_coherence"] is not None and p["severity"] is None)
+        # Why a report has the recommendations it has: how the AI graded the pairs, and how many pieces of advice it offered against how
+        # many were kept. A report with none then says whether the AI found nothing, found only small things, or offered advice that
+        # was dropped because its sentence is not in the section.
+        grades = collections.Counter(p["severity"] or "unreviewed" for p in flow if p["scores"]["overall_coherence"] is not None)
+        offered = sum(len(((p["explanation"] or {}).get("recommendations")) or []) for p in flow if p["severity"] in SERIOUS)
+        log.info("Scan %s pair review: %s; AI advice offered for serious pairs %d, kept %d",
+                 str(gemini.scan_context.get())[:8], ", ".join(f"{name} {count}" for name, count in sorted(grades.items())), offered, len(recommendations))
         if unreviewed and (gemini.quota_reached() or gemini.rate_limited()):   # mandatory: a scan the AI limit cut short stops here
             raise gemini.AIQuotaReached()
         # Tell the report why pairs are missing, so "no recommendations" is never mistaken for "nothing wrong".

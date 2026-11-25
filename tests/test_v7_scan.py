@@ -567,3 +567,30 @@ def test_an_ai_cleared_neighbor_below_the_pass_mark_keeps_its_rating_but_a_far_p
 def test_a_document_of_unrelated_sections_scores_low_instead_of_100():
     bogus = [pair_for_score("None", "none", order=n, overall=0.15) for n in range(1, 6)]
     assert manuscript_score(bogus)[0] == 15.0
+
+
+def test_the_scan_log_says_how_the_pairs_were_graded_and_how_much_advice_was_kept(monkeypatch, caplog):
+    """When a report has no recommendations, the log says why: nothing found, or advice offered and then dropped."""
+    sections = [{"name": "Objectives", "text": "enough words for a valid section " * 4}, {"name": "Methods", "text": "enough words for a valid section " * 4},
+                {"name": "Results", "text": "enough words for a valid section " * 4}]
+    scores = {"pair_weight": 1, "overall_coherence": 0.3, "objectives_alignment": 0.3, "methodology_fit": 0.3, "numeric_consistency": 0.3, "claim_support": 0.3}
+    flow = assemble_flow(sections, [{"scores": dict(scores)}, {"scores": dict(scores)}])
+
+    async def serious_but_unusable(*_, **__):   # a serious problem, with advice whose sentence is not in either section
+        return {"severity": "Moderate", "failed_dimension": "claim_support", "coherence_scores": {}, "link_summary": "",
+                "comparison": {"a_says": "", "b_says": ""}, "highlighted_inconsistencies": [], "reference_list": [], "bridges": [],
+                "recommendations": [{"section": "Methods", "original_sentence": "A sentence that is not in the section.", "recommended_revision": "Fix it."}]}
+
+    async def no_summary(*_):
+        return None
+
+    async def nothing(items):
+        return {}
+
+    monkeypatch.setattr(v7_explain, "explain_pair", serious_but_unusable)
+    monkeypatch.setattr(v7_explain, "explain_batch", nothing)
+    monkeypatch.setattr(v7_explain, "explain_summary", no_summary)
+    with caplog.at_level("INFO", logger="resync.v7_scan"):
+        _, recommendations, _ = asyncio.run(explain_flow(sections, flow))
+    line = next(record.getMessage() for record in caplog.records if "pair review" in record.getMessage())
+    assert "Moderate 2" in line and "advice offered for serious pairs 2, kept 0" in line and recommendations == []
