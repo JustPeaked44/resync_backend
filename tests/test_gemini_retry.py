@@ -233,3 +233,42 @@ def test_the_third_key_takes_over_when_the_first_two_are_out_of_quota_and_the_sc
         return gemini.quota_blocked(), gemini.quota_reached()
 
     assert asyncio.run(third_runs_out()) == (True, True)   # the first two are blocked and now the third: no key is left, so scans stop
+
+
+def test_the_scan_budget_stops_only_the_optional_whole_paper_check_and_the_log_says_what_it_spent(monkeypatch):
+    monkeypatch.setattr(gemini, "SCAN_REQUEST_BUDGET", 3)
+    sent = []
+
+    async def send(request, credential):
+        sent.append(1)
+        return Response(200)
+
+    monkeypatch.setattr(gemini, "_send", send)
+    logs = []
+
+    class Logger:
+        def info(self, message, *args):
+            logs.append(message % args)
+
+    monkeypatch.setattr(gemini.logging.getLogger("resync.gemini"), "info", Logger().info)
+
+    async def scan():
+        token = gemini.scan_context.set("budget-test")
+        try:
+            for _ in range(3):
+                with gemini.purpose("pair batches"):
+                    await gemini.post_gemini_with_retry({"contents": []})
+            assert gemini.budget_left() == 0
+            with gemini.purpose("pair batches"):   # a review the report needs is never refused, even past the budget
+                await gemini.post_gemini_with_retry({"contents": []})
+            with pytest.raises(gemini.GeminiBudgetReached):   # the optional whole-paper check is
+                with gemini.purpose("whole-paper"):
+                    await gemini.post_gemini_with_retry({"contents": []})
+            gemini.log_scan_requests()
+        finally:
+            gemini.scan_context.reset(token)
+
+    asyncio.run(scan())
+    assert len(sent) == 4
+    assert logs == ["Scan budget-t made 4 Gemini requests (budget 3): pair batches 4"]
+    assert gemini.scan_requests("budget-test") == 0   # forgotten once logged

@@ -19,6 +19,8 @@ def the_ai_quota_state_is_not_shared_between_tests():
     from services import gemini
     gemini._quota_blocked_until.clear()
     gemini.LIMITER.rate_limited.clear()
+    gemini._requests.clear()
     yield
     gemini._quota_blocked_until.clear()
     gemini.LIMITER.rate_limited.clear()
+    gemini._requests.clear()

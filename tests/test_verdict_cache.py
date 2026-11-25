@@ -149,10 +149,10 @@ def test_scanning_the_same_text_again_asks_the_ai_nothing_and_gives_the_same_sco
     asyncio.run(explain_flow(sections, flow))
     first = (severities(flow), manuscript_score(flow)[0])
     assert first[0] == ["Moderate", "Moderate", "None"]       # B holds the bad text, so both pairs that include it are judged Moderate
-    assert ai.asked == [[1], [2], [3], [1], [2]]               # one call per severity group, then a second look at the two flagged pairs
+    assert ai.asked == [[1], [2], [3], [1, 2]]                 # one call per severity group, then ONE second look at the two flagged pairs
     sections2, flow2 = paper(texts)
     asyncio.run(explain_flow(sections2, flow2))
-    assert len(ai.asked) == 5                                   # nothing was asked a second time
+    assert len(ai.asked) == 4                                   # nothing was asked a second time
     assert (severities(flow2), manuscript_score(flow2)[0]) == first
 
 

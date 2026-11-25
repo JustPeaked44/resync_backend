@@ -2,6 +2,7 @@
 
 import asyncio
 import collections
+import contextlib
 import contextvars
 import hashlib
 import math
@@ -67,6 +68,43 @@ class AIQuotaReached(Exception):
 
     def __init__(self, message: str = AI_LIMIT_MESSAGE) -> None:
         super().__init__(message)
+
+
+SCAN_REQUEST_BUDGET = int(os.getenv("GEMINI_SCAN_BUDGET", "30"))   # what one manuscript should cost in requests to Google
+_requests = collections.defaultdict(collections.Counter)   # scan id -> what the request was for -> requests sent
+request_purpose = contextvars.ContextVar("gemini_request_purpose", default="other")
+
+
+class GeminiBudgetReached(Exception):
+    """The scan has used its request budget. Only the optional whole-paper check is stopped by it; the reviews the report
+    needs are never refused, so the budget can lower the cost of a scan but never make it fail."""
+
+
+@contextlib.contextmanager
+def purpose(name):
+    """Marks the requests made inside the block, so the log can say what a scan spent its requests on."""
+    token = request_purpose.set(name)
+    try:
+        yield
+    finally:
+        request_purpose.reset(token)
+
+
+def scan_requests(scan_id=None):
+    return sum(_requests.get(scan_id or scan_context.get(), {}).values())
+
+
+def budget_left():
+    return SCAN_REQUEST_BUDGET - scan_requests()
+
+
+def log_scan_requests():
+    """Writes how many requests the current scan sent to Google and what for, then forgets them."""
+    scan_id = scan_context.get()
+    counts = _requests.pop(scan_id, None)
+    if counts:
+        logging.getLogger("resync.gemini").info("Scan %s made %d Gemini requests (budget %d): %s", str(scan_id)[:8], sum(counts.values()),
+                                                SCAN_REQUEST_BUDGET, ", ".join(f"{name} {count}" for name, count in sorted(counts.items())))
 
 
 def quota_reached():
@@ -273,6 +311,9 @@ async def post_gemini_with_retry(payload):
             if slot is None:
                 break
             spent, key = slot
+            if request_purpose.get() == "whole-paper" and budget_left() <= 0:   # the optional check stops; the scan itself goes on
+                raise GeminiBudgetReached()
+            _requests[scan_context.get()][request_purpose.get()] += 1
             try:
                 response = await _send(payload, key)
             except httpx.TransportError:  # timeout or dropped connection

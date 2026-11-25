@@ -25,17 +25,19 @@ def _sections():
 
 
 def _fake_ai(monkeypatch, genuine=True, misnamed=False):
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)   # one request per section, as these tests expect; packing has its own tests below
     prompts = []
 
     async def generate(prompt, max_tokens=None):
         prompts.append(prompt)
-        if "ONE part of a student's thesis" in prompt:
+        if "ONE part of a student's thesis" in prompt or "SEVERAL parts of a student's thesis" in prompt:   # one section, or small ones packed together
+            facts = []
             if "Waterfall" in prompt:
-                return {"facts": [{"kind": "method", "statement": "built with the Waterfall model", "quote": METHOD_SENTENCE},
-                                  {"kind": "claim", "statement": "invented", "quote": "A sentence that is not in the text at all."}]}
+                facts += [{"kind": "method", "statement": "built with the Waterfall model", "quote": METHOD_SENTENCE},
+                          {"kind": "claim", "statement": "invented", "quote": "A sentence that is not in the text at all."}]
             if "Agile" in prompt:
-                return {"facts": [{"kind": "method", "statement": "built with the Agile model", "quote": CONCLUSION_SENTENCE}]}
-            return {"facts": []}
+                facts.append({"kind": "method", "statement": "built with the Agile model", "quote": CONCLUSION_SENTENCE})
+            return {"facts": facts}
         if "STATEMENTS:" in prompt:
             ids = {line.split(" | ")[3]: line.split(" | ")[0] for line in prompt.split("STATEMENTS:")[1].strip().splitlines()}
             if misnamed:   # the AI named its title field wrongly and left the reason out
@@ -158,6 +160,7 @@ def test_finding_fact_ids_keep_word_boundaries(monkeypatch):
         return {}
 
     monkeypatch.setattr(full_check, "_extract", extract)
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)   # one request per section: packing has its own tests
     monkeypatch.setattr(full_check, "_cross_check", cross_check)
     monkeypatch.setattr(full_check, "_confirm", confirm)
     sections = [{"name": name, "text": ("word " * 100).strip()} for name in ("first", "second")]
@@ -268,6 +271,7 @@ def test_cancelled_read_propagates(monkeypatch):
     async def cancelled(*args):
         raise asyncio.CancelledError()
     monkeypatch.setattr(full_check, "_extract", cancelled)
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)
     sections = [{"name": str(i), "text": "word " * 20} for i in range(2)]
     import pytest
     with pytest.raises(asyncio.CancelledError):
@@ -276,6 +280,8 @@ def test_cancelled_read_propagates(monkeypatch):
 
 def test_chunks_over_safety_limit_are_unread(monkeypatch):
     monkeypatch.setattr(full_check, "MAX_CHUNK_CALLS", 1)
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)
+    monkeypatch.setattr(full_check, "PACK_MAX_CHARS", 150)   # too small to pack the two sections into one request
     async def empty(*args):
         return []
     monkeypatch.setattr(full_check, "_extract", empty)
@@ -287,9 +293,67 @@ def test_chunks_over_safety_limit_are_unread(monkeypatch):
 
 def test_split_ledger_without_comparable_group_is_skipped(monkeypatch):
     monkeypatch.setattr(full_check, "LEDGER_SPLIT_CHARS", 1)
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)
     async def extract(name, text):
         return [{"kind": "number" if name == "first" else "claim", "statement": name, "quote": text}]
     monkeypatch.setattr(full_check, "_extract", extract)
     sections = [{"name": name, "text": "word " * 20} for name in ("first", "second")]
     result = asyncio.run(full_check._prepare(sections))
     assert result.stats["state"] == "ran" and result.stats["compare"] == "skipped"
+
+
+def test_small_sections_share_requests_and_a_paper_always_fits_its_request_cap():
+    jobs = [(i, "word " * 100) for i in range(22)]   # 22 short sections: one request each before
+    groups = full_check.pack_jobs(jobs, 10)
+    assert len(groups) <= 10
+    assert [job for group in groups for job in group] == jobs   # nothing lost, nothing moved
+    assert all(sum(len(text) for _, text in group) <= full_check.PACK_MAX_CHARS for group in groups)
+    assert len(full_check.pack_jobs(jobs, 1000)) < len(jobs)   # even with room to spare, small sections share
+    big = [(i, "w" * 50_000) for i in range(12)]   # no two pieces fit in one request: 12 requests are needed, more than the cap
+    assert len(full_check.pack_jobs(big, 10)) > 10
+
+
+def test_a_packed_request_gives_each_statement_to_the_section_it_was_quoted_from(monkeypatch):
+    sections = [{"name": "methodology", "text": METHOD_SENTENCE}, {"name": "conclusion", "text": CONCLUSION_SENTENCE}]
+    prompts = []
+
+    async def generate(prompt, max_tokens=None):
+        prompts.append(prompt)
+        return {"facts": [{"kind": "method", "statement": "built with Agile", "quote": CONCLUSION_SENTENCE},
+                          {"kind": "method", "statement": "built with Waterfall", "quote": METHOD_SENTENCE},
+                          {"kind": "claim", "statement": "invented", "quote": "Nothing like this is in either part."}]}
+
+    monkeypatch.setattr(v7_explain, "_generate", generate)
+    facts = asyncio.run(full_check._extract_group([(0, METHOD_SENTENCE), (1, CONCLUSION_SENTENCE)], sections))
+    assert len(prompts) == 1 and "[PART: methodology]" in prompts[0] and "[PART: conclusion]" in prompts[0]
+    assert [(fact["statement"], fact["index"]) for fact in facts] == [("built with Agile", 1), ("built with Waterfall", 0)]   # the invented quote is dropped
+
+
+def test_a_paper_of_many_small_sections_is_read_in_few_requests_and_still_compared(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    sections = [{"name": f"part {i}", "text": f"Part {i} describes the study. " * 8} for i in range(18)]
+    sections[3]["text"] += METHOD_SENTENCE
+    sections[15]["text"] += CONCLUSION_SENTENCE
+    reads = []
+
+    async def generate(prompt, max_tokens=None):
+        if "STATEMENTS:" in prompt:
+            ids = {line.split(" | ")[3]: line.split(" | ")[0] for line in prompt.split("STATEMENTS:")[1].strip().splitlines()}
+            return {"conflicts": [{"fact_a": ids["built with the Waterfall model"], "fact_b": ids["built with the Agile model"], "severity": "Moderate",
+                                   "category": "methodology", "what": "Different model", "why": "Waterfall against Agile.", "fix_id": ids["built with the Agile model"]}]}
+        if "[PART:" in prompt or "ONE part" in prompt:
+            reads.append(prompt)
+            facts = []
+            if "Waterfall" in prompt:
+                facts.append({"kind": "method", "statement": "built with the Waterfall model", "quote": METHOD_SENTENCE})
+            if "Agile" in prompt:
+                facts.append({"kind": "method", "statement": "built with the Agile model", "quote": CONCLUSION_SENTENCE})
+            return {"facts": facts}
+        return {"results": [{"id": 1, "genuine": True, "severity": "Moderate", "fixed_sentence": "The team developed the system using the Waterfall model with fixed phases."}]}
+
+    monkeypatch.setattr(v7_explain, "_generate", generate)
+    result = asyncio.run(full_check._prepare(sections))
+    assert len(reads) <= full_check.MAX_CHUNK_CALLS and len(reads) < len(sections)   # 18 sections cost at most 10 reading requests, not 18
+    assert result.stats["state"] == "ran" and result.stats["chunks_read"] == result.stats["chunks_total"] == 18
+    candidates, _ = result
+    assert len(candidates) == 1 and {candidates[0]["a"]["section"], candidates[0]["b"]["section"]} == {"part 3", "part 15"}

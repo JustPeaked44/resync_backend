@@ -34,7 +34,8 @@ logger = logging.getLogger("resync.full_check")
 
 VERSION = "1"                      # bump when the prompts below change, so remembered answers are not reused
 CHUNK_CHARS = int(os.getenv("FULL_CHECK_CHUNK_CHARS", "12000"))
-MAX_CHUNK_CALLS = int(os.getenv("FULL_CHECK_MAX_CALLS", "80"))   # a safety stop for a huge paper
+MAX_CHUNK_CALLS = int(os.getenv("FULL_CHECK_MAX_CALLS", "10"))   # reading requests for a whole paper; pieces are packed to fit (see pack_jobs)
+PACK_MAX_CHARS = 80_000            # the most text one reading request may carry
 CONCURRENCY = int(os.getenv("FULL_CHECK_CONCURRENCY", "6"))
 MAX_FACTS_PER_CHUNK = 30
 LEDGER_SPLIT_CHARS = 120_000       # a longer list of statements is compared in two calls
@@ -58,6 +59,12 @@ Rules: copy "quote" EXACTLY, word for word, from the text below (one whole sente
 Return JSON: {{"facts":[{{"kind":"objective|method|number|claim|term","statement":"...","quote":"..."}}]}}
 TEXT:
 {text}"""
+
+_SINGLE_OPEN = 'ONE part of a student\'s thesis, called "{section}"'
+assert _SINGLE_OPEN in FACT_PROMPT and "List up to 30 statements" in FACT_PROMPT
+FACT_PROMPT_MULTI = FACT_PROMPT.replace(
+    _SINGLE_OPEN, "SEVERAL parts of a student's thesis. Each part starts with a line [PART: name] and ends where the next one starts").replace(
+    "List up to 30 statements", "For EACH part, list up to 30 statements")
 
 CROSS_PROMPT = """Below are statements taken from every part of one student's thesis. Each has an id, the section it came from and its kind.
 Find statements from DIFFERENT sections that contradict each other or do not match, so that a reader would not know which is true. Examples: two different numbers for the same thing (people, items, dates, percentages, versions); a method, tool, design or framework named differently in two places; an objective or research question that changed between sections; a conclusion that claims more than the findings support (for example a causal claim from correlational results); the same term used for two different things.
@@ -106,6 +113,27 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> List[str]:
     return chunks
 
 
+def pack_jobs(jobs: List[tuple], max_groups: int) -> List[List[tuple]]:
+    """Packs consecutive (section index, text) pieces into reading requests of up to a size that grows from CHUNK_CHARS until the
+    paper fits in max_groups requests (or PACK_MAX_CHARS is reached; what still does not fit is not read and is reported as such).
+    Small sections share a request, so a paper with many short sections costs few requests."""
+    size = CHUNK_CHARS
+    while True:
+        groups: List[List[tuple]] = []
+        used = 0
+        for job in jobs:
+            weight = len(job[1]) + 40   # the [PART: name] line
+            if groups and used + weight <= size:
+                groups[-1].append(job)
+                used += weight
+            else:
+                groups.append([job])
+                used = weight
+        if len(groups) <= max_groups or size >= PACK_MAX_CHARS:
+            return groups
+        size = min(PACK_MAX_CHARS, max(size + 1, int(size * 1.25)))
+
+
 ASK_PAUSES = (2.0, 5.0, 12.0, 25.0)
 ASK_WAIT_CAP = 45.0
 _jitter = random.Random()
@@ -139,11 +167,16 @@ async def _ask(prompt: str, label: str) -> Optional[Dict[str, Any]]:
     tries = len(ASK_PAUSES) + 1
     for attempt in range(1, tries + 1):
         try:
-            raw = await v7_explain._generate(prompt, max_tokens=32768)
+            with gemini.purpose("whole-paper"):
+                raw = await v7_explain._generate(prompt, max_tokens=32768)
             if not isinstance(raw, dict):
                 _failure_kind.set("malformed")
                 return None
             return raw
+        except gemini.GeminiBudgetReached:
+            _failure_kind.set("transient")
+            logger.warning("Full check (%s) skipped: this scan used its request budget", label)
+            return None
         except gemini.GeminiQuotaExhausted:
             _failure_kind.set("transient")
             logger.warning("Full check (%s) skipped: the AI's limit was reached", label)
@@ -194,6 +227,40 @@ async def _extract(section: str, chunk: str) -> Optional[List[Dict[str, str]]]:
             continue
         kind = item.get("kind") if item.get("kind") in KINDS else "claim"
         facts.append({"kind": kind, "statement": " ".join(statement.split())[:240], "quote": quote})
+    await VerdictCache.save_many({key: {"severity": "None", "facts": facts}})
+    return facts
+
+
+async def _extract_group(members: List[tuple], sections: List[Dict[str, Any]]) -> Optional[List[Dict[str, str]]]:
+    """Like _extract, for several pieces of different sections in one request. Each fact carries "index", the section whose piece
+    contains its quote; a quote that is in none of the pieces is dropped, as in _extract."""
+    names = [sections[index]["name"] for index, _ in members]
+    key = VerdictCache.fingerprint("full-check-facts-multi", VERSION, names, [chunk for _, chunk in members])
+    saved = (await VerdictCache.get_many([key])).get(key)
+    if saved is not None and isinstance(saved.get("facts"), list):
+        return saved["facts"]
+    text = "\n\n".join(f"[PART: {name}]\n{chunk}" for name, (_, chunk) in zip(names, members))
+    raw = await _ask(FACT_PROMPT_MULTI.format(text=text), f"read {len(members)} parts")
+    if raw is None:
+        return None
+    if not isinstance(raw.get("facts"), list):
+        _failure_kind.set("malformed")
+        return None
+    facts = []
+    for item in raw["facts"][:MAX_FACTS_PER_CHUNK * min(len(members), 4)]:
+        if not isinstance(item, dict):
+            continue
+        quote, statement = item.get("quote"), item.get("statement")
+        if not (isinstance(quote, str) and isinstance(statement, str) and quote.strip() and statement.strip()):
+            continue
+        quote = " ".join(quote.split())
+        if len(quote) > 500:
+            continue
+        owner = next((index for index, chunk in members if gemini.verify_quote(quote, chunk)[1]), None)
+        if owner is None:
+            continue
+        kind = item.get("kind") if item.get("kind") in KINDS else "claim"
+        facts.append({"kind": kind, "statement": " ".join(statement.split())[:240], "quote": quote, "index": owner})
     await VerdictCache.save_many({key: {"severity": "None", "facts": facts}})
     return facts
 
@@ -422,35 +489,49 @@ async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run:
     jobs = [(index, chunk) for index, section in enumerate(sections) if len((section["text"] or "").split()) >= MIN_SECTION_WORDS
             for chunk in chunk_text(section["text"])]
     run["chunks_total"] = len(jobs)
-    run["chunks_failed"] = max(0, len(jobs) - MAX_CHUNK_CALLS)
-    jobs = jobs[:MAX_CHUNK_CALLS]
-    if not jobs:
+    groups = pack_jobs(jobs, MAX_CHUNK_CALLS)
+    run["chunks_failed"] = sum(len(group) for group in groups[MAX_CHUNK_CALLS:])
+    groups = groups[:MAX_CHUNK_CALLS]
+    if not groups:
         return [], {}
     if announce:
-        gemini.expect_calls(len(jobs) + 2)
+        gemini.expect_calls(len(groups) + 2)
     gate = asyncio.Semaphore(CONCURRENCY)
 
-    async def read(job):
+    async def read_single(job):
+        name, chunk = sections[job[0]]["name"], job[1]
+        found = await _extract(name, chunk)
+        lost = found is None
+        if found is None and _failure_kind.get() == "malformed" and len(chunk) > 2500:   # an answer that came back broken: read the same piece again in two halves
+            halves = chunk_text(chunk, size=len(chunk) // 2 + 1)
+            parts = [await _extract(name, half) for half in halves]
+            found = [fact for part in parts for fact in (part or [])] if any(part is not None for part in parts) else None
+            lost = any(part is None for part in parts)
+        return found, lost
+
+    async def read(group):
         async with gate:
-            name, chunk = sections[job[0]]["name"], job[1]
-            found = await _extract(name, chunk)
-            lost = found is None
-            if found is None and _failure_kind.get() == "malformed" and len(chunk) > 2500:   # an answer that came back broken: read the same piece again in two halves
-                halves = chunk_text(chunk, size=len(chunk) // 2 + 1)
-                parts = [await _extract(name, half) for half in halves]
-                found = [fact for part in parts for fact in (part or [])] if any(part is not None for part in parts) else None
-                lost = any(part is None for part in parts)
-            run["chunks_failed"] += lost
+            if len(group) == 1:
+                found, lost = await read_single(group[0])
+            else:
+                found = await _extract_group(group, sections)
+                lost = found is None
+                if lost and _failure_kind.get() == "malformed" and gemini.budget_left() > 4:   # a broken answer: read the pieces one by one
+                    singles = [await read_single(job) for job in group]
+                    found = [fact for part, _ in singles for fact in (part or [])] if any(part is not None for part, _ in singles) else None
+                    lost = any(failed for _, failed in singles)
+            run["chunks_failed"] += len(group) if lost else 0
             return found
 
-    results = await asyncio.gather(*(read(job) for job in jobs), return_exceptions=True)
+    results = await asyncio.gather(*(read(group) for group in groups), return_exceptions=True)
     facts: List[Dict[str, Any]] = []
-    for (index, _), found in zip(jobs, results):
+    for group, found in zip(groups, results):
         if isinstance(found, asyncio.CancelledError):
             raise found
-        run["chunks_failed"] += isinstance(found, BaseException)
+        run["chunks_failed"] += len(group) if isinstance(found, BaseException) else 0
         for fact in found if isinstance(found, list) else []:
-            facts.append({**fact, "id": f"F{len(facts) + 1}", "index": index, "section": sections[index]["name"]})
+            index = fact.get("index", group[0][0])
+            facts.append({**{k: v for k, v in fact.items() if k != "index"}, "id": f"F{len(facts) + 1}", "index": index, "section": sections[index]["name"]})
     if len({fact["index"] for fact in facts}) < 2:
         return [], {}
     by_id = {fact["id"]: fact for fact in facts}

@@ -408,6 +408,7 @@ def select_pairs_to_explain(pairs, sections=None, roles=None):
 CRITICAL_BELOW = 0.40
 MODERATE_BELOW = 0.65     # Minor runs from here up to RECOMMENDATION_THRESHOLD
 BATCH_MAX = 12            # a group larger than this is split, so one answer never grows too long to read
+MAX_FAR_SINGLES = 3       # extra one-pair reviews of the main far-apart pairs, at most this many per scan
 
 
 def severity_batches(pairs):
@@ -557,9 +558,10 @@ async def apply_subject_check(flow, sections):
     from services import gemini
     gemini.expect_calls(1)
     try:
-        different = await asyncio.wait_for(v7_explain.check_subjects_batch(
-            [{"id": p["order"], "role_a": p["section_a"], "text_a": sections[p["index_a"]]["text"],
-              "role_b": p["section_b"], "text_b": sections[p["index_b"]]["text"]} for p in candidates]), EXPLAIN_TIMEOUT)
+        with gemini.purpose("subject check"):
+            different = await asyncio.wait_for(v7_explain.check_subjects_batch(
+                [{"id": p["order"], "role_a": p["section_a"], "text_a": sections[p["index_a"]]["text"],
+                  "role_b": p["section_b"], "text_b": sections[p["index_b"]]["text"]} for p in candidates]), EXPLAIN_TIMEOUT)
     except asyncio.TimeoutError:
         log.warning("The subject check of %s pairs took over %ss; skipped", len(candidates), EXPLAIN_TIMEOUT)
         return
@@ -600,9 +602,10 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
             index_a, index_b = pair["index_a"], pair["index_b"]
             culprits = pair["culprit_sentences"]
             try:
-                pair["explanation"] = await asyncio.wait_for(explain_pair(
-                    pair["section_a"], sections[index_a]["text"], pair["section_b"], sections[index_b]["text"],
-                    scores_of(pair), culprits["section_a"], culprits["section_b"], adjacent=pair["adjacent"]), EXPLAIN_TIMEOUT)
+                with gemini.purpose("single pairs"):
+                    pair["explanation"] = await asyncio.wait_for(explain_pair(
+                        pair["section_a"], sections[index_a]["text"], pair["section_b"], sections[index_b]["text"],
+                        scores_of(pair), culprits["section_a"], culprits["section_b"], adjacent=pair["adjacent"]), EXPLAIN_TIMEOUT)
             except asyncio.TimeoutError:  # never let one slow pair hold the whole scan at 99%
                 log.warning("Pair %s took over %ss; leaving it unreviewed", pair["order"], EXPLAIN_TIMEOUT)
 
@@ -615,7 +618,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
     async def review_batch(group):
         """One Gemini call for a whole severity group. Pairs it does not answer are reviewed one by one afterwards."""
         try:
-            answers = await asyncio.wait_for(explain_batch(batch_items(group)), EXPLAIN_TIMEOUT)
+            with gemini.purpose("pair batches"):
+                answers = await asyncio.wait_for(explain_batch(batch_items(group)), EXPLAIN_TIMEOUT)
         except asyncio.TimeoutError:
             log.warning("A batch of %s pairs took over %ss; reviewing them one by one", len(group), EXPLAIN_TIMEOUT)
             return
@@ -626,7 +630,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
     async def second_opinion(group):
         """A contradiction only counts when a second review of just these pairs also finds one."""
         try:
-            answers = await asyncio.wait_for(explain_batch(batch_items(group)), EXPLAIN_TIMEOUT)
+            with gemini.purpose("rechecks"):
+                answers = await asyncio.wait_for(explain_batch(batch_items(group)), EXPLAIN_TIMEOUT)
         except asyncio.TimeoutError:
             return   # not confirmed, not denied: the first verdict stands
         for pair in group:
@@ -650,14 +655,14 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
     try:
         await asyncio.gather(*(review_batch(group) for _, group in batches), return_exceptions=True)  # one bad batch never cancels the rest
         # Pairs a batch left out (or whose batch failed) get a review of their own, so nothing is skipped silently.
-        missing = [pair for pair in to_explain if pair["explanation"] is None]
+        missing = [pair for pair in to_explain if pair["explanation"] is None]   # required reviews are never cut by the request budget
         if missing:
             gemini.expect_calls(len(missing))
             await asyncio.gather(*(explain(pair) for pair in missing), return_exceptions=True)
         # The main far-apart pairs get a review of their own whatever the batch said, so a contradiction is not lost in a group.
         singles = [pair for pair in main_far_pairs(flow, sections, roles) if pair in to_review
-                   and (pair["explanation"] or {}).get("severity") in (None, "None")]
-        if singles:
+                   and (pair["explanation"] or {}).get("severity") in (None, "None")][:MAX_FAR_SINGLES]
+        if singles and gemini.budget_left() > len(singles) + 4:   # an extra review, so it waits for the budget the required ones need
             gemini.expect_calls(len(singles))
             await asyncio.gather(*(explain(pair) for pair in singles), return_exceptions=True)
         # Gemini fails more under load (429/503), so pairs it could not judge get one calmer, one-at-a-time second pass.
@@ -667,8 +672,9 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         # A one-off answer on a borderline pair must not move the score from one scan to the next, so every contradiction
         # found this time is put to a second review of just those pairs; if that one finds nothing, the pair is clear.
         flagged = [pair for pair in to_review if pair["explanation"] and pair["explanation"]["severity"] in ("Critical", "Moderate", "Minor")]
-        if flagged:
-            rechecks = severity_batches(flagged)
+        if flagged and gemini.budget_left() >= 2:
+            ordered = sorted(flagged, key=lambda p: p["scores"]["overall_coherence"])   # weakest first, in as few calls as BATCH_MAX allows
+            rechecks = [("Recheck", ordered[start:start + BATCH_MAX]) for start in range(0, len(ordered), BATCH_MAX)]
             gemini.expect_calls(len(rechecks))
             await asyncio.gather(*(second_opinion(group) for _, group in rechecks), return_exceptions=True)
         # A loosely linked neighbor pair always gets linking sentences to add: when the main review wrote none, ask for
@@ -693,7 +699,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         decided = [pair for pair in to_explain if pair["explanation"] and (pair in to_review or pair in loose)]
         await VerdictCache.save_many({keys[pair["order"]]: pair["explanation"] for pair in decided})
         apply_figure_conflicts(flow, sections)
-        await apply_subject_check(flow, sections)
+        if gemini.budget_left() >= 2:   # the subject check is an extra; it waits for the budget the required reviews need
+            await apply_subject_check(flow, sections)
         # The pair review sees where sections meet; this reads every section in full and compares all of it (full_check).
         whole_paper = {}   # filled with how much of the paper the whole-paper check really covered
         await full_check.apply_full_check(flow, sections, roles, prepared=full_check_task, status=whole_paper)
@@ -724,7 +731,9 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         review_status["unverified"] = len(unverified)
         if unreviewed and gemini.rate_limited():
             review_status.update(reason="rate_limited", message="Some AI reviews could not finish. This score is provisional; try scanning again later.")
-        synthesis = {"summary": await explain_summary(flow, findings),
+        with gemini.purpose("summary"):
+            summary = await explain_summary(flow, findings)
+        synthesis = {"summary": summary,
                      "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
                      "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None,
                      "review_status": review_status, "unverified_findings": unverified[:20]}
@@ -732,6 +741,7 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         if full_check_task is not None:   # the scan stopped early: do not leave the paper check running
             full_check_task.cancel()
         gemini.expect_calls(0)
+        gemini.log_scan_requests()   # how many requests this scan sent to Google, and what for
     return findings, recommendations, synthesis
 
 
