@@ -51,6 +51,20 @@ def _saved_scan_view(result: Dict[str, Any], unlocked: bool) -> Dict[str, Any]:
     return locked_scan_view(saved)
 
 logger = logging.getLogger("resync.main")
+
+
+def _show_app_logs() -> None:
+    """Python prints only warnings unless a logger has a handler, so the app's own INFO lines (one summary per scan: how many requests
+    it sent to Gemini, how the pairs were graded) never reached the container log. The resync.* loggers get one, at INFO."""
+    app_log = logging.getLogger("resync")
+    app_log.setLevel(logging.INFO)
+    if not app_log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        app_log.addHandler(handler)
+
+
+_show_app_logs()
 PROCESS_START = datetime.now(timezone.utc)
 INTERRUPTED_GRACE_SECONDS = int(os.getenv("INTERRUPTED_GRACE_SECONDS", "180"))
 SCAN_DEADLINE_SECONDS = int(os.getenv("SCAN_DEADLINE_SECONDS", "2700"))

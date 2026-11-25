@@ -50,3 +50,10 @@ def test_a_token_supabase_rejects_is_still_a_401_without_a_retry(monkeypatch):
     with pytest.raises(HTTPException) as refused:
         asyncio.run(main.get_authenticated_user_id("Bearer token"))
     assert refused.value.status_code == 401
+
+
+def test_the_app_loggers_have_a_handler_at_info_so_the_scan_summaries_reach_the_container_log():
+    import logging
+    app_log = logging.getLogger("resync")
+    assert app_log.level == logging.INFO and any(isinstance(handler, logging.StreamHandler) for handler in app_log.handlers)
+    assert logging.getLogger("resync.gemini").isEnabledFor(logging.INFO)
