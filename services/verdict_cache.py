@@ -24,7 +24,7 @@ logger = logging.getLogger("resync.verdict_cache")
 
 TABLE = "pair_verdict_cache"
 # Bump this whenever the pair prompts, the rules or how answers are read change: verdicts saved before no longer match.
-PROMPT_VERSION = "4"   # bumped: numeric context rule and strict-quote rule change what the AI answers
+PROMPT_VERSION = "5"   # bumped: answers saved under 4 came from the over-cautious prompt of 96b74f3 and kept returning "no problem" (so reports with no recommendations, and scans that never needed Gemini). 4 was the numeric context and strict-quote rules
 # Old unscoped keys no longer match; existing rows are left untouched.
 KEY_VERSION = "1"
 MEMORY_LIMIT = 4000
