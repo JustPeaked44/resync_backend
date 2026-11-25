@@ -318,11 +318,15 @@ def manuscript_preview_sections(sections, parse_result):
     source_text = parse_result.get("parsed_sections") or {}
     order = parse_result.get("section_order") or list(source_text)
     result, total_bytes, budget_exhausted = [], 2 + 5 * len(sections), False
+    # The scan reads cleaned text (no table rows, page numbers or running headers), but the report shows the document as it was
+    # written. The display text is the same merge of the uncleaned sections, so it matches the blocks and the Word file again.
+    # Cleaning only drops whole lines, so every sentence a recommendation quotes is still in it.
+    shown = {item["name"]: item["text"] for item in merge_repeated_sections(source_text, order)} if source_text else {}
     for section in sections:
         name = section["name"]
         base = re.sub(r" \(\d+\)$", "", name)
         parts = [key for key in order if re.sub(r" \(\d+\)$", "", key) == base]
-        preview = {**section, "display_name": names.get(name), "blocks": None}
+        preview = {**section, "text": shown.get(name) or section["text"], "display_name": names.get(name), "blocks": None}
         if not budget_exhausted and any(source_blocks.get(key) for key in parts):
             blocks, table_count, drop_tables = [], 0, False
             for key in parts:

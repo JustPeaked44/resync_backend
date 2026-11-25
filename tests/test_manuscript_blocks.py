@@ -44,3 +44,14 @@ def test_openapi_section_fields_are_optional_and_other_fields_remain_allowed():
     assert schema["additionalProperties"] is True
     assert set(schema["properties"]) == {"display_name", "blocks"}
     assert "required" not in schema
+
+
+def test_the_report_text_keeps_table_rows_and_page_numbers_that_the_scan_does_not_read():
+    """96b74f3 made the scan read cleaned text, which had also replaced the text shown in the report, so the text no longer matched
+    its blocks. The scan keeps the cleaned text; the report shows the section as written."""
+    from services.v7_scan import comparable_sections
+    raw = "The study surveyed forty students.\nName | Score\nAnna | 90\n12\nResults were positive."
+    parsed = {"parsed_sections": {"Methods": raw}, "section_order": ["Methods"], "section_roles": {}, "display_names": {}, "section_blocks": {}}
+    sections = comparable_sections(parsed["parsed_sections"], parsed["section_order"], {})
+    assert "Anna | 90" not in sections[0]["text"] and "\n12\n" not in sections[0]["text"]   # what the scan reads
+    assert manuscript_preview_sections(sections, parsed)[0]["text"] == raw                     # what the report shows
