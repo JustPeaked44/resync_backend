@@ -663,10 +663,11 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
 
     Returns (analysis_run_id, manuscript_id, credits_remaining).
     """
-    await _check_scan_rate_limit(req.user_id)
+    # Checked before the rate limit counts this attempt: a scan we refuse must not use up the person's allowance of scans.
     if quota_reached():   # mandatory: no scan starts while the AI has no quota left, so the person stays on the confirm step
         logger.info("Scan refused: the AI has no quota left")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AI_LIMIT_MESSAGE)
+    await _check_scan_rate_limit(req.user_id)
 
     analysis_run_id = str(uuid.uuid4())
     try:

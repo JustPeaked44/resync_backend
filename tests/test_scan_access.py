@@ -280,3 +280,19 @@ def test_no_scan_starts_while_the_ai_has_no_quota_left(monkeypatch):
 def test_a_scan_stopped_by_the_ai_limit_is_reported_with_the_plain_message():
     assert main._failure_message("abcdef123456", main.AIQuotaReached()) == main.AI_LIMIT_MESSAGE
     assert main._safe_refusal(main.AI_LIMIT_MESSAGE)
+
+
+def test_a_scan_refused_for_the_ai_quota_does_not_use_up_the_rate_limit(monkeypatch):
+    """Retrying while scans are blocked must not run into 'Too many scans started recently': refused attempts are not counted."""
+    counted = []
+
+    async def count(user):
+        counted.append(user)
+
+    monkeypatch.setattr(main, "_check_scan_rate_limit", count)
+    monkeypatch.setattr(main, "quota_reached", lambda: True)
+    for _ in range(3):
+        with pytest.raises(main.HTTPException) as refused:
+            asyncio.run(main._provision_analysis_run(main.ScanRequest(user_id="owner")))
+        assert refused.value.status_code == 503
+    assert counted == []

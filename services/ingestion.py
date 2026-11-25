@@ -11,6 +11,7 @@ MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 100 * 1024 * 1024
 MAX_DOCUMENT_XML_BYTES = 40 * 1024 * 1024
 MAX_ELEMENT_TEXT_CHARS = 500_000
+MAX_DOCUMENT_CHARS = 600_000   # all the text read from one document (raised from 500,000 on 2026-11-25)
 DOCX_COMPLEX_MESSAGE = "This document is too complex to read. Please save a simpler copy and try again."
 READ_CHUNK_BYTES = 1024 * 1024
 
@@ -364,10 +365,10 @@ class DocumentIngestionService:
         if char_count > 200_000:
             logging.getLogger("resync.ingestion").warning(f"Large document ingested: {char_count} characters.")
             
-        if char_count > 500_000:
+        if char_count > MAX_DOCUMENT_CHARS:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"Document is too large to process ({char_count:,} characters). Max limit is 500,000 characters."
+                detail=f"Document is too large to process ({char_count:,} characters). Max limit is {MAX_DOCUMENT_CHARS:,} characters."
             )
             
         return text
