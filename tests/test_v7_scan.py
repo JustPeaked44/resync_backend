@@ -115,7 +115,9 @@ def test_explanation_cap_and_single_summary(monkeypatch):
     assert synthesis["summary"] is None and synthesis["strongest_pair"]["order"] == 30
 
 
-def test_unfinished_rate_limited_review_is_partial(monkeypatch):
+def test_a_review_cut_short_by_the_ai_limit_stops_the_scan_instead_of_finishing_provisional(monkeypatch):
+    """Mandatory rule: when the AI's quota is reached the scan does not go on to a provisional report. It stops with an
+    AIQuotaReached, which the job reports as a failed scan so the person lands back on the confirm step."""
     sections = [{"name": "A", "text": "enough words for a valid section"},
                 {"name": "B", "text": "enough words for a valid section"}]
     flow = assemble_flow(sections, [{"scores": {"pair_weight": 1, "overall_coherence": 0.2,
@@ -128,13 +130,27 @@ def test_unfinished_rate_limited_review_is_partial(monkeypatch):
     monkeypatch.setattr(v7_explain, "explain_pair", unavailable)
     monkeypatch.setattr(v7_explain, "explain_summary", unavailable)
     monkeypatch.setattr(gemini, "rate_limited", lambda: True)
+    with pytest.raises(gemini.AIQuotaReached) as stopped:
+        asyncio.run(explain_flow(sections, flow))
+    assert str(stopped.value) == gemini.AI_LIMIT_MESSAGE
+
+
+def test_pairs_left_unreviewed_for_another_reason_still_finish_as_partial(monkeypatch):
+    sections = [{"name": "A", "text": "enough words for a valid section"},
+                {"name": "B", "text": "enough words for a valid section"}]
+    flow = assemble_flow(sections, [{"scores": {"pair_weight": 1, "overall_coherence": 0.2,
+        "objectives_alignment": 0.2, "methodology_fit": 0.2,
+        "numeric_consistency": 0.2, "claim_support": 0.2}}])
+
+    async def unavailable(*_, **__):
+        return None
+
+    monkeypatch.setattr(v7_explain, "explain_pair", unavailable)
+    monkeypatch.setattr(v7_explain, "explain_summary", unavailable)
+    monkeypatch.setattr(gemini, "rate_limited", lambda: False)
+    monkeypatch.setattr(gemini, "quota_reached", lambda: False)
     _, _, synthesis = asyncio.run(explain_flow(sections, flow))
-    status = synthesis["review_status"]
-    assert (status["status"], status["unreviewed"], status["reason"]) == ("partial", 1, "rate_limited")
-    assert status["message"] == "Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later."
-    # nothing was reviewed, so the score is an ML-only estimate and says so
-    assert (status["analysis"], status["basis"], status["reviewed"], status["needs_review"]) == ("incomplete", "ml_estimate", 0, 1)
-    assert status["unverified"] == 0
+    assert (synthesis["review_status"]["status"], synthesis["review_status"]["unreviewed"]) == ("partial", 1)   # the apps treat this as not finished
 
 
 def pair_for_score(severity=None, dimension=None, numeric=True, order=1, overall=0.5):

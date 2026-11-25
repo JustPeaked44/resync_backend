@@ -11,3 +11,14 @@ def verdicts_are_not_remembered_between_tests(monkeypatch):
     VerdictCache.forget_everything_in_memory()
     yield
     VerdictCache.forget_everything_in_memory()
+
+
+@pytest.fixture(autouse=True)
+def the_ai_quota_state_is_not_shared_between_tests():
+    """A scan now stops when the AI limit is reached, so a quota or rate-limit mark left by one test would stop the next one."""
+    from services import gemini
+    gemini._quota_blocked_until.clear()
+    gemini.LIMITER.rate_limited.clear()
+    yield
+    gemini._quota_blocked_until.clear()
+    gemini.LIMITER.rate_limited.clear()

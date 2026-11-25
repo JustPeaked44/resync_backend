@@ -49,6 +49,23 @@ def _available_key():
 def quota_blocked():
     return _available_key() is None
 
+
+# Shown to the person as written. It must never say why (the AI quota), only that the scan did not finish and can be retried.
+AI_LIMIT_MESSAGE = "We could not finish your scan right now. Nothing was charged. Please try again in a little while."
+
+
+class AIQuotaReached(Exception):
+    """The AI's quota ran out, so the review cannot finish. A scan must stop then and be reported as not finished, never
+    completed with a provisional score. Carries the message the person sees, which does not name the quota."""
+
+    def __init__(self, message: str = AI_LIMIT_MESSAGE) -> None:
+        super().__init__(message)
+
+
+def quota_reached():
+    """True when keys are configured and every one of them is out of daily quota."""
+    return bool(_configured_keys()) and quota_blocked()
+
 # Set per scan job (see main._run_scan_job) so the limiter can report status to that scan's poller.
 scan_context = contextvars.ContextVar("gemini_scan_id", default=None)
 scan_user = contextvars.ContextVar("gemini_scan_user", default=None)

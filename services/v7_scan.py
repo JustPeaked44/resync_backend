@@ -706,6 +706,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
         findings, recommendations = flatten_explanations(flow, sections)
         scored = [p for p in flow if p["pair_score"] is not None]
         unreviewed = sum(1 for p in flow if p["scores"]["overall_coherence"] is not None and p["severity"] is None)
+        if unreviewed and (gemini.quota_reached() or gemini.rate_limited()):   # mandatory: a scan the AI limit cut short stops here
+            raise gemini.AIQuotaReached()
         # Tell the report why pairs are missing, so "no recommendations" is never mistaken for "nothing wrong".
         review_status = {"status": "complete" if not unreviewed else "partial", "unreviewed": unreviewed}
         checked = full_check.enabled() and not gemini.quota_blocked()
@@ -717,7 +719,7 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
                       for p in flow for item in ((p["explanation"] or {}).get("unverified") or [])]
         review_status["unverified"] = len(unverified)
         if unreviewed and gemini.rate_limited():
-            review_status.update(reason="rate_limited", message="Some AI reviews could not finish because the AI's temporary limit was reached. This score is provisional; try scanning again later.")
+            review_status.update(reason="rate_limited", message="Some AI reviews could not finish. This score is provisional; try scanning again later.")
         synthesis = {"summary": await explain_summary(flow, findings),
                      "strongest_pair": pair_pointer(max(scored, key=lambda p: p["pair_score"])) if scored else None,
                      "weakest_pair": pair_pointer(min(scored, key=lambda p: p["pair_score"])) if scored else None,

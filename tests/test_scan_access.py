@@ -1,3 +1,4 @@
+import pytest
 import json
 import asyncio
 from copy import deepcopy
@@ -150,6 +151,7 @@ def test_scan_provision_keeps_zero_balance_and_rate_limit(monkeypatch):
         raise AssertionError("scan debit must not run")
 
     monkeypatch.setattr(main, "_check_scan_rate_limit", check)
+    monkeypatch.setattr(main, "quota_reached", lambda: False)   # an earlier test may have left the shared AI quota state blocked
     monkeypatch.setattr(main.DatabasePersistenceService, "get_client", DB)
     monkeypatch.setattr(main.credits_service, "get_balance", balance)
     monkeypatch.setattr(main.credits_service, "debit_scan_credit", forbidden)
@@ -260,3 +262,21 @@ def test_real_scan_response_serializes_current_and_legacy_locked_sections():
         unlocked = main.ScanResponse.model_validate(locked_scan_view(full)).model_dump_json()
         assert "withheld paragraph" in unlocked
         assert ("withheld cell" in unlocked) is current
+
+
+def test_no_scan_starts_while_the_ai_has_no_quota_left(monkeypatch):
+    """Mandatory rule: nothing is saved and nothing starts; the person gets the plain message and stays on the confirm step."""
+    async def allowed(user):
+        return None
+
+    monkeypatch.setattr(main, "_check_scan_rate_limit", allowed)
+    monkeypatch.setattr(main, "quota_reached", lambda: True)
+    monkeypatch.setattr(main.DatabasePersistenceService, "get_client", lambda: (_ for _ in ()).throw(AssertionError("no row may be created")))
+    with pytest.raises(main.HTTPException) as refused:
+        asyncio.run(main._provision_analysis_run(main.ScanRequest(user_id="owner")))
+    assert refused.value.status_code == 503 and refused.value.detail == main.AI_LIMIT_MESSAGE
+
+
+def test_a_scan_stopped_by_the_ai_limit_is_reported_with_the_plain_message():
+    assert main._failure_message("abcdef123456", main.AIQuotaReached()) == main.AI_LIMIT_MESSAGE
+    assert main._safe_refusal(main.AI_LIMIT_MESSAGE)

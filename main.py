@@ -37,7 +37,7 @@ from services.section_cache import SectionCache
 from services.v7_scan import (comparable_sections, merge_repeated_sections, manuscript_preview_sections, assemble_flow, explain_flow,
                               four_part_score, manuscript_score, band, MIN_SECTION_WORDS)
 from services.reference_parser import extract_intext_citations
-from services.gemini import scan_context, scan_status_message
+from services.gemini import scan_context, scan_status_message, AIQuotaReached, AI_LIMIT_MESSAGE, quota_reached
 from services.gemini import scan_user
 from services.manuscript_title import derive_title
 from services.scan_access import locked_scan_view, scan_view
@@ -140,6 +140,11 @@ async def _read_upload(file: UploadFile, message: str) -> bytearray:
 @app.get("/")
 def read_root():
     return {"status": "Resync FastAPI Server is Live!"}
+
+@app.exception_handler(AIQuotaReached)
+async def _ai_quota_reached(request, exc):
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": str(exc)})
+
 
 class NotAResearchPaper(HTTPException):
     """The document has no research-paper structure, so it is not scanned (and nothing is charged)."""
@@ -659,6 +664,9 @@ async def _provision_analysis_run(req: ScanRequest, default_source_name: Optiona
     Returns (analysis_run_id, manuscript_id, credits_remaining).
     """
     await _check_scan_rate_limit(req.user_id)
+    if quota_reached():   # mandatory: no scan starts while the AI has no quota left, so the person stays on the confirm step
+        logger.info("Scan refused: the AI has no quota left")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AI_LIMIT_MESSAGE)
 
     analysis_run_id = str(uuid.uuid4())
     try:
@@ -1033,7 +1041,7 @@ async def _mark_failed(scan_id: str, message: str) -> None:
 
 
 def _safe_refusal(message: str) -> bool:
-    return message in (NOT_A_PAPER_MESSAGE, DOCX_COMPLEX_MESSAGE) or message.startswith((
+    return message in (NOT_A_PAPER_MESSAGE, DOCX_COMPLEX_MESSAGE, AI_LIMIT_MESSAGE) or message.startswith((
         "Google Doc not found.", "Unable to open the document.", "Unable to access document.",
         "Document access restricted.", "Invalid Google Docs URL format.",
         "The submitted Google Doc appears to be empty.", "The uploaded document appears to be empty",
@@ -1045,6 +1053,8 @@ def _safe_refusal(message: str) -> bool:
 def _failure_message(scan_id: str, exc: BaseException) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return TIMEOUT_MESSAGE
+    if isinstance(exc, AIQuotaReached):
+        return AI_LIMIT_MESSAGE
     if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
         detail = re.sub(r"^\d{3}:\s*", "", exc.detail)
         if _safe_refusal(detail):
