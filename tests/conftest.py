@@ -24,3 +24,12 @@ def the_ai_quota_state_is_not_shared_between_tests():
     gemini._quota_blocked_until.clear()
     gemini.LIMITER.rate_limited.clear()
     gemini._requests.clear()
+
+
+@pytest.fixture(autouse=True)
+def tests_never_see_the_real_gemini_keys(monkeypatch):
+    """The developer's .env holds real keys. A test that forgets to fake the AI would send real requests, spend the quota and wait
+    through Google's retries, so no test sees a key unless it sets one itself (test_gemini_retry does)."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY_FALLBACK", "GEMINI_API_KEY_FALLBACK_2"):
+        monkeypatch.delenv(name, raising=False)
+

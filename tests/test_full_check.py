@@ -357,3 +357,53 @@ def test_a_paper_of_many_small_sections_is_read_in_few_requests_and_still_compar
     assert result.stats["state"] == "ran" and result.stats["chunks_read"] == result.stats["chunks_total"] == 18
     candidates, _ = result
     assert len(candidates) == 1 and {candidates[0]["a"]["section"], candidates[0]["b"]["section"]} == {"part 3", "part 15"}
+
+
+def _busy_paper():
+    return [{"name": f"part {i}", "text": f"Part {i} describes the study. " * 8} for i in range(12)]
+
+
+def test_a_busy_model_is_asked_a_few_times_not_dozens_and_the_check_stops_asking_after_three_failed_reads(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)          # one read per section: 12 reads
+    monkeypatch.setattr(full_check, "CONCURRENCY", 1)          # one at a time, so the breaker can count
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    calls = []
+
+    async def busy(prompt, max_tokens=None):
+        calls.append(1)
+        raise RuntimeError('{"error": {"code": 503, "message": "This model is currently experiencing high demand.", "status": "UNAVAILABLE"}}')
+
+    monkeypatch.setattr(v7_explain, "_generate", busy)
+    result = asyncio.run(full_check._prepare(_busy_paper()))
+    assert len(calls) == full_check.GIVE_UP_AFTER * full_check.ASK_ATTEMPTS   # 3 reads x 3 tries, then nothing more (it was 12 reads x 5 tries)
+    assert result.gave_up is True and result.stats["state"] == "failed" and result.stats["chunks_read"] == 0   # reported as not read
+
+
+def test_a_read_that_gets_through_resets_the_count_and_no_extra_pass_follows_a_give_up(monkeypatch):
+    monkeypatch.setenv("FULL_CHECK", "on")
+    monkeypatch.setattr(full_check, "CHUNK_CHARS", 1)
+    monkeypatch.setattr(full_check, "CONCURRENCY", 1)
+    monkeypatch.setattr(full_check.asyncio, "sleep", _no_pause)
+    calls = []
+
+    async def flaky(prompt, max_tokens=None):
+        calls.append(1)
+        if len(calls) % (full_check.ASK_ATTEMPTS + 1) != 0:   # every fourth request answers, the three before it fail
+            raise RuntimeError("busy")
+        return {"facts": []}
+
+    monkeypatch.setattr(v7_explain, "_generate", flaky)
+    result = asyncio.run(full_check._prepare(_busy_paper()))
+    assert result.gave_up is False   # a success between failures keeps the check going
+
+    sections, passes = _busy_paper(), []
+
+    async def always_busy(prompt, max_tokens=None):
+        passes.append(1)
+        raise RuntimeError("busy")
+
+    monkeypatch.setattr(v7_explain, "_generate", always_busy)
+    status = {}
+    assert asyncio.run(full_check.apply_full_check(_flow(sections[:2]), sections, status=status)) == 0
+    assert len(passes) == full_check.GIVE_UP_AFTER * full_check.ASK_ATTEMPTS   # no extra passes after giving up

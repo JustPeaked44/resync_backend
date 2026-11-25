@@ -36,6 +36,8 @@ VERSION = "1"                      # bump when the prompts below change, so reme
 CHUNK_CHARS = int(os.getenv("FULL_CHECK_CHUNK_CHARS", "12000"))
 MAX_CHUNK_CALLS = int(os.getenv("FULL_CHECK_MAX_CALLS", "10"))   # reading requests for a whole paper; pieces are packed to fit (see pack_jobs)
 PACK_MAX_CHARS = 80_000            # the most text one reading request may carry
+ASK_ATTEMPTS = int(os.getenv("FULL_CHECK_ATTEMPTS", "3"))   # tries per request; the transport already retried each one, so more only hammers a busy model
+GIVE_UP_AFTER = 3                  # reads that fail for a reason that is not the text (busy model, network) before the check stops asking
 CONCURRENCY = int(os.getenv("FULL_CHECK_CONCURRENCY", "6"))
 MAX_FACTS_PER_CHUNK = 30
 LEDGER_SPLIT_CHARS = 120_000       # a longer list of statements is compared in two calls
@@ -164,7 +166,7 @@ async def _ask(prompt: str, label: str) -> Optional[Dict[str, Any]]:
     """Ask up to five times, keeping malformed answers distinct from transient failures."""
     _failure_kind.set(None)
     waited = 0.0
-    tries = len(ASK_PAUSES) + 1
+    tries = min(len(ASK_PAUSES) + 1, ASK_ATTEMPTS)
     for attempt in range(1, tries + 1):
         try:
             with gemini.purpose("whole-paper"):
@@ -426,7 +428,7 @@ async def apply_full_check(flow: List[Dict[str, Any]], sections: List[Dict[str, 
         stats = getattr(found, "stats", None)
         deadline = time.monotonic() + EXTRA_TIME_BUDGET
         for pause in EXTRA_PASS_PAUSES:
-            if not stats or stats["state"] == "ran":
+            if not stats or stats["state"] == "ran" or getattr(found, "gave_up", False):
                 break
             remaining = deadline - time.monotonic()
             if remaining <= pause:
@@ -474,7 +476,7 @@ def _outcome(run: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str,
 async def _prepare(sections: List[Dict[str, Any]], announce: bool = True):
     """Everything that needs the AI: (candidates, confirmed) plus .stats on what was really checked. It does not touch the report,
     so it can run early."""
-    run = {"failed": set(), "chunks_total": 0, "chunks_failed": 0, "compared": False}
+    run = {"failed": set(), "chunks_total": 0, "chunks_failed": 0, "compared": False, "transient_reads": 0, "gave_up": False}
     token = _run.set(run)
     try:
         candidates, confirmed = await _read_and_compare(sections, announce, run)
@@ -482,6 +484,7 @@ async def _prepare(sections: List[Dict[str, Any]], announce: bool = True):
         _run.reset(token)
     result = Prepared((candidates, confirmed))
     result.stats = _outcome(run, candidates)
+    result.gave_up = run["gave_up"]   # the AI kept failing: another pass would only repeat it
     return result
 
 
@@ -511,6 +514,9 @@ async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run:
 
     async def read(group):
         async with gate:
+            if run["gave_up"]:   # the model keeps failing: the rest is not asked, and is reported as not read
+                run["chunks_failed"] += len(group)
+                return None
             if len(group) == 1:
                 found, lost = await read_single(group[0])
             else:
@@ -521,6 +527,13 @@ async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run:
                     found = [fact for part, _ in singles for fact in (part or [])] if any(part is not None for part, _ in singles) else None
                     lost = any(failed for _, failed in singles)
             run["chunks_failed"] += len(group) if lost else 0
+            if lost and _failure_kind.get() == "transient":
+                run["transient_reads"] += 1
+                if run["transient_reads"] >= GIVE_UP_AFTER and not run["gave_up"]:
+                    run["gave_up"] = True
+                    logger.warning("Full check stopped asking: %s reads in a row failed because the AI could not answer", run["transient_reads"])
+            elif not lost:
+                run["transient_reads"] = 0
             return found
 
     results = await asyncio.gather(*(read(group) for group in groups), return_exceptions=True)
