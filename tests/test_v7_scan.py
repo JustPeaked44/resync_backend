@@ -594,3 +594,29 @@ def test_the_scan_log_says_how_the_pairs_were_graded_and_how_much_advice_was_kep
         _, recommendations, _ = asyncio.run(explain_flow(sections, flow))
     line = next(record.getMessage() for record in caplog.records if "pair review" in record.getMessage())
     assert "Moderate 2" in line and "advice offered for serious pairs 2, kept 0" in line and recommendations == []
+
+
+def test_a_contradiction_found_by_the_whole_paper_check_never_raises_another_category():
+    from services import full_check
+    sections = [{"name": f"Part {i}", "text": f"Part {i} describes the study."} for i in range(4)]
+    flow = assemble_flow(sections, [
+        {"index_a": a, "index_b": b, "scores": {**{key: 0.9 for key in v7_scan.DIMENSIONS}, "overall_coherence": 0.9,
+                                                "pair_weight": 1.0}} for a, b in ((0, 1), (0, 2))])
+    for pair, dimension in zip(flow, ("none", "claim_support")):
+        pair["severity"], pair["failed_dimension"] = ("None" if dimension == "none" else "Critical"), dimension
+    before_overall, before = manuscript_score(flow)
+    model_only = four_part_score(flow)
+
+    side = lambda i: {"index": i, "section": sections[i]["name"], "quote": sections[i]["text"], "statement": "states it"}
+    conflict = {"a": side(0), "b": side(3), "category": "objectives", "what": "They disagree", "why": "They disagree."}
+    conflict["fix"] = conflict["b"]
+    added = full_check._ensure_pair(flow, sections, 0, 3)
+    full_check._add_finding(added, sections, conflict, "Critical", None)
+    added["severity"], added["failed_dimension"] = added["explanation"]["severity"], added["explanation"]["failed_dimension"]
+    overall, after = manuscript_score(flow)
+
+    assert after["context_alignment"]["score"] < before["context_alignment"]["score"]
+    for name in ("operational_alignment", "logical_support", "evidence_consistency"):
+        assert after[name] == before[name]
+    assert overall <= before_overall
+    assert four_part_score(flow) == model_only   # a pair the model never rated adds nothing to the model's own figures

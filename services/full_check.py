@@ -367,6 +367,9 @@ def _ensure_pair(flow: List[Dict[str, Any]], sections: List[Dict[str, Any]], i: 
     raw = {"index_a": i, "index_b": j, "scores": {**ratings, "overall_coherence": 0.8, "pair_weight": 1.0},
            "culprits_a": [], "culprits_b": []}
     pair = assemble_flow(sections, [raw])[0]
+    # The model never rated this pair and nobody checked it in the other categories (the ratings above are placeholders),
+    # so only the category its contradiction is charged to counts it: see manuscript_score.
+    pair["found_by_full_check"] = True
     pair["order"] = max((p["order"] for p in flow), default=0) + 1
     flow.append(pair)
     return pair

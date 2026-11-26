@@ -85,7 +85,7 @@ def calibrate(raw):
 
 def four_part_score(pairs):
     # The API score does not read v7_logic.calculate_manuscript_score's raw worker output.
-    scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None]
+    scored = [p for p in pairs if p["scores"]["overall_coherence"] is not None and not p.get("found_by_full_check")]
     values = {key: [calibrate(p["scores"][key]) for p in scored
                     if key != "numeric_consistency" or p["numeric_applicable"]] for key in DIMENSIONS}
     applicable = sum(bool(items) for items in values.values())
@@ -172,6 +172,10 @@ def manuscript_score(pairs, transitions=None):
         for p in scored:
             rating = p["scores"].get(key)
             if rating is None or (key == "numeric_consistency" and not p.get("numeric_applicable", True)):
+                continue
+            # A pair only the whole-paper check found is a check in the one category it contradicts, never a free pass in
+            # the others: otherwise finding one more contradiction raised the other categories.
+            if p.get("found_by_full_check") and p.get("failed_dimension") != key:
                 continue
             severity, neighbors = p.get("severity"), p.get("adjacent", True) is not False
             kind = counts["flow" if neighbors else "cross"]
@@ -721,7 +725,7 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
             pair["severity"] = explanation["severity"] if explanation else ("None" if overall >= RECOMMENDATION_THRESHOLD else None)
             pair["failed_dimension"] = explanation["failed_dimension"] if explanation else ("none" if overall >= RECOMMENDATION_THRESHOLD else None)
         findings, recommendations = flatten_explanations(flow, sections)
-        scored = [p for p in flow if p["pair_score"] is not None]
+        scored = [p for p in flow if p["pair_score"] is not None and not p.get("found_by_full_check")]   # model-rated pairs only
         unreviewed = sum(1 for p in flow if p["scores"]["overall_coherence"] is not None and p["severity"] is None)
         # Why a report has the recommendations it has: how the AI graded the pairs, and how many pieces of advice it offered against how
         # many were kept. A report with none then says whether the AI found nothing, found only small things, or offered advice that
