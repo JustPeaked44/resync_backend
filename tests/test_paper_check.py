@@ -25,6 +25,27 @@ def test_filler_and_everyday_documents_are_refused(text):
     assert not result["ok"] and result["reason"] == "no_paper_structure"
 
 
+def _sections(*headings, body=SECTION):
+    return "\n".join(f"{heading}\n{body}" for heading in headings)
+
+
+def test_a_study_guide_with_research_sounding_headings_is_refused():
+    text = _sections("System Architecture", "Findings, Evidence and Verification Rules",
+                     "What Makes a Recommendation Credible", "Honest Limitations")
+    result = _check(text)
+    assert not result["ok"] and result["reason"] == "no_paper_structure"
+
+
+def test_a_proposal_with_its_first_three_chapters_is_accepted():
+    assert _check(_sections("Introduction", "Related Literature", "Methodology"))["ok"]
+
+
+def test_a_questionnaire_is_refused():
+    questions = "How often do you study the data from your research?\n" * 15
+    result = _check(_sections("Objectives", "Methodology", "Results", "Conclusion", body=SECTION + "\n" + questions))
+    assert not result["ok"] and result["reason"] == "questionnaire"
+
+
 def test_a_tiny_document_is_refused():
     assert _check("Introduction\nHello.\nMethodology\nWorld.")["reason"] == "too_short"
 
@@ -37,16 +58,85 @@ def _docx(body: str) -> bytes:
     return buf.getvalue()
 
 
-def test_a_scanned_docx_is_named_as_a_scan():
-    from services.paper_check import SCANNED_MESSAGE, docx_layout_problem
-    assert docx_layout_problem(_docx("<w:p><w:r><w:drawing/></w:r></w:p>"), 5) == SCANNED_MESSAGE
+PICTURE = "<w:p><w:r><w:drawing/></w:r></w:p>"
+TWO_COLUMNS = '<w:sectPr><w:cols w:num="2" w:space="720"/></w:sectPr>'
+ENGLISH = ("This study examines how the students of the university manage their time and what this means for their "
+           "grades in the courses that they take during the year. ") * 20
+SPANISH = ("La presente investigación tiene como objetivo determinar la incidencia de la propiedad, planta y equipo en "
+           "los resultados económicos de las empresas de la región durante el año. ") * 20
+BULLETS = ("Skills Python Java SQL network support hardware repair customer service teamwork leadership. "
+           "Experience technician intern at the campus help desk. ") * 15
+POLISH = "Celem niniejszej pracy jest analiza wyników finansowych przedsiębiorstw działających w regionie. " * 20
+RUSSIAN = "Настоящее исследование посвящено анализу финансовых результатов предприятий региона. " * 20
+BECAUSE = "Could not read this document because "
 
 
-def test_a_two_column_docx_is_named_as_two_columns():
-    from services.paper_check import TWO_COLUMN_MESSAGE, docx_layout_problem
-    assert docx_layout_problem(_docx('<w:sectPr><w:cols w:num="2" w:space="720"/></w:sectPr>'), 900) == TWO_COLUMN_MESSAGE
+@pytest.mark.parametrize("found, reason", [
+    ({"language": True}, "this language is unsupported."),
+    ({"two_columns": True}, "it contains a two-column structure."),
+    ({"scanned": True}, "it is a scanned file."),
+    ({"handwritten": True}, "it is a handwritten file."),
+    ({"language": True, "two_columns": True}, "it contains an unsupported language and a two-column structure."),
+    ({"scanned": True, "language": True}, "it is a scanned file and contains an unsupported language."),
+    ({"scanned": True, "two_columns": True}, "it is a scanned file and contains a two-column structure."),
+    ({"handwritten": True, "language": True}, "it is a handwritten file and contains an unsupported language."),
+    ({"handwritten": True, "two_columns": True}, "it is a handwritten file and contains a two-column structure."),
+    ({"scanned": True, "handwritten": True}, "it is a scanned and handwritten file."),
+    ({"scanned": True, "handwritten": True, "language": True, "two_columns": True},
+     "it is a scanned and handwritten file and contains an unsupported language and a two-column structure."),
+])
+def test_every_combination_has_its_own_sentence(found, reason):
+    from services.paper_check import unreadable_message
+    assert unreadable_message(**found) == BECAUSE + reason
 
 
-def test_a_plain_docx_has_no_layout_problem():
-    from services.paper_check import docx_layout_problem
-    assert docx_layout_problem(_docx('<w:p/><w:sectPr><w:cols w:space="720"/></w:sectPr>'), 900) is None
+def test_no_reason_means_no_message():
+    from services.paper_check import unreadable_message
+    assert unreadable_message() is None
+
+
+@pytest.mark.parametrize("text, unsupported", [(ENGLISH, False), (SPANISH, True), (RUSSIAN, True), (POLISH, True),
+                                               (BULLETS, False), ("Hola mundo.", False)])
+def test_only_writing_that_is_clearly_not_english_is_unsupported(text, unsupported):
+    from services.paper_check import unsupported_language
+    assert unsupported_language(text) is unsupported
+
+
+def _problem(body, text, paper_ok, seen=None, monkeypatch=None):
+    import asyncio
+    from services import page_check
+    from services.paper_check import document_problem
+    if monkeypatch:
+        async def read(_data):
+            return seen
+        monkeypatch.setattr(page_check, "read_pictures", read)
+    return asyncio.run(document_problem(_docx(body), text, paper_ok))
+
+
+def test_a_spanish_two_column_paper_names_both():
+    assert _problem(TWO_COLUMNS, SPANISH, False) == BECAUSE + "it contains an unsupported language and a two-column structure."
+
+
+def test_another_language_is_refused_even_when_the_structure_passes():
+    assert _problem("<w:p/>", SPANISH, True) == BECAUSE + "this language is unsupported."
+
+
+def test_two_columns_alone_are_refused_only_when_the_paper_check_failed():
+    assert _problem(TWO_COLUMNS, ENGLISH, False) == BECAUSE + "it contains a two-column structure."
+    assert _problem(TWO_COLUMNS, ENGLISH, True) is None
+
+
+def test_a_plain_english_docx_has_no_problem():
+    assert _problem('<w:p/><w:sectPr><w:cols w:space="720"/></w:sectPr>', ENGLISH, False) is None
+    assert _problem(PICTURE, ENGLISH, True) is None
+
+
+@pytest.mark.parametrize("seen, reason", [
+    (None, "it is a scanned file."),                                    # the pictures could not be looked at
+    ({"scanned_print": True}, "it is a scanned file."),
+    ({"handwritten": True}, "it is a handwritten file."),
+    ({"handwritten": True, "non_english": True, "two_columns": True},
+     "it is a handwritten file and contains an unsupported language and a two-column structure."),
+])
+def test_a_picture_document_says_what_the_pictures_show(monkeypatch, seen, reason):
+    assert _problem(PICTURE, "", False, seen, monkeypatch) == BECAUSE + reason

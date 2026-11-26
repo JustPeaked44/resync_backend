@@ -26,7 +26,8 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES, DOCX_COMPLEX_MESSAGE
-from services.paper_check import NOT_A_PAPER_MESSAGE, check_research_paper, docx_layout_problem
+from services.paper_check import (NOT_A_PAPER_MESSAGE, UNREADABLE_PREFIX, check_research_paper, document_problem,
+                                  is_picture_document)
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT, DISCARDED_MESSAGE
@@ -161,13 +162,13 @@ async def _ai_quota_reached(request, exc):
 
 
 class NotAResearchPaper(HTTPException):
-    """The document has no research-paper structure, so it is not scanned (and nothing is charged)."""
+    """The document cannot be scanned (no research-paper structure, or it cannot be read), and nothing is charged."""
 
-    def __init__(self) -> None:
-        super().__init__(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=NOT_A_PAPER_MESSAGE)
+    def __init__(self, message: str = NOT_A_PAPER_MESSAGE) -> None:
+        super().__init__(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
 
     def __str__(self) -> str:
-        return NOT_A_PAPER_MESSAGE
+        return self.detail
 
 
 def _scan_concurrency() -> int:
@@ -809,7 +810,12 @@ async def _execute_scan_pipeline(
         logger.info("Scan %s reused the saved sections of manuscript %s", analysis_run_id, cached["manuscript_id"])
     elif payload:
         fname = filename or req.filename or req.doc_url or "document.docx"
-        raw_text, source_records = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname, include_metadata=True)
+        try:
+            raw_text, source_records = await DocumentIngestionService.extract_plaintext_from_upload(payload, fname, include_metadata=True)
+        except HTTPException:
+            if not is_picture_document(payload):    # a file of page pictures only has no text: say what it is instead
+                raise
+            raise NotAResearchPaper(await document_problem(payload, "", False))
     elif req.doc_url and ("docs.google.com" in req.doc_url or req.doc_url.startswith("http")):
         raw_text = await google_doc_text(req.doc_url)
         # The link had to be fetched, but if its text is unchanged it can still skip the parser.
@@ -839,6 +845,10 @@ async def _execute_scan_pipeline(
         )
     source_records = None
     paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
+    problem = await document_problem(payload, raw_text, paper["ok"])
+    if problem:
+        logger.info("Scan %s refused: the document cannot be read", analysis_run_id)
+        raise NotAResearchPaper(problem)
     if not paper["ok"]:
         logger.info("Scan %s refused: not a research paper (%s)", analysis_run_id, paper["reason"])
         raise NotAResearchPaper()
@@ -1077,6 +1087,7 @@ def _safe_refusal(message: str) -> bool:
         "The submitted Google Doc appears to be empty.", "The uploaded document appears to be empty",
         "Unsupported file format.", "No valid manuscript provided.", "Invalid base64 encoding",
         "This Google Doc is too large", "This Google Doc is larger", "Document is too large to process",
+        UNREADABLE_PREFIX,
     ))
 
 
@@ -2074,9 +2085,15 @@ async def manuscript_outline(
     doc_url: Optional[str] = Form(None),
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> OutlineResponse:
+    data = None
     if file is not None:
         data = await _read_upload(file, "This file is larger than 25 MB.")
-        raw_text = await DocumentIngestionService.extract_plaintext_from_upload(data, file.filename or "uploaded.docx")
+        try:
+            raw_text = await DocumentIngestionService.extract_plaintext_from_upload(data, file.filename or "uploaded.docx")
+        except HTTPException:
+            if not is_picture_document(data):
+                raise
+            raw_text = ""      # only page pictures: the outline answers with what is wrong instead of failing
     elif doc_url and doc_url.startswith("http"):
         # The same link is often asked about twice (when it is pasted and again on the confirm step): remember it briefly.
         _outline_cache_prune(time.time())
@@ -2107,8 +2124,9 @@ async def manuscript_outline(
         excerpt=[line[:420] for line in paragraphs[1:7]],
     )
     paper = check_research_paper(raw_text, parsed)
-    response.looks_like_paper = paper["ok"]
-    response.paper_problem = None if paper["ok"] else ((docx_layout_problem(data, words) if file is not None else None) or NOT_A_PAPER_MESSAGE)
+    problem = await document_problem(data, raw_text, paper["ok"])
+    response.looks_like_paper = paper["ok"] and not problem
+    response.paper_problem = problem or (None if paper["ok"] else NOT_A_PAPER_MESSAGE)
     if file is None and doc_url:
         now = time.time()
         _outline_cache_prune(now)
