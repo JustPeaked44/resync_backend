@@ -65,6 +65,44 @@ def check_research_paper(raw_text: str, parse_result: Optional[Dict[str, Any]], 
 
 UNREADABLE_PREFIX = "Could not read this document because "
 
+_HEADING_NUMBER = re.compile(r"^(?:chapter\s+(?:\d+|[ivxl]+|one|two|three|four|five|six|seven)\b[\s.:\-]*|(?:\d+(?:\.\d+)*[.)]?|[ivxl]+[.)])\s+)", re.I)
+_HEADING_SKIP = frozenset(("the", "of", "and", "a", "an"))
+MAX_HEADING_LINE_WORDS = 25
+MIN_TEMPLATE_HEADINGS = 3      # fewer are too few to say a paper does not follow them
+# Measured on real theses against school templates: papers written to a template had 66% or more of its headings,
+# other papers 57% or less (unrelated ones under 15%).
+MIN_TEMPLATE_SHARE = 0.60
+
+
+def _heading_key(line: str) -> str:
+    """A heading reduced to its telling words, so numbering, capitals, plurals and "the/of/and" do not matter."""
+    text = _HEADING_NUMBER.sub("", (line or "").strip().lower())
+    text = re.sub(r"(?:\t|\.{3,}|\s{3,})\s*(?:\d+|[ivxl]+)\s*$", "", text)     # a page number in a contents list
+    words = [word for word in re.findall(r"[^\W_]+", text) if word not in _HEADING_SKIP]
+    return " ".join(word[:-1] if len(word) > 3 and word.endswith("s") else word for word in words)
+
+
+def template_matches(raw_text: str, template_toc) -> Tuple[int, int]:
+    """(how many of the template's headings stand as headings in the manuscript, how many the template has).
+    "References" is left out: the web app adds it to every template and nearly every paper has it."""
+    wanted = {_heading_key(heading) for heading in (template_toc or []) if isinstance(heading, str)}
+    wanted -= {"", _heading_key("References")}
+    lines = {_heading_key(cell) for line in (raw_text or "").splitlines() for cell in [line, *line.split(" | ")]
+             if len(cell.split()) <= MAX_HEADING_LINE_WORDS}
+    lines.discard("")
+    found = sum(1 for key in wanted if key in lines or any(line.startswith(key + " ") for line in lines))
+    return found, len(wanted)
+
+
+def template_problem(raw_text: str, template_toc) -> Optional[str]:
+    """Why the manuscript cannot be scanned with this template: it was not written to it. None when it was, or when
+    there is no template (or one too short to judge by)."""
+    found, total = template_matches(raw_text, template_toc)
+    if total < MIN_TEMPLATE_HEADINGS or found >= total * MIN_TEMPLATE_SHARE:
+        return None
+    return (f"{UNREADABLE_PREFIX}it does not match the uploaded template: only {found} of the template's {total} headings "
+            "are in the manuscript. Upload the manuscript written with this template, or change the template.")
+
 
 def unreadable_message(scanned: bool = False, handwritten: bool = False, language: bool = False,
                        two_columns: bool = False) -> Optional[str]:

@@ -27,7 +27,7 @@ load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES, DOCX_COMPLEX_MESSAGE
 from services.paper_check import (NOT_A_PAPER_MESSAGE, UNREADABLE_PREFIX, check_research_paper, document_problem,
-                                  is_picture_document)
+                                  is_picture_document, template_problem)
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
 from services.db_service import DatabasePersistenceService, RUN_TABLE, RUN_ID, RUN_STATUS, RUN_ERROR, RUN_CREATED, RUN_RESULT, DISCARDED_MESSAGE
@@ -845,9 +845,9 @@ async def _execute_scan_pipeline(
         )
     source_records = None
     paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
-    problem = await document_problem(payload, raw_text, paper["ok"])
+    problem = await document_problem(payload, raw_text, paper["ok"]) or template_problem(raw_text, req.template_toc)
     if problem:
-        logger.info("Scan %s refused: the document cannot be read", analysis_run_id)
+        logger.info("Scan %s refused: the document cannot be read or does not follow the template", analysis_run_id)
         raise NotAResearchPaper(problem)
     if not paper["ok"]:
         logger.info("Scan %s refused: not a research paper (%s)", analysis_run_id, paper["reason"])
@@ -2070,6 +2070,15 @@ class OutlineResponse(BaseModel):
     paper_problem: Optional[str] = None
 
 
+def _template_headings(template_toc: Optional[str]) -> List[str]:
+    """The headings sent as a JSON array; an empty list when none or unreadable."""
+    try:
+        value = json.loads(template_toc) if isinstance(template_toc, str) and template_toc else []
+    except ValueError:
+        return []
+    return [item for item in value if isinstance(item, str)][:500] if isinstance(value, list) else []
+
+
 @app.post(
     "/api/manuscripts/outline",
     response_model=OutlineResponse,
@@ -2083,8 +2092,10 @@ class OutlineResponse(BaseModel):
 async def manuscript_outline(
     file: Optional[UploadFile] = File(None, description="Word document"),
     doc_url: Optional[str] = Form(None),
+    template_toc: Optional[str] = Form(None, description="Optional JSON array string of template headings to compare against"),
     authenticated_user_id: str = Depends(get_authenticated_user_id),
 ) -> OutlineResponse:
+    headings = _template_headings(template_toc)
     data = None
     if file is not None:
         data = await _read_upload(file, "This file is larger than 25 MB.")
@@ -2098,7 +2109,7 @@ async def manuscript_outline(
         # The same link is often asked about twice (when it is pasted and again on the confirm step): remember it briefly.
         _outline_cache_prune(time.time())
         cached = _outline_cache.get(doc_url)
-        if cached and time.time() - cached[0] < OUTLINE_CACHE_SECONDS:
+        if cached and time.time() - cached[0] < OUTLINE_CACHE_SECONDS and not headings:
             return cached[1]
         try:
             raw_text = await asyncio.wait_for(google_doc_text(doc_url), timeout=OUTLINE_FETCH_SECONDS)
@@ -2124,10 +2135,10 @@ async def manuscript_outline(
         excerpt=[line[:420] for line in paragraphs[1:7]],
     )
     paper = check_research_paper(raw_text, parsed)
-    problem = await document_problem(data, raw_text, paper["ok"])
+    problem = await document_problem(data, raw_text, paper["ok"]) or template_problem(raw_text, headings)
     response.looks_like_paper = paper["ok"] and not problem
     response.paper_problem = problem or (None if paper["ok"] else NOT_A_PAPER_MESSAGE)
-    if file is None and doc_url:
+    if file is None and doc_url and not headings:   # an answer about one template must not be reused for another
         now = time.time()
         _outline_cache_prune(now)
         _outline_cache.pop(doc_url, None)

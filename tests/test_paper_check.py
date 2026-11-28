@@ -46,6 +46,36 @@ def test_a_questionnaire_is_refused():
     assert not result["ok"] and result["reason"] == "questionnaire"
 
 
+TEMPLATE = ["Rationale of the Study", "Objectives of the Study", "Scope and Limitations", "Related Literature",
+            "Research Design", "References"]
+
+
+def test_a_manuscript_written_to_the_template_matches_however_its_headings_are_numbered():
+    from services.paper_check import template_matches, template_problem
+    text = _sections("CHAPTER I", "1.1 RATIONALE OF THE STUDY", "Objective of Study", "Scope and Limitation",
+                     "2.1 Related Literature")
+    assert template_matches(text, TEMPLATE) == (4, 5)      # "References" is not counted
+    assert template_problem(text, TEMPLATE) is None
+
+
+def test_a_manuscript_written_to_another_template_is_refused():
+    from services.paper_check import template_problem
+    problem = template_problem(_sections("Abstract", "Introduction", "Methods", "Related Literature", "Conclusion"), TEMPLATE)
+    assert problem.startswith("Could not read this document because it does not match the uploaded template: only 1 of")
+
+
+def test_headings_only_mentioned_inside_sentences_do_not_count():
+    from services.paper_check import template_matches
+    text = "The rationale of the study and its research design are described by the writer in a long sentence. " * 30
+    assert template_matches(text, TEMPLATE)[0] == 0
+
+
+def test_no_template_or_a_very_short_one_refuses_nothing():
+    from services.paper_check import template_problem
+    assert template_problem(SECTION, None) is None
+    assert template_problem(SECTION, ["Introduction", "References"]) is None
+
+
 def test_a_tiny_document_is_refused():
     assert _check("Introduction\nHello.\nMethodology\nWorld.")["reason"] == "too_short"
 
