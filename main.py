@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from services.ingestion import DocumentIngestionService, looks_like_html_document, bounded_download, MAX_UPLOAD_BYTES, READ_CHUNK_BYTES, DOCX_COMPLEX_MESSAGE
-from services.paper_check import (NOT_A_PAPER_MESSAGE, UNREADABLE_PREFIX, check_research_paper, document_problem,
+from services.paper_check import (MIN_WORDS, NOT_A_PAPER_MESSAGE, UNREADABLE_PREFIX, check_research_paper, document_problem,
                                   is_picture_document, template_problem)
 from services.ml_client import ml_client
 from services.citation import CitationAuditService
@@ -841,7 +841,7 @@ async def _execute_scan_pipeline(
     # block the event loop, stalling concurrent status-poll requests.
     if parse_result is None:
         parse_result = await asyncio.to_thread(
-            ManuscriptParserService.parse_manuscript_sections, raw_text, req.template_toc, source_records
+            ManuscriptParserService.parse_for_scan, raw_text, req.template_toc, source_records
         )
     source_records = None
     paper = check_research_paper(raw_text, parse_result, has_template=bool(req.template_toc))
@@ -2214,6 +2214,37 @@ def slim_docx_bytes(data: bytes) -> bytes:
         return data
 
 
+def _pictures_to_keep(archive) -> set:
+    """A document with almost no typed text is made of its pictures (a scan or handwriting). The largest ones are kept, so
+    a link is told what is wrong with it the same way an uploaded file is (the web keeps the same ones for uploads)."""
+    from lxml import etree
+    from services.page_check import MAX_PICTURES, MAX_PICTURE_BYTES
+    word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    words, runs = 0, []
+    try:
+        with archive.open("word/document.xml") as stream:
+            for _, element in etree.iterparse(stream, tag=(word + "t", word + "p"), resolve_entities=False, no_network=True):
+                if element.tag == word + "t":
+                    runs.append(element.text or "")
+                else:
+                    words += len("".join(runs).split())
+                    runs = []
+                    if words >= MIN_WORDS:
+                        return set()
+                element.clear()
+    except (KeyError, etree.XMLSyntaxError):
+        return set()
+    keep, total = set(), 0
+    pictures = [item for item in archive.infolist()
+                if item.filename.lower().startswith("word/media/") and item.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+    for item in sorted(pictures, key=lambda item: item.file_size, reverse=True):
+        if len(keep) == MAX_PICTURES or total + item.file_size > MAX_PICTURE_BYTES:
+            continue
+        keep.add(item.filename)
+        total += item.file_size
+    return keep
+
+
 def _slim_download(source, size):
     import shutil
     import tempfile
@@ -2225,10 +2256,11 @@ def _slim_download(source, size):
         with zipfile.ZipFile(source) as archive:
             if not any(item.filename.lower().startswith("word/media/") and not item.filename.endswith("/") for item in archive.infolist()):
                 return None
+            keep = _pictures_to_keep(archive)
             with tempfile.TemporaryFile() as output:
                 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as target:
                     for item in archive.infolist():
-                        if item.filename.lower().startswith("word/media/") and not item.filename.endswith("/"):
+                        if item.filename.lower().startswith("word/media/") and not item.filename.endswith("/") and item.filename not in keep:
                             target.writestr(item.filename, _PLACEHOLDER_PNG)
                         else:
                             with archive.open(item) as reader, target.open(item.filename, "w") as writer:

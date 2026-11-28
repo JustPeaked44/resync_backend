@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from services.db_service import DatabasePersistenceService
@@ -18,8 +19,11 @@ from services.db_service import DatabasePersistenceService
 logger = logging.getLogger("resync.section_cache")
 
 TABLE = "manuscript"
-# Bump this when the parser changes what it finds, so rows saved by the old parser stop matching.
-CACHE_VERSION = "2"
+# Rows saved by a different parser stop matching: the version carries a fingerprint of the parser and ingestion code, so a
+# change to how papers are read can never be hidden behind an old saved split.
+_READERS = ("parser.py", "ingestion.py")
+CACHE_VERSION = "4-" + hashlib.sha256(b"".join(
+    Path(__file__).with_name(name).read_bytes().replace(b"\r\n", b"\n") for name in _READERS)).hexdigest()[:16]
 # Only these parts of a parse result are kept; they are everything a scan reads from it.
 PARSE_KEYS = ("parsed_sections", "section_order", "section_roles", "structure", "display_names", "section_blocks")
 

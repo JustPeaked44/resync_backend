@@ -169,6 +169,18 @@ class ManuscriptParserService:
     """
 
     @classmethod
+    def parse_for_scan(cls, text: str, template_toc: List[str] = None, source_records: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """How a scan splits a manuscript: the same way with or without a template, so the same paper gets the same sections,
+        the same saved AI verdicts, and so the same score and recommendations. A template only says whether the paper was
+        written to it (services/paper_check.template_problem); its headings split a paper only when the paper has no
+        headings of its own that can be found."""
+        if template_toc:
+            own = cls.parse_manuscript_sections(text, None, source_records)
+            if own.get("structure") != "split":
+                return own
+        return cls.parse_manuscript_sections(text, template_toc, source_records)
+
+    @classmethod
     def parse_manuscript_sections(
         cls,
         text: str,
@@ -268,6 +280,7 @@ class ManuscriptParserService:
             if listed:
                 front_end = i
         skip.update(range(front_end))   # everything before the end of the contents is front matter, not part of the study
+        skip.update(cls._typed_contents(lines))
         # shortcut: requires a standalone Chapter I and Introduction, expand for other layouts when observed.
         for toc in range(len(lines)):
             if not re.fullmatch(r"(?i)\s*(?:table of contents|contents)\s*", lines[toc]):
@@ -289,6 +302,27 @@ class ManuscriptParserService:
         if source_records:
             cls._attach_preview(result, source_records)
         return result
+
+    @staticmethod
+    def _typed_contents(lines: List[str]) -> range:
+        """The lines of a contents page typed with tabs, wide gaps or dot leaders before the page numbers, from its
+        "Table of Contents" title to the last numbered entry before the writing starts (lists of tables, figures and
+        appendices included). Read as text, those entries became sections of their own, and the scan then compared and gave
+        advice about contents lines. Empty when there is no such page."""
+        title = re.compile(r"(?i)^\s*(?:table\s+of\s+contents|contents)\s*$")
+        numbered = re.compile(r"(?i)(?:\t|\s{2,}|\.{3,}|…|\|)[\s.…]*(?:\d{1,3}|[ivxlc]{1,7})\s*\|?\s*$")
+        for start, line in enumerate(lines[: max(1, len(lines) * 2 // 5)]):
+            if not title.match(line):
+                continue
+            last, count = start, 0
+            for index in range(start + 1, len(lines)):
+                if numbered.search(lines[index]):
+                    last, count = index, count + 1
+                elif len(lines[index].split()) >= 25:      # a paragraph: the contents are over
+                    break
+            if count >= 5:
+                return range(start, last + 1)
+        return range(0)
 
     @staticmethod
     def _without_diagram_text(lines):

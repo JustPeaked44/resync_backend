@@ -170,3 +170,25 @@ def test_a_plain_english_docx_has_no_problem():
 ])
 def test_a_picture_document_says_what_the_pictures_show(monkeypatch, seen, reason):
     assert _problem(PICTURE, "", False, seen, monkeypatch) == BECAUSE + reason
+
+
+@pytest.mark.parametrize("template", [["Introduction", "Conclusion", "References"], ["THE PROBLEM", "Profile of the Respondents"],
+                                      ["Chapter 9", "Something Else", "Another"]])
+def test_a_paper_is_split_the_same_way_with_or_without_a_template(template):
+    text = _sections("1. Introduction", "Statement of the Problem", "Review of Related Literature", "2. Methodology", "Results",
+                     "Discussion", "Conclusion")
+    assert ManuscriptParserService.parse_for_scan(text, template) == ManuscriptParserService.parse_for_scan(text, None)
+
+
+def test_a_template_still_splits_a_paper_whose_headings_cannot_be_found():
+    text = "\n".join(["Opening Part", SECTION * 3, "Closing Part", SECTION * 3])
+    plain = ManuscriptParserService.parse_for_scan(text, None)
+    with_template = ManuscriptParserService.parse_for_scan(text, ["Opening Part", "Closing Part"])
+    if plain["structure"] == "split":
+        assert [name for name, body in with_template["parsed_sections"].items() if body] == ["Opening Part", "Closing Part"]
+
+
+def test_a_saved_split_is_tied_to_the_code_that_made_it():
+    import re
+    from services.section_cache import CACHE_VERSION
+    assert re.fullmatch(r"4-[0-9a-f]{16}", CACHE_VERSION)
