@@ -407,3 +407,27 @@ def test_a_read_that_gets_through_resets_the_count_and_no_extra_pass_follows_a_g
     status = {}
     assert asyncio.run(full_check.apply_full_check(_flow(sections[:2]), sections, status=status)) == 0
     assert len(passes) == full_check.GIVE_UP_AFTER * full_check.ASK_ATTEMPTS   # no extra passes after giving up
+
+
+def test_sections_reread_one_by_one_keep_their_own_statements_and_are_still_compared(monkeypatch):
+    from services import full_check, gemini
+    sections = [{"name": f"Part {i}", "text": f"Part {i} has sentence number {i} about the study. " * 6} for i in range(3)]
+    compared = []
+
+    async def broken_together(members, _sections):
+        full_check._failure_kind.set("malformed")
+        return None
+
+    async def one_section(name, chunk):
+        return [{"kind": "claim", "statement": f"said in {name}", "quote": chunk.split(". ")[0] + "."}]
+
+    async def cross(facts):
+        compared.extend((fact["section"], fact["statement"]) for fact in facts)
+        return []
+
+    monkeypatch.setattr(full_check, "_extract_group", broken_together)
+    monkeypatch.setattr(full_check, "_extract", one_section)
+    monkeypatch.setattr(full_check, "_cross_check", cross)
+    monkeypatch.setattr(gemini, "budget_left", lambda: 30)
+    asyncio.run(full_check._prepare(sections, announce=False))
+    assert compared == [(f"Part {i}", f"said in Part {i}") for i in range(3)]

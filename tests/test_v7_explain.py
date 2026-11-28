@@ -316,7 +316,7 @@ def test_bridges_are_validated_capped_and_listed_first():
     assert [b["placement"] for b in result["bridges"]] == ["start", "end"]
     assert result["bridges"][0]["sentence"] == 'The "A" section sets the goal that B tests.'
     flow = assemble_flow([{"name": "A", "text": "A text here."}, {"name": "B", "text": "B text here."}],
-                         [{"scores": dict(low, pair_weight=1)}])
+                         [{"scores": dict(low, claim_support=0.45, pair_weight=1)}])   # a weak link: this pair loses points
     flow[0]["explanation"] = result
     _, recommendations = flatten_explanations(flow)
     assert [r["kind"] for r in recommendations] == ["add", "add"]   # linking sentences are shown again as suggestions (d0d15a9 of Nov 18 had stopped that)

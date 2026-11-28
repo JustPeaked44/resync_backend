@@ -395,11 +395,8 @@ def _add_finding(pair: Dict[str, Any], sections: List[Dict[str, Any]], conflict:
         explanation["link_summary"] = conflict["why"]
     if not (explanation["comparison"].get("a_says") or explanation["comparison"].get("b_says")):
         explanation["comparison"] = {"a_says": a["statement"], "b_says": b["statement"]}
-    if RANK.get(explanation.get("severity"), 0) < RANK[severity]:
-        explanation["severity"] = severity
-        explanation["failed_dimension"] = CATEGORY_DIMENSION.get(conflict["category"], "claim_support")
-    elif explanation.get("failed_dimension") in (None, "none"):
-        explanation["failed_dimension"] = CATEGORY_DIMENSION.get(conflict["category"], "claim_support")
+    from services.v7_scan import charge_dimension
+    charge_dimension(explanation, CATEGORY_DIMENSION.get(conflict["category"], "claim_support"), severity)
     if conflict["category"] == "numeric":
         pair["numeric_applicable"] = True
     pair["explanation"] = explanation
@@ -527,7 +524,10 @@ async def _read_and_compare(sections: List[Dict[str, Any]], announce: bool, run:
                 lost = found is None
                 if lost and _failure_kind.get() == "malformed" and gemini.budget_left() > 4:   # a broken answer: read the pieces one by one
                     singles = [await read_single(job) for job in group]
-                    found = [fact for part, _ in singles for fact in (part or [])] if any(part is not None for part, _ in singles) else None
+                    # Each fact keeps the section it was read from. Without that they were all filed under the group's first
+                    # section, nothing could be compared across sections, and the check was skipped while reported as run.
+                    found = ([dict(fact, index=job[0]) for job, (part, _) in zip(group, singles) for fact in (part or [])]
+                             if any(part is not None for part, _ in singles) else None)
                     lost = any(failed for _, failed in singles)
             run["chunks_failed"] += len(group) if lost else 0
             if lost and _failure_kind.get() == "transient":

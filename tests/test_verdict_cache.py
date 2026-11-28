@@ -202,8 +202,9 @@ def test_a_loosely_linked_neighbor_pair_with_only_one_linking_sentence_is_comple
 
     monkeypatch.setattr(v7_explain, "explain_batch", one_bridge)
     monkeypatch.setattr(v7_explain, "suggest_bridges_batch", completes)
+    flow[1]["scores"]["claim_support"] = 0.45                  # the second pair loses points too
     asyncio.run(explain_flow(sections, flow))
-    assert sorted(asked_for) == [1, 2]                         # the two pairs rated under 0.65; the 0.7 pair needs none
+    assert sorted(asked_for) == [1, 2]                         # the two pairs that lose points for a weak link; the 0.7 pair needs none
     assert [len(p["explanation"]["bridges"]) for p in flow[:2]] == [2, 2]
 
 
@@ -252,6 +253,7 @@ def test_pairs_missing_linking_sentences_are_asked_again_until_they_have_both(mo
 
     monkeypatch.setattr(v7_explain, "explain_batch", no_bridges)
     monkeypatch.setattr(v7_explain, "suggest_bridges_batch", partial)
+    flow[1]["scores"]["claim_support"] = 0.45                  # the second pair loses points too
     asyncio.run(explain_flow(sections, flow))
     assert rounds == [[1, 2], [1, 2], [2]]                     # each round asks only for the pairs still short
     assert [len(p["explanation"]["bridges"]) for p in flow[:2]] == [2, 2]

@@ -272,7 +272,7 @@ def test_a_pair_that_takes_too_long_is_left_unreviewed_without_holding_the_other
 def test_a_loosely_linked_neighbor_pair_gets_linking_sentences_even_when_the_main_review_wrote_none(monkeypatch):
     monkeypatch.setattr(v7_scan, "SUGGEST_LINKING_SENTENCES", True)   # on by default; set here so the test does not depend on the environment
     sections = [{"name": n, "text": "enough words for a valid section"} for n in "ABCD"]
-    ratings = [0.4, 0.8, 0.5]   # A-B loose, B-C well linked (never reviewed), C-D loose
+    ratings = [0.4, 0.8, 0.45]   # A-B loose, B-C well linked (never reviewed), C-D loose: loose means points are lost (below 0.5)
     raw = [{"scores": {"pair_weight": 1, "overall_coherence": o, "objectives_alignment": o, "methodology_fit": o,
                        "numeric_consistency": o, "claim_support": o}} for o in ratings]
     flow = assemble_flow(sections, raw)
@@ -620,3 +620,54 @@ def test_a_contradiction_found_by_the_whole_paper_check_never_raises_another_cat
         assert after[name] == before[name]
     assert overall <= before_overall
     assert four_part_score(flow) == model_only   # a pair the model never rated adds nothing to the model's own figures
+
+
+def test_finding_a_second_problem_on_a_pair_never_raises_a_score():
+    pair = dict(pair_for_score("Moderate", "objectives_alignment", overall=0.9), adjacent=False)
+    pair["explanation"] = {"severity": "Moderate", "failed_dimension": "objectives_alignment"}
+    before_overall, before = manuscript_score([pair])
+    v7_scan.charge_dimension(pair["explanation"], "numeric_consistency", "Critical")
+    pair["severity"], pair["failed_dimension"] = pair["explanation"]["severity"], pair["explanation"]["failed_dimension"]
+    overall, after = manuscript_score([pair])
+    assert pair["severity"] == "Critical" and pair["explanation"]["also_failed"] == {"objectives_alignment": "Moderate"}
+    assert after["context_alignment"] == before["context_alignment"]          # the first problem is still charged
+    assert after["evidence_consistency"]["score"] == 0 and overall < before_overall
+
+
+def test_one_quoted_sentence_is_charged_at_its_most_serious_grade():
+    quote = [{"section": "S1", "quote": "the same sentence"}]
+    minor = dict(pair_for_score("Minor", "claim_support", order=1, overall=0.9), adjacent=False,
+                 explanation={"highlighted_inconsistencies": quote})
+    critical = dict(pair_for_score("Critical", "claim_support", order=2, overall=0.9), adjacent=False,
+                    explanation={"highlighted_inconsistencies": quote})
+    assert manuscript_score([minor, critical])[1]["logical_support"]["score"] == 0
+
+
+@pytest.mark.parametrize("rating, adjacent, shown", [(0.4, True, 1), (0.6, True, 0), (0.4, False, 0)])
+def test_a_linking_sentence_is_advised_only_where_points_are_lost_for_a_weak_link(rating, adjacent, shown):
+    pair = dict(pair_for_score("None", "none", overall=rating), adjacent=adjacent, index_a=0, index_b=1, pair_score=rating,
+                explanation={"severity": "None", "highlighted_inconsistencies": [], "recommendations": [], "reference_list": [],
+                             "bridges": [{"section": "S1", "placement": "end", "sentence": "This connects the two."}]})
+    _, recommendations = flatten_explanations([pair])
+    assert len(recommendations) == shown
+    assert (manuscript_score([pair])[0] < 100) == bool(shown)
+
+
+def test_a_typed_contents_page_is_not_read_as_sections():
+    from services.parser import ManuscriptParserService
+    body = "This part of the study explains how the students manage their time during the whole school year. " * 6
+    contents = ["TABLE OF CONTENTS", "Page"] + [f"{name}\t\t\t     {page}" for page, name in enumerate(
+        ("Introduction", "Rationale of the Study", "Methodology", "Summary", "Recommendations", "Proposed Action Plan"), 1)]
+    contents += ["LIST OF TABLES", "1 | Profile of the Respondents | 68", "APPENDICES\t\t 126"]
+    paper = ["ABSTRACT", body, *contents, "Introduction", body, "Methodology", body, "Recommendations", body]
+    parsed = ManuscriptParserService.parse_manuscript_sections("\n".join(paper), None)
+    text = "\n".join(parsed["parsed_sections"].values())
+    assert "Proposed Action Plan" not in text and "Profile of the Respondents" not in text
+    assert len([name for name in parsed["parsed_sections"] if "recommendation" in name.lower()]) == 1
+
+
+def test_a_contents_line_never_gets_advice():
+    for line in ("3\tSUMMARY, FINDINGS, CONCLUSIONS AND\t   101", "Proposed Action Plan\t\t\t     109", "Recommendations .......... 107"):
+        assert v7_scan.senseless_recommendation({"original_sentence": line, "issue": "x"})
+    for line in ("The study had 145 respondents in 2025.", "A total of 73 students answered, which is about 50."):
+        assert not v7_scan.senseless_recommendation({"original_sentence": line, "issue": "x"})

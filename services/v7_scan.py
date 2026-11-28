@@ -107,7 +107,8 @@ def duplicate_issue_orders(scored):
     seen from several sides, so only the first of them is scored; the others are left out of the checks (neither passed nor
     failed), which keeps a single bad sentence from being charged once per neighbouring section."""
     seen, duplicate = set(), set()
-    for p in sorted(scored, key=lambda item: item.get("order") or 0):
+    weight = {"Critical": 0, "Moderate": 1, "Minor": 2}     # one sentence quoted by several pairs is charged at its most serious
+    for p in sorted(scored, key=lambda item: (weight.get(item.get("severity"), 3), item.get("order") or 0)):
         explanation = p.get("explanation") or {}
         if p.get("severity") not in ("Critical", "Moderate", "Minor"):
             continue
@@ -175,15 +176,19 @@ def manuscript_score(pairs, transitions=None):
                 continue
             # A pair only the whole-paper check found is a check in the one category it contradicts, never a free pass in
             # the others: otherwise finding one more contradiction raised the other categories.
-            if p.get("found_by_full_check") and p.get("failed_dimension") != key:
+            # A pair can be wrong in more than one way (also_failed): each category it contradicts is charged at its own grade.
+            also = (p.get("explanation") or {}).get("also_failed") or {}
+            if p.get("found_by_full_check") and p.get("failed_dimension") != key and key not in also:
                 continue
             severity, neighbors = p.get("severity"), p.get("adjacent", True) is not False
             kind = counts["flow" if neighbors else "cross"]
             kind[0] += 1
             estimated += severity is None   # no AI verdict: this check rests on the model's rating alone
-            if severity in ("Critical", "Moderate", "Minor") and p.get("failed_dimension") == key:
+            graded = severity in ("Critical", "Moderate", "Minor")
+            charge = severity if graded and p.get("failed_dimension") == key else (also.get(key) if graded else None)
+            if charge:
                 reason = "contradiction"
-                earned = CONTRADICTION_CREDIT.get(severity, 0.0)
+                earned = CONTRADICTION_CREDIT.get(charge, 0.0)
                 kind[2] += earned
             # A neighboring pair rated below CHECK_PASS_AT is a loose link even when the AI found no contradiction: unrelated text
             # has nothing to contradict, so the AI clearing it cannot earn a full point (owner decision, 2026-11-25; 96b74f3 had
@@ -198,7 +203,7 @@ def manuscript_score(pairs, transitions=None):
                 kind[2] += 1
                 continue
             failures.append({"order": p.get("order"), "section_a": p.get("section_a", ""), "section_b": p.get("section_b", ""),
-                             "reason": reason, "severity": severity if reason == "contradiction" else None,
+                             "reason": reason, "severity": charge if reason == "contradiction" else None,
                              "rating": round(rating, 4), "credit": round(earned, 4), "kind": "flow" if neighbors else "cross"})
         total = counts["flow"][0] + counts["cross"][0]
         if not total:
@@ -258,6 +263,7 @@ def is_prose(text):
 
 _CITATION_LINE = re.compile(r"(?i)(?:\bdoi\b|https?://|retrieved from|\bet al\.?,?\s*\(?\d{4}|^\s*\[?\d+\]\s|^[A-Z][A-Za-z'\-]+,\s+(?:[A-Z]\.\s*){1,3}[,&(])")
 _CAPTION = re.compile(r"(?i)^\s*(?:table|figure|fig\.?|appendix)\s*[\dA-Z]+\s*[:.\-\u2013\u2014|]")
+_CONTENTS_LINE = re.compile(r"(?i)(?:\t|\.{4,}|\s{4,})\s*(?:\d{1,3}|[ivxlc]{1,7})\s*$")   # "Summary ........ 101"
 _ASKS_FOR_EXTRA = re.compile(r"(?i)\b(?:add|insert|include|create|provide|cite)\b[^.]{0,60}\b(?:tables?|figures?|diagrams?|citations?|references?|sources?)\b")
 
 
@@ -265,7 +271,7 @@ def senseless_recommendation(item):
     """A recommendation about a reference entry, a table row, a caption or a diagram label, or one that only asks for another
     citation, table or figure, does not fix an inconsistency in the argument."""
     sentence = (item.get("original_sentence") or "").strip()
-    if sentence and (" | " in sentence or _CITATION_LINE.search(sentence) or _CAPTION.match(sentence)
+    if sentence and (" | " in sentence or _CITATION_LINE.search(sentence) or _CAPTION.match(sentence) or _CONTENTS_LINE.search(sentence)
                      or sentence.startswith(("\u25cf", "\u2022", "\u25aa"))):
         return True
     return bool(_ASKS_FOR_EXTRA.search(item.get("issue") or "")) and not sentence
@@ -515,6 +521,27 @@ def figure_conflict(text_a, text_b):
     return None
 
 
+def charge_dimension(explanation, dimension, severity):
+    """Records one more problem on a pair without forgiving an earlier one: the most serious stays the pair's grade and
+    category, every other category it contradicts is kept in also_failed."""
+    rank = {None: -1, "None": 0, "Minor": 1, "Moderate": 2, "Critical": 3}
+    grade, main = explanation.get("severity"), explanation.get("failed_dimension")
+    others = dict(explanation.get("also_failed") or {})
+    if rank.get(grade, 0) <= 0 or main in (None, "none"):
+        explanation["severity"] = severity if rank[severity] > rank.get(grade, 0) else grade
+        explanation["failed_dimension"] = dimension
+    elif main == dimension:
+        explanation["severity"] = severity if rank[severity] > rank[grade] else grade
+    elif rank[severity] > rank[grade]:
+        others[main] = grade
+        explanation["severity"], explanation["failed_dimension"] = severity, dimension
+    elif rank[severity] > rank.get(others.get(dimension), 0):
+        others[dimension] = severity
+    others.pop(explanation.get("failed_dimension"), None)
+    if others:
+        explanation["also_failed"] = others
+
+
 def apply_figure_conflicts(flow, sections):
     """Adds a quoted finding and a one-sentence fix for every pair whose sections report different headcounts."""
     rank = {None: -1, "None": 0, "Minor": 1, "Moderate": 2, "Critical": 3}
@@ -547,9 +574,7 @@ def apply_figure_conflicts(flow, sections):
             "section": b["name"], "original_sentence": sentence_b, "recommended_revision": fixed, "kind": "edit",
             "issue": f"This section reports {number_b:,} {group} but {a['name']} reports {number_a:,}. Use the correct number in both places.",
             "category": "numeric"})
-        if rank.get(explanation.get("severity"), 0) < rank["Moderate"]:
-            explanation["severity"] = "Moderate"
-        explanation["failed_dimension"] = "numeric_consistency"
+        charge_dimension(explanation, "numeric_consistency", "Moderate")
         pair["numeric_applicable"] = True
         pair["explanation"] = explanation
 
@@ -587,7 +612,7 @@ async def apply_subject_check(flow, sections):
 
 async def explain_flow(sections, flow, roles=None, full_check_task=None):
     from services import gemini
-    from services.v7_explain import (FLOW_SUGGESTION_BELOW, explain_batch, explain_pair, explain_summary, pair_cache_key,
+    from services.v7_explain import (explain_batch, explain_pair, explain_summary, pair_cache_key,
                                      suggest_bridges_batch, valid_cached_explanation)
     from services.verdict_cache import VerdictCache
 
@@ -686,8 +711,8 @@ async def explain_flow(sections, flow, roles=None, full_check_task=None):
             await asyncio.gather(*(second_opinion(group) for _, group in rechecks), return_exceptions=True)
         # A loosely linked neighbor pair always gets linking sentences to add: when the main review wrote none, ask for
         # just those (all pairs in ONE call), so a score that lost points to weak links never comes with an empty list.
-        loose = [p for p in flow if SUGGEST_LINKING_SENTENCES and p.get("adjacent", True) and p["explanation"] and p["explanation"].get("severity") == "None"
-                 and len(p["explanation"].get("bridges") or []) < 2 and (p["scores"]["overall_coherence"] or 1) < FLOW_SUGGESTION_BELOW]
+        loose = [p for p in flow if SUGGEST_LINKING_SENTENCES and p["explanation"] and p["explanation"].get("severity") == "None"
+                 and len(p["explanation"].get("bridges") or []) < 2 and weak_link(p)]
         for _ in range(BRIDGE_ROUNDS):   # pairs the request missed or whose sentences were already in the paper are asked again
             pending = [p for p in loose if len(p["explanation"].get("bridges") or []) < 2]
             if not pending:
@@ -779,6 +804,15 @@ def analysis_quality(to_explain, unreviewed, whole_paper_check_ran):
             "whole_paper_check": whole_paper_check_ran if isinstance(whole_paper_check_ran, str) else ("ran" if whole_paper_check_ran else "skipped")}
 
 
+def weak_link(pair):
+    """A neighboring pair that loses points for how loosely it is connected (the "loose link" of manuscript_score). Only
+    such a pair needs a sentence added between its sections; advice for any other pair would fix nothing."""
+    if pair.get("adjacent", True) is False:
+        return False
+    return any(pair["scores"].get(key) is not None and pair["scores"][key] < CHECK_PASS_AT for key in DIMENSION_NAMES
+               if key != "numeric_consistency" or pair.get("numeric_applicable", True))
+
+
 def flatten_explanations(flow, sections=None):
     from services.v7_explain import recommendation_category
 
@@ -800,7 +834,7 @@ def flatten_explanations(flow, sections=None):
         # Linking sentences to add come first: they connect the two sections, which is what moves the score.
         bridges = [{"section": b["section"], "original_sentence": None, "issue": "", "kind": "add",
                     "placement": b["placement"], "recommended_revision": b["sentence"]}
-                   for b in explanation.get("bridges", [])]
+                   for b in (explanation.get("bridges", []) if weak_link(pair) else [])]
         fallback_category = recommendation_category(
             None, dict(pair["scores"], numeric_applicable=pair["numeric_applicable"]))
         pair_recommendations = sorted(explanation["recommendations"],

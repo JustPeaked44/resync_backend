@@ -454,6 +454,15 @@ async def check_subjects_batch(items):
     Returns {pair id: {subject_a, subject_b, quote_a, quote_b}} for pairs answered false whose quotes really are in the text."""
     if not items:
         return {}
+    # Each pair's answer is remembered, so scanning the same paper again gives the same result.
+    keys = {item["id"]: VerdictCache.fingerprint("subject-check", item["role_a"], gemini.truncate_text(item["text_a"], 2500),
+                                                 item["role_b"], gemini.truncate_text(item["text_b"], 2500)) for item in items}
+    saved = await VerdictCache.get_many(keys.values())
+    known = {item["id"]: saved[keys[item["id"]]]["different"] for item in items
+             if "different" in saved.get(keys[item["id"]], {})}
+    items = [item for item in items if item["id"] not in known]
+    if not items:
+        return {key: value for key, value in known.items() if value}
     blocks = "\n".join(f'=== PAIR {item["id"]} ===\nFirst section: "{item["role_a"]}": {gemini.truncate_text(item["text_a"], 2500)}\n'
                        f'Second section: "{item["role_b"]}": {gemini.truncate_text(item["text_b"], 2500)}\n' for item in items)
     prompt = SUBJECT_BATCH_PROMPT.replace("{pairs}", blocks)
@@ -473,7 +482,10 @@ async def check_subjects_batch(items):
                 subject_a, subject_b = _squashed(entry.get("subject_a")), _squashed(entry.get("subject_b"))
                 if quote_a and quote_b and subject_a and subject_b and quote_a in _squashed(item["text_a"]) and quote_b in _squashed(item["text_b"]):
                     different[item["id"]] = {"subject_a": subject_a, "subject_b": subject_b, "quote_a": quote_a, "quote_b": quote_b}
-            return different
+            answered_ids = {str(entry.get("pair_id")) for entry in answered if isinstance(entry, dict)}
+            await VerdictCache.save_many({keys[item["id"]]: {"severity": "None", "different": different.get(item["id"])}
+                                          for item in items if str(item["id"]) in answered_ids})
+            return {**{key: value for key, value in known.items() if value}, **different}
         except gemini.GeminiQuotaExhausted:
             return {}
         except Exception:
